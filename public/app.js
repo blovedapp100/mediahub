@@ -118,25 +118,122 @@
     progress.classList.toggle('show', busy);
   }
 
+  var latestReq = 0;
+
+  // Typical seconds each platform takes to show the video (measured live).
+  // meta = title/thumbnail, info = full quality list, max = give up after this.
+  var PLATFORM_TIME = {
+    'YouTube': { meta: 2, info: 8, max: 30 },
+    'TikTok': { meta: 2, info: 6, max: 30 },
+    'Facebook': { meta: 3, info: 12, max: 35 },
+    'Instagram': { meta: 3, info: 8, max: 30 },
+    'X (Twitter)': { meta: 4, info: 10, max: 30 },
+    'Reddit': { meta: 5, info: 10, max: 30 },
+    'Vimeo': { meta: 4, info: 8, max: 30 },
+    'Dailymotion': { meta: 4, info: 8, max: 30 },
+  };
+  var timerEl = document.getElementById('timer');
+  var timerInt = null;
+  var timerStart = 0;
+
+  function fmtSecs(s) { return s.toFixed(1) + 's'; }
+
+  function stopTimer() {
+    if (timerInt) { clearInterval(timerInt); timerInt = null; }
+  }
+
+  function startTimer(platform) {
+    stopTimer();
+    var t = PLATFORM_TIME[platform] || { meta: 3, info: 8, max: 30 };
+    timerStart = Date.now();
+    if (!timerEl) return t;
+    timerEl.innerHTML = '<b>' + platform + '</b> — video usually shows in ~' + t.meta + 's… <b class="elapsed">0.0s</b>';
+    timerInt = setInterval(function () {
+      var el = timerEl.querySelector('.elapsed');
+      if (el) el.textContent = fmtSecs((Date.now() - timerStart) / 1000);
+    }, 100);
+    return t;
+  }
+
+  function timerShown(seconds) {
+    if (!timerEl) return;
+    timerEl.innerHTML = 'Video shown in <b>' + fmtSecs(seconds) + '</b> — getting qualities…';
+  }
+
+  function timerDone(seconds) {
+    stopTimer();
+    if (!timerEl) return;
+    timerEl.innerHTML = 'Ready in <b>' + fmtSecs(seconds) + '</b>';
+  }
+
+  function renderPreview(data) {
+    currentTitle = data.title || 'video';
+    titleEl.textContent = currentTitle;
+    uploaderEl.textContent = data.uploader ? 'By ' + data.uploader : '';
+    durationEl.textContent = data.duration ? 'Length: ' + fmtDuration(data.duration) : '';
+    if (videoEl) {
+      try { videoEl.pause(); } catch (e) {}
+      videoEl.removeAttribute('src');
+      videoEl.style.display = 'none';
+    }
+    if (data.thumbnail) { thumbImg.src = data.thumbnail; thumbImg.style.display = ''; }
+    else thumbImg.style.display = 'none';
+    if (playerWrap) playerWrap.style.display = data.thumbnail ? '' : 'none';
+    formatsEl.innerHTML = '<li class="loading">Finding qualities…</li>';
+    result.hidden = false;
+  }
+
   async function fetchInfo(url) {
     currentUrl = url;
+    var reqId = ++latestReq;
+    var platform = detectPlatform(url) || 'Video';
+    var timing = startTimer(platform);
     setBusy(true);
     msg.textContent = '';
     result.hidden = true;
     formatsEl.innerHTML = '';
+    // Stage 1 — fast preview (title + thumbnail) in about 2 seconds.
+    fetch('/api/meta', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: url }),
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (reqId !== latestReq || !data || !data.title) return;
+        renderPreview(data);
+        timerShown((Date.now() - timerStart) / 1000);
+      })
+      .catch(function () {});
+    // Stage 2 — full quality list (takes a few seconds longer).
+    var ctrl = new AbortController();
+    var timeoutId = setTimeout(function () { ctrl.abort(); }, timing.max * 1000);
     try {
       var r = await fetch('/api/info', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: url }),
+        signal: ctrl.signal,
       });
       var data = await r.json();
+      if (reqId !== latestReq) return;
       if (!r.ok) throw new Error(data.error || 'Something went wrong.');
       renderResult(data);
+      timerDone((Date.now() - timerStart) / 1000);
     } catch (err) {
-      msg.textContent = err.message || 'Something went wrong. Please try another link.';
+      if (reqId !== latestReq) return;
+      stopTimer();
+      if (err && err.name === 'AbortError') {
+        if (result.hidden) msg.textContent = platform + ' is taking too long right now. Please try again.';
+        else formatsEl.innerHTML = '<li class="loading">Taking too long — please try again.</li>';
+      } else if (result.hidden) {
+        msg.textContent = err.message || 'Something went wrong. Please try another link.';
+      } else {
+        formatsEl.innerHTML = '<li class="loading">Could not load qualities — please try again.</li>';
+      }
     } finally {
-      setBusy(false);
+      clearTimeout(timeoutId);
+      if (reqId === latestReq) setBusy(false);
     }
   }
 
