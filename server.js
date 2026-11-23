@@ -27,7 +27,12 @@ app.use(express.static(path.join(__dirname, 'public'), {
 // frontend may call the OTHER region's API when its own region is blocked
 // by YouTube/TikTok — that only works if the API answers cross-origin
 // requests from the sibling site. Allowed origins come from env.
-const BACKUP_ORIGIN = (process.env.BACKUP_ORIGIN || '').trim().replace(/\/$/, '');
+// One backup region was not enough — the site now keeps a LIST of backup
+// regions and tries them in order until one answers. Env BACKUP_ORIGINS
+// is comma-separated; the old singular BACKUP_ORIGIN is still honoured
+// as a single entry.
+const BACKUP_ORIGINS = (process.env.BACKUP_ORIGINS || process.env.BACKUP_ORIGIN || '')
+  .split(',').map((s) => s.trim().replace(/\/$/, '')).filter(Boolean);
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .split(',').map((s) => s.trim().replace(/\/$/, '')).filter(Boolean);
 app.use('/api', (req, res, next) => {
@@ -898,7 +903,7 @@ function renderLanding(platform, req) {
 
 // ---- routes ----------------------------------------------------------------
 
-app.get('/api/config', rateLimit(30, 60000), (req, res) => res.json({ backupOrigin: BACKUP_ORIGIN || null }));
+app.get('/api/config', rateLimit(30, 60000), (req, res) => res.json({ backupOrigins: BACKUP_ORIGINS, backupOrigin: BACKUP_ORIGINS[0] || null }));
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
