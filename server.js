@@ -13,7 +13,14 @@ const PORT = process.env.PORT || 3000;
 const YTDLP = process.env.YTDLP_PATH || 'yt-dlp';
 
 app.use(express.json({ limit: '64kb' }));
-app.use(express.static(path.join(__dirname, 'public'), { maxAge: '1h', etag: true }));
+app.use(express.static(path.join(__dirname, 'public'), {
+  maxAge: '1h', etag: true,
+  setHeaders: (res, filePath) => {
+    // HTML/JS/CSS must never stay cached after a deploy — a stale app.js
+    // kept the old (pre-timer, pre-/api/meta) frontend live for an hour.
+    if (/\.(html|js|css)$/.test(filePath)) res.setHeader('Cache-Control', 'no-cache');
+  },
+}));
 
 // ---- helpers ---------------------------------------------------------------
 
@@ -45,6 +52,12 @@ function isYouTube(u) {
     const h = new URL(u).hostname.toLowerCase();
     return h === 'youtube.com' || h === 'www.youtube.com' || h === 'm.youtube.com' || h === 'youtu.be' || h.endsWith('.youtube.com');
   } catch { return false; }
+}
+
+function platformOf(u) {
+  if (isYouTube(u)) return 'youtube';
+  if (isTikTok(u)) return 'tiktok';
+  try { return new URL(u).hostname.replace(/^www\./, ''); } catch { return 'unknown'; }
 }
 
 // Extra yt-dlp args per host. YouTube bot-checks datacenter IPs on its web
@@ -94,6 +107,26 @@ function setDownloadHeaders(res, title, ext, contentType) {
   }
 }
 
+// Stream a direct file URL straight to the client. Returns true when the
+// download started, false when the URL did not answer — the caller then
+// falls back to the yt-dlp save. Headers are only set after the fetch
+// succeeds, so a failed attempt commits nothing.
+async function streamThrough(res, streamUrl, title, ext, contentType) {
+  const r = await fetch(streamUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+  if (!r.ok || !r.body) return false;
+  setDownloadHeaders(res, title, ext, contentType);
+  const reader = r.body.getReader();
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!res.write(Buffer.from(value))) await new Promise((ok) => res.once('drain', ok));
+    }
+    res.end();
+  } catch { try { res.end(); } catch {} }
+  return true;
+}
+
 // Last resort: never let one bad request kill the server for everyone.
 process.on('uncaughtException', (e) => {
   console.error('uncaught:', scrub(String((e && e.stack) || e)).slice(0, 1000));
@@ -117,6 +150,41 @@ function cacheSet(url, data) {
     if (first) infoCache.delete(first);
   }
   infoCache.set(cacheKey(url), { at: Date.now(), data });
+}
+
+// Raw info (with direct stream URLs) for /api/save: the public result
+// above drops the URLs, but a save can stream a direct URL instead of
+// running yt-dlp a second time — which matters when yt-dlp only answers
+// through one specific client on this IP.
+const rawCache = new Map();
+function rawCacheSet(url, info) {
+  if (rawCache.size >= 200) {
+    const first = rawCache.keys().next().value;
+    if (first) rawCache.delete(first);
+  }
+  rawCache.set(cacheKey(url), { at: Date.now(), info });
+}
+function rawCacheGet(url) {
+  const e = rawCache.get(cacheKey(url));
+  if (!e) return null;
+  if (Date.now() - e.at > INFO_TTL) { rawCache.delete(cacheKey(url)); return null; }
+  return e.info;
+}
+
+// Winning yt-dlp client args per URL (same TTL) — see ytdlpInfoWithFallbacks.
+const rawClient = new Map();
+function rawClientSet(url, args) {
+  if (rawClient.size >= 200) {
+    const first = rawClient.keys().next().value;
+    if (first) rawClient.delete(first);
+  }
+  rawClient.set(cacheKey(url), { at: Date.now(), args: args || null });
+}
+function rawClientGet(url) {
+  const e = rawClient.get(cacheKey(url));
+  if (!e) return null;
+  if (Date.now() - e.at > INFO_TTL) { rawClient.delete(cacheKey(url)); return null; }
+  return e.args;
 }
 
 // ---- per-IP rate limit (counts only, no URLs stored) ------------------------
@@ -190,56 +258,104 @@ function ytdlpJson(url, timeoutMs = 60000, extraArgs = []) {
   return new Promise((resolve, reject) => {
     execFile(YTDLP, ['-J', '--no-playlist', '--no-warnings', '--socket-timeout', '15', ...extraArgs, url],
       { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 },
-      (err, stdout) => {
-        if (err) return reject(new Error('Could not read this link. The video may be private, removed, or the site is blocking us.'));
+      (err, stdout, stderr) => {
+        if (err) {
+          const e = new Error('Could not read this link. The video may be private, removed, or the site is blocking us.');
+          // The real reason (e.g. "Sign in to confirm you're not a bot")
+          // is kept for the server log only — the user just sees the
+          // friendly message above.
+          e.detail = String(stderr || '').split('\n').filter(Boolean).slice(-2).join(' ').slice(0, 200) || String(err.message || '').slice(0, 200);
+          return reject(e);
+        }
         try { resolve(JSON.parse(stdout)); } catch { reject(new Error('Could not read this link.')); }
       });
   });
 }
 
-// Info lookup with fallbacks: try several player clients in turn — the
-// YouTube bot check is flaky on datacenter IPs, so one client failing does
-// not mean the video is unreadable; the Android client usually answers.
-// For YouTube, the first two clients race in parallel so a slow one does
-// not hold up the other.
+// Richness of an info result: highest video height first, then most
+// formats. The Android client answers fastest but only ever offers 360p,
+// while tv_embedded (a few seconds slower) has the full 1080p list —
+// picking the first success would hide every quality above 360p.
+function infoScore(info) {
+  const list = Array.isArray(info.formats) ? info.formats : [];
+  let maxH = 0, count = 0;
+  for (const f of list) {
+    if (!f || f.ext === 'mhtml') continue;
+    count++;
+    if ((f.height || 0) > maxH) maxH = f.height || 0;
+  }
+  return maxH * 1000 + count;
+}
+
+function withTimeout(promise, ms, msg) {
+  let timer;
+  return Promise.race([
+    promise.finally(() => clearTimeout(timer)),
+    new Promise((_, rej) => { timer = setTimeout(() => rej(new Error(msg)), ms); }),
+  ]);
+}
+
+// Info lookup: everything races in parallel and the richest success wins.
+// The old code ran clients one after another with 30-60s timeouts, so on
+// a blocked IP the chain took up to 2 minutes — long past the 30s the
+// browser waits — and the mirror fallback never got a chance to run.
+// YouTube: android + web_embedded + tv_embedded clients (12s each) race
+// the Invidious/Piped mirrors, and the result with the most qualities is
+// kept. TikTok: the plain client races two other API hostnames (the
+// iPhone user-agent breaks TikTok in yt-dlp, so it is NOT used here).
+// Everything else: plain + iPhone user-agent, 20s each.
+// Returns { info, clientArgs } — clientArgs are the yt-dlp extra args of
+// the client that produced this info (null for mirrors), so /api/save can
+// download with the same client: a format from tv_embedded does not exist
+// for the android client, and a save with the wrong client fails.
 async function ytdlpInfoWithFallbacks(url) {
+  const wrapErr = (e) => {
+    const err = new Error('Could not read this link. The video may be private, removed, or the site is blocking us.');
+    err.detail = (e && e.errors && e.errors.map((x) => x && x.detail).filter(Boolean).join(' | ')) || '';
+    return err;
+  };
+  const tag = (p, args) => p.then((info) => ({ info, clientArgs: args }));
   if (isYouTube(url)) {
-    const android = ['--extractor-args', 'youtube:player_client=android'];
-    const webEmb = ['--extractor-args', 'youtube:player_client=web_embedded'];
-    try {
-      return await Promise.any([
-        ytdlpJson(url, 30000, android),
-        ytdlpJson(url, 30000, webEmb),
-      ]);
-    } catch {}
-    const rest = [
-      android,
-      ['--extractor-args', 'youtube:player_client=ios'],
-      [],
+    const clients = [
+      ['--extractor-args', 'youtube:player_client=android'],
+      ['--extractor-args', 'youtube:player_client=web_embedded'],
+      ['--extractor-args', 'youtube:player_client=tv_embedded'],
     ];
-    let lastErr = null;
-    for (const args of rest) {
-      try {
-        return await ytdlpJson(url, 30000, args);
-      } catch (e) {
-        lastErr = e;
-      }
+    const mirror = withTimeout(mirrorInfo(url).then((info) => {
+      if (!info) throw new Error('mirror empty');
+      return { info, clientArgs: null };
+    }), 12000, 'mirror timeout');
+    const settled = await Promise.allSettled([
+      ...clients.map((args) => tag(ytdlpJson(url, 12000, args), args)),
+      mirror,
+    ]);
+    const ok = settled.filter((r) => r.status === 'fulfilled').map((r) => r.value);
+    if (!ok.length) {
+      const err = new Error('Could not read this link. The video may be private, removed, or the site is blocking us.');
+      err.detail = settled.filter((r) => r.status === 'rejected').map((r) => r.reason && r.reason.detail).filter(Boolean).join(' | ');
+      throw err;
     }
-    throw lastErr;
-  }
-  const attempts = [
-    [],
-    ['--user-agent', 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'],
-  ];
-  let lastErr = null;
-  for (const args of attempts) {
-    try {
-      return await ytdlpJson(url, 60000, args);
-    } catch (e) {
-      lastErr = e;
+    let best = ok[0];
+    for (const cand of ok) {
+      if (infoScore(cand.info) > infoScore(best.info)) best = cand;
     }
+    return best;
   }
-  throw lastErr;
+  const attempts = isTikTok(url)
+    ? [
+        [],
+        ['--extractor-args', 'tiktok:api_hostname=api22-normal-c-useast1a.tiktokv.com'],
+        ['--extractor-args', 'tiktok:api_hostname=api19-normal-c-useast1a.tiktokv.com'],
+      ]
+    : [
+        [],
+        ['--user-agent', 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'],
+      ];
+  try {
+    return await Promise.any(attempts.map((args) => tag(ytdlpJson(url, 20000, args), args)));
+  } catch (e) {
+    throw wrapErr(e);
+  }
 }
 
 // ---- fast preview metadata (~1-2s) -----------------------------------------
@@ -519,7 +635,14 @@ function previewUrl(info) {
   return any ? any.url : '';
 }
 
-function buildFormats(info) {
+function buildFormats(info, opts) {
+  // opts.noSeparateAudio (TikTok): TikTok's standalone "audio" format is
+  // the background MUSIC file, not the video's soundtrack — on a 139s
+  // video it is only ~60s long. Pairing it with a video-only stream (or
+  // offering it as "Audio only") would give a download whose sound stops
+  // part-way through, so for TikTok only progressive (video+audio) formats
+  // are offered — they carry the video's real, full-length sound.
+  const noSeparateAudio = !!(opts && opts.noSeparateAudio);
   const list = Array.isArray(info.formats) ? info.formats : [];
   const byHeight = new Map(); // height -> best progressive (video+audio)
   const videoOnly = new Map(); // height -> best video-only
@@ -564,7 +687,7 @@ function buildFormats(info) {
         filesize: prog.filesize || prog.filesize_approx || 0,
         note: 'With sound',
       });
-    } else if (vo && bestAudio) {
+    } else if (vo && bestAudio && !noSeparateAudio) {
       out.push({
         id: String(vo.format_id) + '+' + String(bestAudio.format_id),
         label: h + 'p' + (vo.fps && vo.fps > 30 ? ' ' + Math.round(vo.fps) + 'fps' : ''),
@@ -592,7 +715,7 @@ function buildFormats(info) {
       note: 'With sound',
     });
   }
-  if (bestAudio) {
+  if (bestAudio && !noSeparateAudio) {
     out.push({
       id: String(bestAudio.format_id),
       label: 'Audio only',
@@ -603,14 +726,27 @@ function buildFormats(info) {
     });
   }
   if (out.length === 0) {
-    const best = list.filter((f) => f.vcodec && f.vcodec !== 'none')
-      .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
-    if (best) {
-      out.push({
-        id: 'bestvideo+bestaudio',
-        label: (best.height ? best.height + 'p' : 'Best quality'),
-        ext: 'mp4', hasAudio: true, filesize: 0, note: 'With sound',
-      });
+    if (noSeparateAudio) {
+      const prog = list.filter((f) => f && f.vcodec && f.vcodec !== 'none' && f.acodec && f.acodec !== 'none' && f.url)
+        .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+      if (prog) {
+        out.push({
+          id: String(prog.format_id),
+          label: (prog.height ? prog.height + 'p' : 'Best quality'),
+          ext: prog.ext || 'mp4', hasAudio: true,
+          filesize: prog.filesize || prog.filesize_approx || 0, note: 'With sound',
+        });
+      }
+    } else {
+      const best = list.filter((f) => f.vcodec && f.vcodec !== 'none')
+        .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+      if (best) {
+        out.push({
+          id: 'bestvideo+bestaudio',
+          label: (best.height ? best.height + 'p' : 'Best quality'),
+          ext: 'mp4', hasAudio: true, filesize: 0, note: 'With sound',
+        });
+      }
     }
   }
   return out;
@@ -780,19 +916,22 @@ app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
   try {
     let result = null;
     if (isTikTok(url)) {
-      result = await tikwmInfo(url);
+      result = await tikwmInfo(url, 6000);
       // fall through to yt-dlp when tikwm has nothing
     }
     if (!result) {
       let info = null;
       try {
-        info = await ytdlpInfoWithFallbacks(url);
-      } catch {
+        const res = await ytdlpInfoWithFallbacks(url);
+        info = res.info;
+        rawClientSet(url, res.clientArgs);
+      } catch (e) {
         info = null;
+        console.error('info failed:', platformOf(url), scrub(e.detail || e.message));
       }
-      if (!info && isYouTube(url)) info = await mirrorInfo(url);
       if (!info) throw new Error('Could not read this link. The video may be private, removed, or the site is blocking us.');
-      const formats = buildFormats(info);
+      rawCacheSet(url, info);
+      const formats = buildFormats(info, { noSeparateAudio: isTikTok(url) });
       if (!formats.length) return res.status(404).json({ error: 'No playable versions were found for this link.' });
       result = {
         source: 'generic',
@@ -875,6 +1014,28 @@ app.get('/api/save', rateLimit(10, 60000), async (req, res) => {
     return;
   }
 
+  // Direct stream: when /api/info already resolved this link, its raw
+  // formats carry direct file URLs — stream one instead of running yt-dlp
+  // a second time (which may fail on this IP through a different client).
+  // Merged video+audio (id contains '+') still needs the yt-dlp path below.
+  // Audio-only streams are NOT streamed directly: YouTube throttles a
+  // plain fetch of an audio-only URL to ~30KB/s, while yt-dlp pulls the
+  // same URL at full speed — so audio goes to the yt-dlp save below.
+  if (!formatId.includes('+')) {
+    const raw = rawCacheGet(url);
+    const fmt = raw && Array.isArray(raw.formats) ? raw.formats.find((f) => f && String(f.format_id) === formatId && f.url) : null;
+    if (fmt && fmt.vcodec && fmt.vcodec !== 'none') {
+      const ext2 = String(fmt.ext || 'mp4').toLowerCase();
+      const ctype = ext2 === 'mp3' ? 'audio/mpeg' : ext2 === 'm4a' ? 'audio/mp4' : ext2 === 'webm' ? 'video/webm' : 'video/mp4';
+      try {
+        if (await streamThrough(res, fmt.url, title, ext2, ctype)) return;
+      } catch (e) {
+        console.error('direct stream failed:', scrub(e.message));
+      }
+      // fall through to the yt-dlp save below
+    }
+  }
+
   const merged = formatId.includes('+');
   const ext = 'mp4';
 
@@ -884,7 +1045,7 @@ app.get('/api/save', rateLimit(10, 60000), async (req, res) => {
     // the file, and delete it immediately — no buildup on disk.
     const tmp = path.join(os.tmpdir(), 'mediahub-' + crypto.randomBytes(8).toString('hex') + '.mp4');
     const args = ['-f', formatId, '--merge-output-format', 'mp4', '--no-playlist', '--no-warnings',
-      '--socket-timeout', '15', ...ytdlpExtraArgs(url), '-o', tmp, url];
+      '--socket-timeout', '15', ...(rawClientGet(url) || ytdlpExtraArgs(url)), '-o', tmp, url];
     const child = spawn(YTDLP, args, { timeout: 900000 });
     let stderr = '';
     child.stderr.on('data', (d) => { if (stderr.length < 4000) stderr += d.toString(); });
@@ -909,8 +1070,16 @@ app.get('/api/save', rateLimit(10, 60000), async (req, res) => {
   }
 
   // Single format: stream stdout straight to the client, nothing on disk.
+  // Name it by the format's own extension (an audio-only save is .m4a/.mp3,
+  // not .mp4).
+  const rawFmt = (() => {
+    const r = rawCacheGet(url);
+    return r && Array.isArray(r.formats) ? r.formats.find((f) => f && String(f.format_id) === formatId) : null;
+  })();
+  const singleExt = rawFmt && rawFmt.ext ? String(rawFmt.ext).toLowerCase() : 'mp4';
+  const singleType = singleExt === 'mp3' ? 'audio/mpeg' : singleExt === 'm4a' ? 'audio/mp4' : singleExt === 'webm' ? 'video/webm' : 'video/mp4';
   const args = ['-f', formatId, '--no-playlist', '--no-warnings',
-    '--socket-timeout', '15', ...ytdlpExtraArgs(url), '-o', '-', url];
+    '--socket-timeout', '15', ...(rawClientGet(url) || ytdlpExtraArgs(url)), '-o', '-', url];
   const child = spawn(YTDLP, args, { timeout: 900000 });
   let sent = false;
   let stderr = '';
@@ -918,17 +1087,28 @@ app.get('/api/save', rateLimit(10, 60000), async (req, res) => {
   child.on('error', () => {
     if (!res.headersSent) res.status(502).json({ error: 'This clip is not available right now. Please try again.' });
   });
-  child.on('spawn', () => {
-    setDownloadHeaders(res, title, ext, 'video/mp4');
-    sent = true;
-    child.stdout.pipe(res);
-  });
-  child.on('close', (code) => {
-    if (code !== 0) {
-      console.error('save exited non-zero:', code, scrub(stderr.slice(-500)));
-      if (!sent && !res.headersSent) res.status(502).json({ error: 'This clip is not available right now. Please try again.' });
-      else if (sent) { try { res.end(); } catch {} }
+  // Headers go out only with the first real byte of output. Sending them
+  // on spawn meant a bad/stale quality choice came back as an empty file
+  // with a 200 status instead of an error. Termination lives in 'close'
+  // only: ending the response on stdout 'end' would commit a 200 before
+  // the exit code is known.
+  child.stdout.on('data', (chunk) => {
+    if (!sent) {
+      setDownloadHeaders(res, title, singleExt, singleType);
+      sent = true;
     }
+    if (!res.write(chunk)) child.stdout.pause();
+  });
+  res.on('drain', () => child.stdout.resume());
+  child.on('close', (code) => {
+    if (code === 0) {
+      if (sent) { try { res.end(); } catch {} }
+      else if (!res.headersSent) res.status(502).json({ error: 'This clip is not available right now. Please try again.' });
+      return;
+    }
+    console.error('save exited non-zero:', code, scrub(stderr.slice(-500)));
+    if (!sent && !res.headersSent) res.status(502).json({ error: 'This clip is not available right now. Please try again.' });
+    else if (sent) { try { res.end(); } catch {} }
   });
 });
 
