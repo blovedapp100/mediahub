@@ -1,5 +1,5 @@
 // MediaHub server — paste a link, preview the clip, pick a quality, save it.
-// No user data is stored. URLs are never written to logs.
+// No visitor data is stored. URLs are never written to logs.
 // Info responses are cached in memory (10 min, keyed by a hash of the link).
 const express = require('express');
 const { execFile, spawn } = require('child_process');
@@ -334,13 +334,87 @@ async function proxyArgs(url, allowProxy = true) {
   return (await warpCheck()) ? ['--proxy', WARP_PROXY] : [];
 }
 
+// ---- Background sessions (cookies) ----------------------------------------
+// The screen stays just the downloader — no login, no cookie UI anywhere.
+// Sessions live ONLY on the server, in the background: the owner's own
+// logged-in cookies for YouTube / TikTok / Facebook / Instagram, supplied
+// as environment variables (COOKIES_YOUTUBE, COOKIES_TIKTOK,
+// COOKIES_FACEBOOK, COOKIES_INSTAGRAM — each a full Netscape cookies.txt
+// file's contents; COOKIES_TXT is the combined fallback for all four) or
+// as local files cookies-<platform>.txt / cookies.txt (local dev only).
+// At startup each one is written to the temp dir and passed to yt-dlp as
+// --cookies, so downloads go out as the logged-in session instead of
+// anonymous. That is the only way a server can use a login: a website can
+// never read a visitor's browser cookies (same-origin rule), and a Google
+// sign-in only proves who someone is — it hands over no cookies and logs
+// nobody into TikTok/Facebook/Instagram. So sessions come from the owner
+// exporting his own cookies, never from visitors.
+// Safety: cookie contents are NEVER logged and NEVER returned by any API
+// — /api/health reports only true/false per platform. Nothing is stored
+// in git (see .gitignore) and nothing is written to disk outside tmp.
+// Without cookies the site behaves exactly as before.
+const COOKIE_PLATFORMS = ['youtube', 'tiktok', 'facebook', 'instagram'];
+const cookieFiles = {};
+function loadCookies() {
+  for (const p of COOKIE_PLATFORMS) {
+    const envName = 'COOKIES_' + p.toUpperCase();
+    let content = process.env[envName] || process.env.COOKIES_TXT || '';
+    if (!content) {
+      for (const f of [`cookies-${p}.txt`, 'cookies.txt']) {
+        try {
+          const fp = path.join(__dirname, f);
+          if (fs.existsSync(fp)) { content = fs.readFileSync(fp, 'utf8'); break; }
+        } catch {}
+      }
+    }
+    if (!content || !content.trim()) continue;
+    // A real Netscape file is tab-separated lines; a pasted single cookie
+    // or an empty file is not usable — skip it loudly instead of passing
+    // junk to yt-dlp on every call.
+    const lines = content.split('\n').filter((l) => l.trim() && !l.trim().startsWith('#'));
+    if (!lines.length || !lines.some((l) => l.split('\t').length >= 6)) {
+      console.error(`cookies ignored for ${p}: not a Netscape cookies.txt file`);
+      continue;
+    }
+    try {
+      const file = path.join(os.tmpdir(), `mediahub-cookies-${p}.txt`);
+      fs.writeFileSync(file, content, { mode: 0o600 });
+      cookieFiles[p] = file;
+      console.log(`cookies loaded for ${p} (${lines.length} cookies)`);
+    } catch (e) {
+      console.error(`cookies failed for ${p}:`, scrub(e.message));
+    }
+  }
+}
+loadCookies();
+function platformKey(url) {
+  if (isYouTube(url)) return 'youtube';
+  if (isTikTok(url)) return 'tiktok';
+  try {
+    const h = new URL(url).hostname.toLowerCase();
+    if (h.includes('facebook.com') || h.includes('fb.watch')) return 'facebook';
+    if (h.includes('instagram.com')) return 'instagram';
+  } catch {}
+  return null;
+}
+// --cookies for this link's platform, or [] when no session is loaded.
+function cookieArgs(url) {
+  const p = platformKey(url);
+  return p && cookieFiles[p] ? ['--cookies', cookieFiles[p]] : [];
+}
+function cookieStatus() {
+  const out = {};
+  for (const p of COOKIE_PLATFORMS) out[p] = Boolean(cookieFiles[p]);
+  return out;
+}
+
 // ---- yt-dlp ----------------------------------------------------------------
 
 function ytdlpJson(url, timeoutMs = 60000, extraArgs = [], allowProxy = true) {
   return (async () => {
     const pargs = await proxyArgs(url, allowProxy);
     return new Promise((resolve, reject) => {
-    execFile(YTDLP, ['-J', '--no-playlist', '--no-warnings', '--socket-timeout', '15', ...extraArgs, ...pargs, url],
+    execFile(YTDLP, ['-J', '--no-playlist', '--no-warnings', '--socket-timeout', '15', ...extraArgs, ...pargs, ...cookieArgs(url), url],
       { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 },
       (err, stdout, stderr) => {
         if (err) {
@@ -978,7 +1052,7 @@ function renderLanding(platform, req) {
 
 app.get('/api/config', rateLimit(30, 60000), (req, res) => res.json({ backupOrigins: BACKUP_ORIGINS, backupOrigin: BACKUP_ORIGINS[0] || null }));
 
-app.get('/api/health', (req, res) => res.json({ ok: true }));
+app.get('/api/health', (req, res) => res.json({ ok: true, cookies: cookieStatus() }));
 
 app.get('/robots.txt', (req, res) => {
   const base = req.protocol + '://' + req.get('host');
@@ -1156,7 +1230,7 @@ app.get('/api/save', rateLimit(10, 60000), async (req, res) => {
     // the file, and delete it immediately — no buildup on disk.
     const tmp = path.join(os.tmpdir(), 'mediahub-' + crypto.randomBytes(8).toString('hex') + '.mp4');
     const args = ['-f', formatId, '--merge-output-format', 'mp4', '--no-playlist', '--no-warnings',
-      '--socket-timeout', '15', ...(rawClientGet(url) || ytdlpExtraArgs(url)), ...saveProxyArgs, '-o', tmp, url];
+      '--socket-timeout', '15', ...(rawClientGet(url) || ytdlpExtraArgs(url)), ...saveProxyArgs, ...cookieArgs(url), '-o', tmp, url];
     const child = spawn(YTDLP, args, { timeout: 900000 });
     let stderr = '';
     child.stderr.on('data', (d) => { if (stderr.length < 4000) stderr += d.toString(); });
@@ -1190,7 +1264,7 @@ app.get('/api/save', rateLimit(10, 60000), async (req, res) => {
   const singleExt = rawFmt && rawFmt.ext ? String(rawFmt.ext).toLowerCase() : 'mp4';
   const singleType = singleExt === 'mp3' ? 'audio/mpeg' : singleExt === 'm4a' ? 'audio/mp4' : singleExt === 'webm' ? 'video/webm' : 'video/mp4';
   const args = ['-f', formatId, '--no-playlist', '--no-warnings',
-    '--socket-timeout', '15', ...(rawClientGet(url) || ytdlpExtraArgs(url)), ...saveProxyArgs, '-o', '-', url];
+    '--socket-timeout', '15', ...(rawClientGet(url) || ytdlpExtraArgs(url)), ...saveProxyArgs, ...cookieArgs(url), '-o', '-', url];
   const child = spawn(YTDLP, args, { timeout: 900000 });
   let sent = false;
   let stderr = '';
