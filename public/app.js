@@ -120,6 +120,52 @@
 
   var latestReq = 0;
 
+  // ---- multi-region fallback ---------------------------------------------
+  // The site runs in two regions. If this region's API cannot read a link
+  // (YouTube/TikTok block some datacenter IPs), the same request is tried
+  // against the backup region, and the download then comes from there.
+  // currentInfoOrigin remembers which region answered the quality list,
+  // so the Save button downloads from that same region.
+  var origins = null; // [own origin, backup origin] — filled lazily
+  var originsPromise = null;
+  var currentInfoOrigin = '';
+  function getOrigins() {
+    if (origins) return Promise.resolve(origins);
+    if (!originsPromise) {
+      originsPromise = fetch('/api/config')
+        .then(function (r) { return r.json(); })
+        .then(function (cfg) {
+          origins = [location.origin];
+          if (cfg && cfg.backupOrigin && cfg.backupOrigin !== location.origin) origins.push(cfg.backupOrigin);
+          return origins;
+        })
+        .catch(function () { origins = [location.origin]; return origins; });
+    }
+    return originsPromise;
+  }
+  // Try each origin in order until one answers with ok JSON.
+  // Returns { data, origin }. Throws the last error when all fail.
+  async function tryOrigins(path, options, timeoutMs) {
+    var list = await getOrigins();
+    var lastErr = null;
+    for (var i = 0; i < list.length; i++) {
+      var ctrl = new AbortController();
+      var timer = setTimeout(function () { ctrl.abort(); }, timeoutMs);
+      try {
+        var r = await fetch(list[i] + path, Object.assign({}, options, { signal: ctrl.signal }));
+        var data = await r.json().catch(function () { return null; });
+        if (!data) { lastErr = new Error('Something went wrong.'); continue; }
+        if (!r.ok) { lastErr = new Error(data.error || 'Something went wrong.'); continue; }
+        return { data: data, origin: list[i] };
+      } catch (e) {
+        lastErr = e;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    throw lastErr || new Error('Something went wrong.');
+  }
+
   // Typical seconds each platform takes to show the video (measured live).
   // meta = title/thumbnail, info = full quality list, max = give up after this.
   var PLATFORM_TIME = {
@@ -193,32 +239,30 @@
     result.hidden = true;
     formatsEl.innerHTML = '';
     // Stage 1 — fast preview (title + thumbnail) in about 2 seconds.
-    fetch('/api/meta', {
+    // Tries the backup region too when this region cannot read the link.
+    tryOrigins('/api/meta', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url: url }),
-    })
-      .then(function (r) { return r.json(); })
-      .then(function (data) {
+    }, 8000)
+      .then(function (res) {
+        var data = res && res.data;
         if (reqId !== latestReq || !data || !data.title) return;
         renderPreview(data);
         timerShown((Date.now() - timerStart) / 1000);
       })
       .catch(function () {});
     // Stage 2 — full quality list (takes a few seconds longer).
-    var ctrl = new AbortController();
-    var timeoutId = setTimeout(function () { ctrl.abort(); }, timing.max * 1000);
+    // Tries the backup region too when this region cannot read the link.
     try {
-      var r = await fetch('/api/info', {
+      var res = await tryOrigins('/api/info', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: url }),
-        signal: ctrl.signal,
-      });
-      var data = await r.json();
+      }, timing.max * 1000);
       if (reqId !== latestReq) return;
-      if (!r.ok) throw new Error(data.error || 'Something went wrong.');
-      renderResult(data);
+      currentInfoOrigin = res.origin;
+      renderResult(res.data);
       timerDone((Date.now() - timerStart) / 1000);
     } catch (err) {
       if (reqId !== latestReq) return;
@@ -232,7 +276,6 @@
         formatsEl.innerHTML = '<li class="loading">Could not load qualities — please try again.</li>';
       }
     } finally {
-      clearTimeout(timeoutId);
       if (reqId === latestReq) setBusy(false);
     }
   }
@@ -283,7 +326,7 @@
         var btn = ev.target;
         btn.disabled = true;
         btn.textContent = 'Saving…';
-        var saveUrl = '/api/save?url=' + encodeURIComponent(currentUrl) +
+        var saveUrl = (currentInfoOrigin || '') + '/api/save?url=' + encodeURIComponent(currentUrl) +
           '&formatId=' + encodeURIComponent(f.id) +
           '&t=' + encodeURIComponent(currentTitle);
         window.location.href = saveUrl;
