@@ -40,6 +40,25 @@ function isTikTok(u) {
   try { return new URL(u).hostname.toLowerCase().includes('tiktok.com'); } catch { return false; }
 }
 
+function isYouTube(u) {
+  try {
+    const h = new URL(u).hostname.toLowerCase();
+    return h === 'youtube.com' || h === 'www.youtube.com' || h === 'm.youtube.com' || h === 'youtu.be' || h.endsWith('.youtube.com');
+  } catch { return false; }
+}
+
+// Extra yt-dlp args per host. YouTube bot-checks datacenter IPs on its web
+// player, so try the Android client first, then iOS, then the default web
+// client — the app clients usually answer where the web player refuses.
+function ytdlpExtraArgs(url) {
+  return isYouTube(url) ? ['--extractor-args', 'youtube:player_client=android'] : [];
+}
+function ytdlpFallbackArgs(url) {
+  return isYouTube(url)
+    ? ['--extractor-args', 'youtube:player_client=ios']
+    : ['--user-agent', 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'];
+}
+
 // Strip any URL out of a string before it is logged.
 function scrub(s) { return String(s || '').replace(/https?:\/\/\S+/g, '[link]'); }
 
@@ -49,6 +68,36 @@ function safeTitle(t, fallback) {
   if (s.length > 80) s = s.slice(0, 80).trim();
   return s || fallback || 'video';
 }
+
+// Build a Content-Disposition value Node.js will never reject: the plain
+// filename is ASCII-only (emoji / non-Latin chars dropped), and the real
+// title travels percent-encoded in filename* (RFC 5987). A raw emoji in a
+// header used to throw ERR_INVALID_CHAR and kill the whole process.
+function contentDisposition(title, ext) {
+  const raw = String(title || 'video');
+  let ascii = '';
+  for (const ch of raw) {
+    const code = ch.codePointAt(0);
+    if (code >= 32 && code <= 126 && ch !== '"' && ch !== "'") ascii += ch;
+  }
+  ascii = ascii.trim().slice(0, 100) || 'video';
+  const encoded = encodeURIComponent(raw).slice(0, 200);
+  return 'attachment; filename="' + ascii + '.' + ext + '"; filename*=UTF-8' + "''" + encoded + '.' + ext;
+}
+
+function setDownloadHeaders(res, title, ext, contentType) {
+  res.setHeader('Content-Type', contentType);
+  try {
+    res.setHeader('Content-Disposition', contentDisposition(title, ext));
+  } catch {
+    res.setHeader('Content-Disposition', 'attachment; filename="video.' + ext + '"');
+  }
+}
+
+// Last resort: never let one bad request kill the server for everyone.
+process.on('uncaughtException', (e) => {
+  console.error('uncaught:', scrub(String((e && e.stack) || e)).slice(0, 1000));
+});
 
 // ---- info cache (hash-keyed, 10 min TTL, max 200 entries) -------------------
 const INFO_TTL = 10 * 60 * 1000;
@@ -137,15 +186,42 @@ async function tikwmStreamUrl(url, kind) {
 
 // ---- yt-dlp ----------------------------------------------------------------
 
-function ytdlpJson(url, timeoutMs = 60000) {
+function ytdlpJson(url, timeoutMs = 60000, extraArgs = []) {
   return new Promise((resolve, reject) => {
-    execFile(YTDLP, ['-J', '--no-playlist', '--no-warnings', '--socket-timeout', '15', url],
+    execFile(YTDLP, ['-J', '--no-playlist', '--no-warnings', '--socket-timeout', '15', ...extraArgs, url],
       { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 },
       (err, stdout) => {
         if (err) return reject(new Error('Could not read this link. The video may be private, removed, or the site is blocking us.'));
         try { resolve(JSON.parse(stdout)); } catch { reject(new Error('Could not read this link.')); }
       });
   });
+}
+
+// Info lookup with fallbacks: try several player clients in turn — the
+// YouTube bot check is flaky on datacenter IPs, so one client failing does
+// not mean the video is unreadable; the Android client usually answers.
+async function ytdlpInfoWithFallbacks(url) {
+  const attempts = isYouTube(url)
+    ? [
+        ['--extractor-args', 'youtube:player_client=android'],
+        ['--extractor-args', 'youtube:player_client=web_embedded'],
+        ['--extractor-args', 'youtube:player_client=android'],
+        ['--extractor-args', 'youtube:player_client=ios'],
+        [],
+      ]
+    : [
+        [],
+        ['--user-agent', 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'],
+      ];
+  let lastErr = null;
+  for (const args of attempts) {
+    try {
+      return await ytdlpJson(url, 60000, args);
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr;
 }
 
 // Prefer widely playable codecs: h264 first, then vp9, then av1.
@@ -425,7 +501,7 @@ app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
       // fall through to yt-dlp when tikwm has nothing
     }
     if (!result) {
-      const info = await ytdlpJson(url);
+      const info = await ytdlpInfoWithFallbacks(url);
       const formats = buildFormats(info);
       if (!formats.length) return res.status(404).json({ error: 'No playable versions were found for this link.' });
       result = {
@@ -465,8 +541,7 @@ app.get('/api/save', rateLimit(10, 60000), async (req, res) => {
     try {
       const r = await fetch(streamUrl, { headers: { 'User-Agent': 'Mozilla/5.0', Referer: 'https://www.tiktok.com/' } });
       if (!r.ok || !r.body) return res.status(502).json({ error: 'This clip is not available right now. Please try again.' });
-      res.setHeader('Content-Type', ext === 'mp3' ? 'audio/mpeg' : 'video/mp4');
-      res.setHeader('Content-Disposition', 'attachment; filename="' + title.replace(/"/g, '') + '.' + ext + '"');
+      setDownloadHeaders(res, title, ext, ext === 'mp3' ? 'audio/mpeg' : 'video/mp4');
       const reader = r.body.getReader();
       try {
         for (;;) {
@@ -493,7 +568,7 @@ app.get('/api/save', rateLimit(10, 60000), async (req, res) => {
     // the file, and delete it immediately — no buildup on disk.
     const tmp = path.join(os.tmpdir(), 'mediahub-' + crypto.randomBytes(8).toString('hex') + '.mp4');
     const args = ['-f', formatId, '--merge-output-format', 'mp4', '--no-playlist', '--no-warnings',
-      '--socket-timeout', '15', '-o', tmp, url];
+      '--socket-timeout', '15', ...ytdlpExtraArgs(url), '-o', tmp, url];
     const child = spawn(YTDLP, args, { timeout: 900000 });
     let stderr = '';
     child.stderr.on('data', (d) => { if (stderr.length < 4000) stderr += d.toString(); });
@@ -508,8 +583,7 @@ app.get('/api/save', rateLimit(10, 60000), async (req, res) => {
         if (!res.headersSent) res.status(502).json({ error: 'This clip is not available right now. Please try again.' });
         return;
       }
-      res.setHeader('Content-Type', 'video/mp4');
-      res.setHeader('Content-Disposition', 'attachment; filename="' + title.replace(/"/g, '') + '.' + ext + '"');
+      setDownloadHeaders(res, title, ext, 'video/mp4');
       const stream = fs.createReadStream(tmp);
       stream.on('error', () => { fs.unlink(tmp, () => {}); try { res.end(); } catch {} });
       stream.on('end', () => fs.unlink(tmp, () => {}));
@@ -520,7 +594,7 @@ app.get('/api/save', rateLimit(10, 60000), async (req, res) => {
 
   // Single format: stream stdout straight to the client, nothing on disk.
   const args = ['-f', formatId, '--no-playlist', '--no-warnings',
-    '--socket-timeout', '15', '-o', '-', url];
+    '--socket-timeout', '15', ...ytdlpExtraArgs(url), '-o', '-', url];
   const child = spawn(YTDLP, args, { timeout: 900000 });
   let sent = false;
   let stderr = '';
@@ -529,8 +603,7 @@ app.get('/api/save', rateLimit(10, 60000), async (req, res) => {
     if (!res.headersSent) res.status(502).json({ error: 'This clip is not available right now. Please try again.' });
   });
   child.on('spawn', () => {
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Disposition', 'attachment; filename="' + title.replace(/"/g, '') + '.' + ext + '"');
+    setDownloadHeaders(res, title, ext, 'video/mp4');
     sent = true;
     child.stdout.pipe(res);
   });
