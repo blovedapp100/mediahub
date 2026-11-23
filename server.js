@@ -5,6 +5,7 @@ const express = require('express');
 const { execFile, spawn } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
+const net = require('net');
 const os = require('os');
 const path = require('path');
 
@@ -279,11 +280,44 @@ async function tikwmStreamUrl(url, kind) {
   } catch { return null; } finally { clearTimeout(timer); }
 }
 
+// ---- Cloudflare WARP egress -------------------------------------------------
+// Render's IPs are blocked by YouTube/TikTok in every region, so yt-dlp
+// cannot read those links direct. The fix is a userspace WireGuard tunnel
+// to Cloudflare WARP (free, no account) running inside the container:
+// wireproxy exposes a local SOCKS5 proxy and yt-dlp routes its
+// YouTube/TikTok calls through it. Facebook/Instagram already work
+// direct, so they never use the proxy. If the proxy is down, calls fall
+// back to direct — a WARP outage never takes the whole site down.
+// The verdict is cached for 5 minutes, then re-checked.
+const WARP_PORT = 25344;
+const WARP_PROXY = 'socks5://127.0.0.1:' + WARP_PORT;
+let warpUp = null;
+let warpUpAt = 0;
+const WARP_CHECK_TTL_MS = 5 * 60 * 1000;
+function warpCheck() {
+  const now = Date.now();
+  if (warpUp !== null && now - warpUpAt < WARP_CHECK_TTL_MS) return Promise.resolve(warpUp);
+  return new Promise((resolve) => {
+    const s = net.connect(WARP_PORT, '127.0.0.1');
+    const done = (v) => { warpUp = v; warpUpAt = Date.now(); try { s.destroy(); } catch {} resolve(v); };
+    s.setTimeout(2000);
+    s.once('connect', () => done(true));
+    s.once('timeout', () => done(false));
+    s.once('error', () => done(false));
+  });
+}
+async function proxyArgs(url) {
+  if (!isYouTube(url) && !isTikTok(url)) return [];
+  return (await warpCheck()) ? ['--proxy', WARP_PROXY] : [];
+}
+
 // ---- yt-dlp ----------------------------------------------------------------
 
 function ytdlpJson(url, timeoutMs = 60000, extraArgs = []) {
-  return new Promise((resolve, reject) => {
-    execFile(YTDLP, ['-J', '--no-playlist', '--no-warnings', '--socket-timeout', '15', ...extraArgs, url],
+  return (async () => {
+    const pargs = await proxyArgs(url);
+    return new Promise((resolve, reject) => {
+    execFile(YTDLP, ['-J', '--no-playlist', '--no-warnings', '--socket-timeout', '15', ...extraArgs, ...pargs, url],
       { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 },
       (err, stdout, stderr) => {
         if (err) {
@@ -296,7 +330,8 @@ function ytdlpJson(url, timeoutMs = 60000, extraArgs = []) {
         }
         try { resolve(JSON.parse(stdout)); } catch { reject(new Error('Could not read this link.')); }
       });
-  });
+    });
+  })();
 }
 
 // Richness of an info result: highest video height first, then most
@@ -1050,7 +1085,11 @@ app.get('/api/save', rateLimit(10, 60000), async (req, res) => {
   // Audio-only streams are NOT streamed directly: YouTube throttles a
   // plain fetch of an audio-only URL to ~30KB/s, while yt-dlp pulls the
   // same URL at full speed — so audio goes to the yt-dlp save below.
-  if (!formatId.includes('+')) {
+  // YouTube/TikTok through WARP: the direct googlevideo fetch runs on
+  // Render's own IP (blocked), so skip it and go straight to the yt-dlp
+  // save below, which uses the proxy.
+  const saveProxyArgs = await proxyArgs(url);
+  if (!formatId.includes('+') && !saveProxyArgs.length) {
     const raw = rawCacheGet(url);
     const fmt = raw && Array.isArray(raw.formats) ? raw.formats.find((f) => f && String(f.format_id) === formatId && f.url) : null;
     if (fmt && fmt.vcodec && fmt.vcodec !== 'none') {
@@ -1074,7 +1113,7 @@ app.get('/api/save', rateLimit(10, 60000), async (req, res) => {
     // the file, and delete it immediately — no buildup on disk.
     const tmp = path.join(os.tmpdir(), 'mediahub-' + crypto.randomBytes(8).toString('hex') + '.mp4');
     const args = ['-f', formatId, '--merge-output-format', 'mp4', '--no-playlist', '--no-warnings',
-      '--socket-timeout', '15', ...(rawClientGet(url) || ytdlpExtraArgs(url)), '-o', tmp, url];
+      '--socket-timeout', '15', ...(rawClientGet(url) || ytdlpExtraArgs(url)), ...saveProxyArgs, '-o', tmp, url];
     const child = spawn(YTDLP, args, { timeout: 900000 });
     let stderr = '';
     child.stderr.on('data', (d) => { if (stderr.length < 4000) stderr += d.toString(); });
@@ -1108,7 +1147,7 @@ app.get('/api/save', rateLimit(10, 60000), async (req, res) => {
   const singleExt = rawFmt && rawFmt.ext ? String(rawFmt.ext).toLowerCase() : 'mp4';
   const singleType = singleExt === 'mp3' ? 'audio/mpeg' : singleExt === 'm4a' ? 'audio/mp4' : singleExt === 'webm' ? 'video/webm' : 'video/mp4';
   const args = ['-f', formatId, '--no-playlist', '--no-warnings',
-    '--socket-timeout', '15', ...(rawClientGet(url) || ytdlpExtraArgs(url)), '-o', '-', url];
+    '--socket-timeout', '15', ...(rawClientGet(url) || ytdlpExtraArgs(url)), ...saveProxyArgs, '-o', '-', url];
   const child = spawn(YTDLP, args, { timeout: 900000 });
   let sent = false;
   let stderr = '';
