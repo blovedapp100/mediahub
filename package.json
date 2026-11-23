@@ -1,0 +1,1 @@
+{"dependencies":{"express":"^4.19.2"},"description":"MediaHub - preview a clip from a link and keep it in the quality you choose","license":"MIT","main":"server.js","name":"mediahub","scripts":{"start":"node server.js"},"version":"1.0.0"}
