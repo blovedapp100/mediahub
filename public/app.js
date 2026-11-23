@@ -136,7 +136,10 @@
         .then(function (r) { return r.json(); })
         .then(function (cfg) {
           origins = [location.origin];
-          if (cfg && cfg.backupOrigin && cfg.backupOrigin !== location.origin) origins.push(cfg.backupOrigin);
+          var list = (cfg && cfg.backupOrigins) || (cfg && cfg.backupOrigin ? [cfg.backupOrigin] : []);
+          list.forEach(function (o) {
+            if (o && o !== location.origin && origins.indexOf(o) === -1) origins.push(o);
+          });
           return origins;
         })
         .catch(function () { origins = [location.origin]; return origins; });
