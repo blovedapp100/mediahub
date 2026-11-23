@@ -142,10 +142,10 @@ setInterval(() => {
 
 // ---- TikTok via the free tikwm API (primary), yt-dlp as fallback -----------
 
-async function tikwmInfo(url) {
+async function tikwmInfo(url, timeoutMs = 12000) {
   const api = 'https://www.tikwm.com/api/?url=' + encodeURIComponent(url) + '&hd=1';
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 12000);
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const r = await fetch(api, { signal: ctrl.signal, headers: { 'User-Agent': 'Mozilla/5.0' } });
     const j = await r.json();
@@ -200,19 +200,37 @@ function ytdlpJson(url, timeoutMs = 60000, extraArgs = []) {
 // Info lookup with fallbacks: try several player clients in turn — the
 // YouTube bot check is flaky on datacenter IPs, so one client failing does
 // not mean the video is unreadable; the Android client usually answers.
+// For YouTube, the first two clients race in parallel so a slow one does
+// not hold up the other.
 async function ytdlpInfoWithFallbacks(url) {
-  const attempts = isYouTube(url)
-    ? [
-        ['--extractor-args', 'youtube:player_client=android'],
-        ['--extractor-args', 'youtube:player_client=web_embedded'],
-        ['--extractor-args', 'youtube:player_client=android'],
-        ['--extractor-args', 'youtube:player_client=ios'],
-        [],
-      ]
-    : [
-        [],
-        ['--user-agent', 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'],
-      ];
+  if (isYouTube(url)) {
+    const android = ['--extractor-args', 'youtube:player_client=android'];
+    const webEmb = ['--extractor-args', 'youtube:player_client=web_embedded'];
+    try {
+      return await Promise.any([
+        ytdlpJson(url, 30000, android),
+        ytdlpJson(url, 30000, webEmb),
+      ]);
+    } catch {}
+    const rest = [
+      android,
+      ['--extractor-args', 'youtube:player_client=ios'],
+      [],
+    ];
+    let lastErr = null;
+    for (const args of rest) {
+      try {
+        return await ytdlpJson(url, 30000, args);
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw lastErr;
+  }
+  const attempts = [
+    [],
+    ['--user-agent', 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'],
+  ];
   let lastErr = null;
   for (const args of attempts) {
     try {
@@ -222,6 +240,261 @@ async function ytdlpInfoWithFallbacks(url) {
     }
   }
   throw lastErr;
+}
+
+// ---- fast preview metadata (~1-2s) -----------------------------------------
+// Title / thumbnail / author without waiting for the full format extraction.
+// YouTube: public oEmbed endpoint. TikTok: tikwm API. Anything else: the
+// page's og: tags. Returns null fast when nothing answers — the caller then
+// just waits for /api/info.
+function decodeEntities(s) {
+  return String(s || '')
+    .replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+}
+
+function ogTag(html, prop) {
+  const i = html.indexOf('property="' + prop + '"');
+  if (i < 0) return '';
+  const seg = html.slice(i, i + 600);
+  const m = seg.match(/content="([^"]+)"/) || seg.match(/content='([^']+)'/);
+  return m ? m[1] : '';
+}
+
+async function fastMeta(url) {
+  const cached = cacheGet('meta:' + url);
+  if (cached) return cached;
+  let out = null;
+  if (isYouTube(url)) {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 4000);
+      const r = await fetch('https://www.youtube.com/oembed?url=' + encodeURIComponent(url) + '&format=json',
+        { signal: ctrl.signal, headers: { 'User-Agent': 'Mozilla/5.0' } });
+      clearTimeout(timer);
+      const j = await r.json();
+      if (j && j.title) out = { title: decodeEntities(j.title), thumbnail: j.thumbnail_url || '', uploader: j.author_name || '', duration: 0 };
+    } catch {}
+  }
+  if (!out && isTikTok(url)) {
+    try {
+      const t = await tikwmInfo(url, 2500);
+      if (t) out = { title: t.title, thumbnail: t.thumbnail, uploader: t.uploader, duration: t.duration || 0 };
+    } catch {}
+  }
+  if (!out) {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 2500);
+      const r = await fetch(url, {
+        signal: ctrl.signal, redirect: 'follow',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+          'Accept-Language': 'en-US,en;q=0.9',
+        },
+      });
+      clearTimeout(timer);
+      const html = await r.text();
+      const title = decodeEntities(ogTag(html, 'og:title'));
+      const img = ogTag(html, 'og:image');
+      if (title || img) out = { title: title || 'Video', thumbnail: img, uploader: ogTag(html, 'og:site_name') || '', duration: 0 };
+    } catch {}
+  }
+  if (out) cacheSet('meta:' + url, out);
+  return out;
+}
+
+// ---- YouTube via public Invidious / Piped mirrors (fallback) ---------------
+// Render's IP is bot-checked by YouTube, so when yt-dlp fails we ask public
+// mirrors that keep their own YouTube access. Each attempt is short (5s) and
+// fail-safe: a dead mirror just means "try the next one". Hosts are
+// configurable via INVIDIOUS_HOSTS / PIPED_HOSTS (comma-separated) for tests.
+const INVIDIOUS_HOSTS = (process.env.INVIDIOUS_HOSTS || 'https://invidious.privacyredirect.com,https://yewtu.be,https://inv.nadeko.net').split(',').map((s) => s.trim()).filter(Boolean);
+const PIPED_HOSTS = (process.env.PIPED_HOSTS || 'https://pipedapi.kavin.rocks,https://pipedapi-libre.kavin.rocks,https://pipedapi.leptons.xyz').split(',').map((s) => s.trim()).filter(Boolean);
+
+async function fetchJsonTimeout(url, timeoutMs) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, { signal: ctrl.signal, headers: { 'User-Agent': 'Mozilla/5.0', Accept: 'application/json' } });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch { return null; } finally { clearTimeout(timer); }
+}
+
+function youtubeId(url) {
+  try {
+    const u = new URL(url);
+    if (u.hostname === 'youtu.be') return u.pathname.slice(1).split('/')[0] || '';
+    return u.searchParams.get('v') || '';
+  } catch { return ''; }
+}
+
+function heightOf(q) {
+  const n = parseInt(String(q || '').replace(/[^0-9]/g, ''), 10);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function invidiousInfo(vid) {
+  return (async () => {
+    for (const h of INVIDIOUS_HOSTS) {
+      const j = await fetchJsonTimeout(h + '/api/v1/videos/' + vid, 5000);
+      if (j && Array.isArray(j.formatStreams) && j.formatStreams.length) return j;
+    }
+    return null;
+  })();
+}
+
+function pipedInfo(vid) {
+  return (async () => {
+    for (const h of PIPED_HOSTS) {
+      const j = await fetchJsonTimeout(h + '/streams/' + vid, 5000);
+      if (j && ((Array.isArray(j.videoStreams) && j.videoStreams.length) || (Array.isArray(j.audioStreams) && j.audioStreams.length))) return j;
+    }
+    return null;
+  })();
+}
+
+function invidiousToInfo(j) {
+  const formats = [];
+  for (const s of (j.formatStreams || [])) {
+    if (!s || !s.url) continue;
+    formats.push({
+      format_id: 'inv-' + (s.itag || heightOf(s.quality)),
+      ext: String(s.container || 'mp4').toLowerCase(),
+      height: heightOf(s.quality),
+      width: 0,
+      fps: s.fps || 0,
+      vcodec: s.encoding || 'avc1',
+      acodec: 'mp4a',
+      url: s.url,
+      filesize: s.size || 0,
+      filesize_approx: s.size || 0,
+      tbr: s.bitrate ? s.bitrate / 1000 : 0,
+    });
+  }
+  let bestAudio = null;
+  for (const s of (j.adaptiveFormats || [])) {
+    if (!s || !s.url || s.type !== 'audio') continue;
+    if (!bestAudio || (s.bitrate || 0) > (bestAudio.bitrate || 0)) bestAudio = s;
+  }
+  if (bestAudio) {
+    formats.push({
+      format_id: 'inv-audio',
+      ext: String(bestAudio.container || 'm4a').toLowerCase(),
+      height: 0,
+      width: 0,
+      fps: 0,
+      vcodec: 'none',
+      acodec: bestAudio.encoding || 'mp4a',
+      url: bestAudio.url,
+      filesize: 0,
+      filesize_approx: 0,
+      abr: bestAudio.bitrate ? bestAudio.bitrate / 1000 : 0,
+    });
+  }
+  const thumbs = Array.isArray(j.videoThumbnails) ? j.videoThumbnails : [];
+  const thumb = (thumbs.find((t) => t && t.width >= 480) || thumbs[thumbs.length - 1] || {}).url || '';
+  return {
+    title: j.title || 'Video',
+    thumbnail: thumb,
+    duration: j.lengthSeconds || 0,
+    uploader: j.author || '',
+    formats,
+  };
+}
+
+function pipedToInfo(j) {
+  const formats = [];
+  for (const s of (j.videoStreams || [])) {
+    if (!s || !s.url || s.videoOnly) continue;
+    const fmt = String(s.format || '').toUpperCase();
+    formats.push({
+      format_id: 'pip-' + (s.itag || heightOf(s.quality)),
+      ext: fmt.includes('WEBM') ? 'webm' : 'mp4',
+      height: heightOf(s.quality),
+      width: 0,
+      fps: s.fps || 0,
+      vcodec: s.codec || 'avc1',
+      acodec: 'mp4a',
+      url: s.url,
+      filesize: 0,
+      filesize_approx: 0,
+      tbr: s.bitrate ? s.bitrate / 1000 : 0,
+    });
+  }
+  let bestAudio = null;
+  for (const s of (j.audioStreams || [])) {
+    if (!s || !s.url) continue;
+    if (!bestAudio || (s.bitrate || 0) > (bestAudio.bitrate || 0)) bestAudio = s;
+  }
+  if (bestAudio) {
+    formats.push({
+      format_id: 'pip-audio',
+      ext: 'm4a',
+      height: 0,
+      width: 0,
+      fps: 0,
+      vcodec: 'none',
+      acodec: bestAudio.codec || 'mp4a',
+      url: bestAudio.url,
+      filesize: 0,
+      filesize_approx: 0,
+      abr: bestAudio.bitrate ? bestAudio.bitrate / 1000 : 0,
+    });
+  }
+  return {
+    title: j.title || 'Video',
+    thumbnail: j.thumbnailUrl || '',
+    duration: j.duration || 0,
+    uploader: j.uploader || '',
+    formats,
+  };
+}
+
+async function mirrorInfo(url) {
+  const vid = youtubeId(url);
+  if (!vid) return null;
+  const [inv, pip] = await Promise.all([invidiousInfo(vid), pipedInfo(vid)]);
+  if (inv) return invidiousToInfo(inv);
+  if (pip) return pipedToInfo(pip);
+  return null;
+}
+
+async function mirrorStreamUrl(url, formatId) {
+  const vid = youtubeId(url);
+  if (!vid) return null;
+  const isInv = formatId.startsWith('inv-');
+  const wantAudio = formatId.endsWith('-audio');
+  const itag = wantAudio ? '' : formatId.slice(4);
+  if (isInv) {
+    const j = await invidiousInfo(vid);
+    if (!j) return null;
+    if (wantAudio) {
+      let best = null;
+      for (const s of (j.adaptiveFormats || [])) {
+        if (s && s.type === 'audio' && s.url && (!best || (s.bitrate || 0) > (best.bitrate || 0))) best = s;
+      }
+      return best ? best.url : null;
+    }
+    for (const s of (j.formatStreams || [])) {
+      if (s && String(s.itag) === itag && s.url) return s.url;
+    }
+    return null;
+  }
+  const j = await pipedInfo(vid);
+  if (!j) return null;
+  if (wantAudio) {
+    let best = null;
+    for (const s of (j.audioStreams || [])) {
+      if (s && s.url && (!best || (s.bitrate || 0) > (best.bitrate || 0))) best = s;
+    }
+    return best ? best.url : null;
+  }
+  for (const s of (j.videoStreams || [])) {
+    if (s && String(s.itag) === itag && s.url) return s.url;
+  }
+  return null;
 }
 
 // Prefer widely playable codecs: h264 first, then vp9, then av1.
@@ -487,6 +760,16 @@ app.get('/:platform(youtube|tiktok|facebook|instagram|twitter)', (req, res) => {
   res.type('text/html').send(renderLanding(req.params.platform, req));
 });
 
+app.post('/api/meta', rateLimit(30, 60000), async (req, res) => {
+  const url = String(req.body && req.body.url || '').trim();
+  if (!url || !/^https?:\/\//i.test(url) || !hostAllowed(url)) {
+    return res.status(400).json({ error: 'Please paste a valid video link.' });
+  }
+  const meta = await fastMeta(url);
+  if (!meta) return res.status(404).json({ error: 'No preview available yet.' });
+  return res.json(meta);
+});
+
 app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
   const url = String(req.body && req.body.url || '').trim();
   if (!url || !/^https?:\/\//i.test(url) || !hostAllowed(url)) {
@@ -501,7 +784,14 @@ app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
       // fall through to yt-dlp when tikwm has nothing
     }
     if (!result) {
-      const info = await ytdlpInfoWithFallbacks(url);
+      let info = null;
+      try {
+        info = await ytdlpInfoWithFallbacks(url);
+      } catch {
+        info = null;
+      }
+      if (!info && isYouTube(url)) info = await mirrorInfo(url);
+      if (!info) throw new Error('Could not read this link. The video may be private, removed, or the site is blocking us.');
       const formats = buildFormats(info);
       if (!formats.length) return res.status(404).json({ error: 'No playable versions were found for this link.' });
       result = {
@@ -542,6 +832,32 @@ app.get('/api/save', rateLimit(10, 60000), async (req, res) => {
       const r = await fetch(streamUrl, { headers: { 'User-Agent': 'Mozilla/5.0', Referer: 'https://www.tiktok.com/' } });
       if (!r.ok || !r.body) return res.status(502).json({ error: 'This clip is not available right now. Please try again.' });
       setDownloadHeaders(res, title, ext, ext === 'mp3' ? 'audio/mpeg' : 'video/mp4');
+      const reader = r.body.getReader();
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (!res.write(Buffer.from(value))) await new Promise((ok) => res.once('drain', ok));
+        }
+        res.end();
+      } catch { try { res.end(); } catch {} }
+    } catch (e) {
+      console.error('stream failed:', scrub(e.message));
+      if (!res.headersSent) res.status(502).json({ error: 'This clip is not available right now. Please try again.' });
+      else try { res.end(); } catch {}
+    }
+    return;
+  }
+
+  // Mirror streams (Invidious / Piped): resolve the direct stream URL and stream it through.
+  if (formatId.startsWith('inv-') || formatId.startsWith('pip-')) {
+    const streamUrl = await mirrorStreamUrl(url, formatId);
+    if (!streamUrl) return res.status(502).json({ error: 'This clip is not available right now. Please try again.' });
+    const ext = formatId.endsWith('-audio') ? 'm4a' : 'mp4';
+    try {
+      const r = await fetch(streamUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+      if (!r.ok || !r.body) return res.status(502).json({ error: 'This clip is not available right now. Please try again.' });
+      setDownloadHeaders(res, title, ext, ext === 'm4a' ? 'audio/mp4' : 'video/mp4');
       const reader = r.body.getReader();
       try {
         for (;;) {
