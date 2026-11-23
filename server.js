@@ -215,6 +215,23 @@ function rawClientGet(url) {
   return e.args;
 }
 
+// Whether the winning info for a URL came through the WARP proxy (same
+// TTL) — /api/save must use the same egress that produced the info.
+const rawProxy = new Map();
+function rawProxySet(url, viaProxy) {
+  if (rawProxy.size >= 200) {
+    const first = rawProxy.keys().next().value;
+    if (first) rawProxy.delete(first);
+  }
+  rawProxy.set(cacheKey(url), { at: Date.now(), viaProxy: viaProxy === true });
+}
+function rawProxyGet(url) {
+  const e = rawProxy.get(cacheKey(url));
+  if (!e) return null;
+  if (Date.now() - e.at > INFO_TTL) { rawProxy.delete(cacheKey(url)); return null; }
+  return e.viaProxy;
+}
+
 // ---- per-IP rate limit (counts only, no URLs stored) ------------------------
 const hits = new Map();
 function rateLimit(max, windowMs) {
@@ -306,16 +323,22 @@ function warpCheck() {
     s.once('error', () => done(false));
   });
 }
-async function proxyArgs(url) {
+// allowProxy=false forces direct (no --proxy flag at all). Direct is
+// always tried first: on a host whose own IP works, direct wins, and the
+// proxy is only the fallback when direct fails — otherwise WARP would
+// mask a working IP (that is exactly what happened on the first WARP
+// deploy: the proxy was up, so every call used it).
+async function proxyArgs(url, allowProxy = true) {
+  if (!allowProxy) return [];
   if (!isYouTube(url) && !isTikTok(url)) return [];
   return (await warpCheck()) ? ['--proxy', WARP_PROXY] : [];
 }
 
 // ---- yt-dlp ----------------------------------------------------------------
 
-function ytdlpJson(url, timeoutMs = 60000, extraArgs = []) {
+function ytdlpJson(url, timeoutMs = 60000, extraArgs = [], allowProxy = true) {
   return (async () => {
-    const pargs = await proxyArgs(url);
+    const pargs = await proxyArgs(url, allowProxy);
     return new Promise((resolve, reject) => {
     execFile(YTDLP, ['-J', '--no-playlist', '--no-warnings', '--socket-timeout', '15', ...extraArgs, ...pargs, url],
       { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 },
@@ -358,18 +381,19 @@ function withTimeout(promise, ms, msg) {
 }
 
 // Info lookup: everything races in parallel and the richest success wins.
-// The old code ran clients one after another with 30-60s timeouts, so on
-// a blocked IP the chain took up to 2 minutes — long past the 30s the
-// browser waits — and the mirror fallback never got a chance to run.
-// YouTube: android + web_embedded + tv_embedded clients (12s each) race
-// the Invidious/Piped mirrors, and the result with the most qualities is
+// YouTube/TikTok run in TWO rounds — direct first (8s), then the WARP
+// proxy round (12s). Direct first, so a host whose own IP works never
+// hides behind the proxy; the proxy only runs when direct fails.
+// YouTube: android + web_embedded + tv_embedded clients race the
+// Invidious/Piped mirrors, and the result with the most qualities is
 // kept. TikTok: the plain client races two other API hostnames (the
 // iPhone user-agent breaks TikTok in yt-dlp, so it is NOT used here).
-// Everything else: plain + iPhone user-agent, 20s each.
-// Returns { info, clientArgs } — clientArgs are the yt-dlp extra args of
-// the client that produced this info (null for mirrors), so /api/save can
-// download with the same client: a format from tv_embedded does not exist
-// for the android client, and a save with the wrong client fails.
+// Everything else: plain + iPhone user-agent, 20s, direct only.
+// Returns { info, clientArgs, viaProxy } — clientArgs are the yt-dlp
+// extra args of the client that produced this info (null for mirrors),
+// so /api/save can download with the same client AND the same egress:
+// a format from tv_embedded does not exist for the android client, and
+// a save with the wrong client fails.
 async function ytdlpInfoWithFallbacks(url) {
   const wrapErr = (e) => {
     const err = new Error('Could not read this link. The video may be private, removed, or the site is blocking us.');
@@ -383,25 +407,30 @@ async function ytdlpInfoWithFallbacks(url) {
       ['--extractor-args', 'youtube:player_client=web_embedded'],
       ['--extractor-args', 'youtube:player_client=tv_embedded'],
     ];
-    const mirror = withTimeout(mirrorInfo(url).then((info) => {
-      if (!info) throw new Error('mirror empty');
-      return { info, clientArgs: null };
-    }), 12000, 'mirror timeout');
-    const settled = await Promise.allSettled([
-      ...clients.map((args) => tag(ytdlpJson(url, 12000, args), args)),
-      mirror,
-    ]);
-    const ok = settled.filter((r) => r.status === 'fulfilled').map((r) => r.value);
-    if (!ok.length) {
-      const err = new Error('Could not read this link. The video may be private, removed, or the site is blocking us.');
-      err.detail = settled.filter((r) => r.status === 'rejected').map((r) => r.reason && r.reason.detail).filter(Boolean).join(' | ');
-      throw err;
+    let lastDetail = '';
+    for (const round of [{ allowProxy: false, timeout: 8000 }, { allowProxy: true, timeout: 12000 }]) {
+      const mirror = withTimeout(mirrorInfo(url).then((info) => {
+        if (!info) throw new Error('mirror empty');
+        return { info, clientArgs: null };
+      }), round.timeout, 'mirror timeout');
+      const settled = await Promise.allSettled([
+        ...clients.map((args) => tag(ytdlpJson(url, round.timeout, args, round.allowProxy), args)),
+        mirror,
+      ]);
+      const ok = settled.filter((r) => r.status === 'fulfilled').map((r) => r.value);
+      if (ok.length) {
+        let best = ok[0];
+        for (const cand of ok) {
+          if (infoScore(cand.info) > infoScore(best.info)) best = cand;
+        }
+        best.viaProxy = round.allowProxy;
+        return best;
+      }
+      lastDetail = settled.filter((r) => r.status === 'rejected').map((r) => r.reason && r.reason.detail).filter(Boolean).join(' | ');
     }
-    let best = ok[0];
-    for (const cand of ok) {
-      if (infoScore(cand.info) > infoScore(best.info)) best = cand;
-    }
-    return best;
+    const err = new Error('Could not read this link. The video may be private, removed, or the site is blocking us.');
+    err.detail = lastDetail;
+    throw err;
   }
   const attempts = isTikTok(url)
     ? [
@@ -413,11 +442,20 @@ async function ytdlpInfoWithFallbacks(url) {
         [],
         ['--user-agent', 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'],
       ];
-  try {
-    return await Promise.any(attempts.map((args) => tag(ytdlpJson(url, 20000, args), args)));
-  } catch (e) {
-    throw wrapErr(e);
+  const rounds = isTikTok(url)
+    ? [{ allowProxy: false, timeout: 8000 }, { allowProxy: true, timeout: 12000 }]
+    : [{ allowProxy: false, timeout: 20000 }];
+  let lastErr = null;
+  for (const round of rounds) {
+    try {
+      const res = await Promise.any(attempts.map((args) => tag(ytdlpJson(url, round.timeout, args, round.allowProxy), args)));
+      res.viaProxy = round.allowProxy;
+      return res;
+    } catch (e) {
+      lastErr = e;
+    }
   }
+  throw wrapErr(lastErr);
 }
 
 // ---- fast preview metadata (~1-2s) -----------------------------------------
@@ -989,6 +1027,7 @@ app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
         const res = await ytdlpInfoWithFallbacks(url);
         info = res.info;
         rawClientSet(url, res.clientArgs);
+        rawProxySet(url, res.viaProxy);
       } catch (e) {
         info = null;
         console.error('info failed:', platformOf(url), scrub(e.detail || e.message));
@@ -1088,7 +1127,11 @@ app.get('/api/save', rateLimit(10, 60000), async (req, res) => {
   // YouTube/TikTok through WARP: the direct googlevideo fetch runs on
   // Render's own IP (blocked), so skip it and go straight to the yt-dlp
   // save below, which uses the proxy.
-  const saveProxyArgs = await proxyArgs(url);
+  // Same egress as the info call that produced this link (cached); when
+  // there is no cached verdict (direct save link, expired cache), fall
+  // back to proxy-if-up.
+  const cachedProxy = rawProxyGet(url);
+  const saveProxyArgs = await proxyArgs(url, cachedProxy === null ? true : cachedProxy);
   if (!formatId.includes('+') && !saveProxyArgs.length) {
     const raw = rawCacheGet(url);
     const fmt = raw && Array.isArray(raw.formats) ? raw.formats.find((f) => f && String(f.format_id) === formatId && f.url) : null;
