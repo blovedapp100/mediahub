@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{TITLE}}</title>
+<meta name="description" content="{{DESCRIPTION}}">
+<link rel="canonical" href="{{CANONICAL}}">
+<meta property="og:type" content="website">
+<meta property="og:title" content="{{TITLE}}">
+<meta property="og:description" content="{{DESCRIPTION}}">
+<meta property="og:url" content="{{CANONICAL}}">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="{{TITLE}}">
+<meta name="twitter:description" content="{{DESCRIPTION}}">
+<script type="application/ld+json">{{FAQ_JSON}}</script>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><a href="/">MediaHub</a></div>
+  <div class="tagline">Your clips, in every quality.</div>
+  <button type="button" id="themeToggle" class="theme-toggle" aria-label="Switch colour theme">☾ Dark</button>
+</header>
+
+<main class="wrap">
+  <section class="hero">
+    <h1>{{H1}}</h1>
+    <p class="intro">{{INTRO}}</p>
+    <form id="form" class="url-form">
+      <label class="visually-hidden" for="url">Paste a {{PLATFORM}} video link</label>
+      <input id="url" type="url" data-example="{{EXAMPLE}}" placeholder="Paste a {{PLATFORM}} link here…" autocomplete="off" spellcheck="false" required>
+      <button type="button" id="paste" class="secondary" aria-label="Paste link from clipboard">Paste</button>
+      <button id="go" type="submit">Get video</button>
+    </form>
+    <div id="detect" class="detect" aria-live="polite"></div>
+    <div id="progress" class="progress" aria-hidden="true"><div class="bar"><i></i></div><p>Finding the clip and its qualities…</p></div>
+    <div id="msg" class="msg" role="status" aria-live="polite"></div>
+    <nav class="chips" aria-label="Platforms">{{CHIPS}}</nav>
+  </section>
+
+  <div class="ad-slot" aria-label="Advertisement"><span>Advertisement</span><!-- Ad network code goes here later --></div>
+
+  <section id="result" class="card result" hidden>
+    <div class="preview">
+      <div class="player" id="player">
+        <video id="previewVideo" controls preload="metadata" playsinline></video>
+        <img id="thumb" alt="Video preview" style="display:none">
+      </div>
+      <div class="meta">
+        <h2 id="title"></h2>
+        <p id="uploader" class="uploader"></p>
+        <p id="duration" class="duration"></p>
+      </div>
+    </div>
+    <h3>Choose a quality</h3>
+    <ul id="formats" class="quality-grid"></ul>
+    <p class="hint">Pick a quality to save the clip to your device.</p>
+  </section>
+
+  <section class="card how">
+    <h2>How it works</h2>
+    <ol class="steps">
+      <li><strong>1. Copy the link</strong><span>Open {{PLATFORM}}, find the video you want, tap Share and copy the link.</span></li>
+      <li><strong>2. Paste it here</strong><span>Paste the link into the box above and press Get video.</span></li>
+      <li><strong>3. Pick a quality</strong><span>Choose the quality you want and save the clip to your device.</span></li>
+    </ol>
+  </section>
+
+  <section class="card features">
+    <h2>Why MediaHub</h2>
+    <ul class="feature-grid">
+      <li><strong>Free</strong><span>No cost, no hidden charges.</span></li>
+      <li><strong>No account</strong><span>Nothing to sign up for.</span></li>
+      <li><strong>HD quality</strong><span>Every quality the video actually has.</span></li>
+      <li><strong>Works everywhere</strong><span>Phone, tablet and PC — any modern browser.</span></li>
+      <li><strong>Fast</strong><span>Most links are ready in seconds.</span></li>
+      <li><strong>No software</strong><span>Nothing to install.</span></li>
+    </ul>
+  </section>
+
+  <section class="card faq">
+    <h2>Frequently asked questions</h2>
+    {{FAQ_HTML}}
+  </section>
+
+  <div class="ad-slot" aria-label="Advertisement"><span>Advertisement</span><!-- Ad network code goes here later --></div>
+</main>
+
+<footer class="foot">
+  <nav aria-label="Platforms">
+    <a href="/youtube">YouTube</a> · <a href="/tiktok">TikTok</a> · <a href="/facebook">Facebook</a> · <a href="/instagram">Instagram</a> · <a href="/twitter">X (Twitter)</a>
+  </nav>
+  <p>MediaHub — watch &amp; keep your favourite clips.</p>
+  <p class="fine">Only save clips you have the right to keep. MediaHub does not store your links or your files.</p>
+</footer>
+<script src="/app.js"></script>
+</body>
+</html>
