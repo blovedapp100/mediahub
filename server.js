@@ -22,6 +22,28 @@ app.use(express.static(path.join(__dirname, 'public'), {
   },
 }));
 
+// ---- cross-origin fallback -------------------------------------------------
+// The site runs in two regions (Oregon + a backup region). Each region's
+// frontend may call the OTHER region's API when its own region is blocked
+// by YouTube/TikTok — that only works if the API answers cross-origin
+// requests from the sibling site. Allowed origins come from env.
+const BACKUP_ORIGIN = (process.env.BACKUP_ORIGIN || '').trim().replace(/\/$/, '');
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
+  .split(',').map((s) => s.trim().replace(/\/$/, '')).filter(Boolean);
+app.use('/api', (req, res, next) => {
+  const origin = req.headers.origin || '';
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    if (req.method === 'OPTIONS') {
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+      return res.status(204).end();
+    }
+  }
+  next();
+});
+
 // ---- helpers ---------------------------------------------------------------
 
 const ALLOWED_HOSTS = [
@@ -875,6 +897,8 @@ function renderLanding(platform, req) {
 }
 
 // ---- routes ----------------------------------------------------------------
+
+app.get('/api/config', rateLimit(30, 60000), (req, res) => res.json({ backupOrigin: BACKUP_ORIGIN || null }));
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
