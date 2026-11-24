@@ -110,6 +110,15 @@
     ['snapchat.com', 'Snapchat'],
     ['t.snapchat.com', 'Snapchat'],
     ['v.qq.com', 'Tencent Video'],
+    ['kuaishou.com', 'Kuaishou'],
+    ['v.kuaishou.com', 'Kuaishou'],
+    ['kwai.com', 'Kuaishou'],
+    ['haokan.baidu.com', 'Haokan'],
+    ['pearvideo.com', 'Pear Video'],
+    ['zhihu.com', 'Zhihu'],
+    ['weibo.com', 'Weibo'],
+    ['m.weibo.cn', 'Weibo'],
+    ['tv.sohu.com', 'Sohu'],
   ];
 
   var currentUrl = '';
