@@ -483,8 +483,22 @@
         var data = res && res.data;
         if (reqId !== latestReq || !data || !data.title) return;
         renderedForReq = true;
-        renderPreview(data);
-        timerShown((Date.now() - timerStart) / 1000);
+        if (data.formats && data.formats.length) {
+          // The preview already carries this link's qualities (X: the
+          // tweet page embeds the direct files, so /api/meta attaches
+          // them). Render the full result NOW — Stage 2 below is only
+          // a fallback and will re-render the same list if it lands.
+          // This is what makes X robust when Stage 2 stalls in a real
+          // browser: the qualities are on screen with the preview
+          // (~1s) instead of depending on Stage 2's timers at all.
+          currentInfoOrigin = res.origin;
+          resultRendered = true;
+          renderResult(data);
+          timerDone((Date.now() - timerStart) / 1000);
+        } else {
+          renderPreview(data);
+          timerShown((Date.now() - timerStart) / 1000);
+        }
       })
       .catch(function () {});
     // Cold start: if nothing has rendered after 4s the service is
@@ -534,17 +548,24 @@
       // Geo-block on every region tried: the video is public, but the
       // uploader restricted it to countries none of our regions is in.
       // Say so plainly — retrying the same link will not help.
+      // A full result already on screen (rendered by the preview when
+      // it carried the qualities, or by the TikTok browser path) must
+      // NEVER be overwritten by a later Stage 2 failure: without this
+      // guard the qualities render at ~1s and Stage 2's error then
+      // erases them at ~30s, leaving the exact "Finding qualities…"
+      // hang's twin — a flicker followed by an error. resultRendered
+      // covers the TikTok case too (that path sets both flags).
       if (err && err.geoBlocked) {
         var geoMsg = 'This video is blocked in every region we can reach (US, Europe and Asia). It is only available in the country where the uploader allowed it.';
         if (!renderedForReq) { clearResult(); msg.textContent = geoMsg; }
-        else if (!ttRendered) formatsEl.innerHTML = '<li class="loading">' + geoMsg + '</li>';
+        else if (!resultRendered) formatsEl.innerHTML = '<li class="loading">' + geoMsg + '</li>';
       } else if (err && err.name === 'AbortError') {
         if (!renderedForReq) { clearResult(); msg.textContent = platform + ' is taking too long right now. Please try again.'; }
-        else if (!ttRendered) formatsEl.innerHTML = '<li class="loading">Taking too long — please try again.</li>';
+        else if (!resultRendered) formatsEl.innerHTML = '<li class="loading">Taking too long — please try again.</li>';
       } else if (!renderedForReq) {
         clearResult();
         msg.textContent = err.message || 'Something went wrong. Please try another link.';
-      } else if (!ttRendered) {
+      } else if (!resultRendered) {
         formatsEl.innerHTML = '<li class="loading">Could not load qualities — please try again.</li>';
       }
     } finally {
