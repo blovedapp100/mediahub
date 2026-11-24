@@ -47,8 +47,8 @@
     extBtn.addEventListener('click', function () {
       // Download the extension file, then show the install steps inline.
       var a = document.createElement('a');
-      a.href = '/SaveVideo-Extension-v1.8.zip';
-      a.download = 'SaveVideo-Extension-v1.8.zip';
+      a.href = '/SaveVideo-Extension-v1.9.zip';
+      a.download = 'SaveVideo-Extension-v1.9.zip';
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -61,6 +61,68 @@
   if (extStepsClose && extSteps) {
     extStepsClose.addEventListener('click', function () { extSteps.hidden = true; });
   }
+
+  // ---- YouTube via the companion extension --------------------------------
+  // YouTube cannot be extracted from the site's server (datacenter IPs
+  // are blocked) and a plain web page cannot call YouTube's API
+  // (CORS) or read googlevideo files (no ACAO). The companion
+  // extension CAN: it runs inside youtube.com pages, in the page's own
+  // MAIN world, and downloads the video in the visitor's own browser.
+  // So a pasted YouTube link shows a "Save with extension" row instead
+  // of server qualities — the server is never involved.
+  // youTubeExtShown: the "Save with extension" row is on screen for
+  // this request — a late Stage 2 server success must not replace it
+  // (see the Stage 2 guard in fetchInfo).
+  var youTubeExtShown = false;
+  function youTubeVideoId(url) {
+    if (!url) return '';
+    var m = url.match(/[?&]v=([A-Za-z0-9_-]{6,})/) || url.match(/youtu\.be\/([A-Za-z0-9_-]{6,})/) ||
+      url.match(/youtube\.com\/(?:shorts|embed|live|v)\/([A-Za-z0-9_-]{6,})/);
+    return m ? m[1] : '';
+  }
+  function renderYouTubeExt(videoId) {
+    if (!formatsEl) return;
+    formatsEl.innerHTML = '';
+    var li = document.createElement('li');
+    li.className = 'best';
+    if (extInstalled()) {
+      youTubeExtShown = true;
+      li.innerHTML =
+        '<span class="tag">Best</span>' +
+        '<span class="q">720p · with sound</span>' +
+        '<span class="n">Downloads in your own browser with the Save Video extension — the video never touches our server.</span>' +
+        '<button type="button">Save with extension</button>';
+      li.querySelector('button').addEventListener('click', function (ev) {
+        var btn = ev.target;
+        btn.disabled = true;
+        btn.textContent = 'Opening YouTube…';
+        window.postMessage({ type: 'MH_YT_SAVE', videoId: videoId }, window.location.origin);
+        setTimeout(function () { btn.disabled = false; btn.textContent = 'Save with extension'; }, 10000);
+      });
+    } else {
+      youTubeExtShown = false;
+      li.innerHTML =
+        '<span class="tag">Extension</span>' +
+        '<span class="q">YouTube needs the free extension</span>' +
+        '<span class="n">One-time install, desktop Chrome — then YouTube downloads in your own browser, never through our server.</span>' +
+        '<button type="button">Install the extension</button>';
+      li.querySelector('button').addEventListener('click', function () {
+        if (extBtn) extBtn.click();
+      });
+    }
+    formatsEl.appendChild(li);
+    if (noteEl) { noteEl.textContent = 'YouTube videos save through the Save Video extension, in your own browser.'; noteEl.hidden = false; }
+  }
+  // The extension answers on the page itself when the save starts (or
+  // fails to start). Same origin only.
+  window.addEventListener('message', function (ev) {
+    if (!ev || ev.origin !== window.location.origin || !ev.data) return;
+    if (ev.data.type === 'MH_YT_SAVE_ACK' && formatsEl) {
+      formatsEl.innerHTML = '<li class="loading">Opening YouTube in a background tab — your file will download to your Downloads folder.</li>';
+    } else if (ev.data.type === 'MH_YT_SAVE_ERR' && formatsEl) {
+      formatsEl.innerHTML = '<li class="loading">The extension could not open that YouTube video. Please try again.</li>';
+    }
+  });
 
   // ---- elements ------------------------------------------------------------
   var form = document.getElementById('form');
@@ -110,15 +172,6 @@
     ['snapchat.com', 'Snapchat'],
     ['t.snapchat.com', 'Snapchat'],
     ['v.qq.com', 'Tencent Video'],
-    ['kuaishou.com', 'Kuaishou'],
-    ['v.kuaishou.com', 'Kuaishou'],
-    ['kwai.com', 'Kuaishou'],
-    ['haokan.baidu.com', 'Haokan'],
-    ['pearvideo.com', 'Pear Video'],
-    ['zhihu.com', 'Zhihu'],
-    ['weibo.com', 'Weibo'],
-    ['m.weibo.cn', 'Weibo'],
-    ['tv.sohu.com', 'Sohu'],
   ];
 
   var currentUrl = '';
@@ -452,6 +505,7 @@
     var reqId = ++latestReq;
     var renderedForReq = false; // anything at all shown (preview or full result)
     var resultRendered = false; // the FULL result (qualities) shown — a meta
+    youTubeExtShown = false; // reset per request (set by renderYouTubeExt)
     // preview must not block the browser tikwm result from rendering its
     // qualities: renderPreview only shows title/thumbnail + "Finding
     // qualities…", so discarding the tikwm answer after a preview left
@@ -504,6 +558,20 @@
           resultRendered = true;
           renderResult(data);
           timerDone((Date.now() - timerStart) / 1000);
+        } else if (platform === 'YouTube' && youTubeVideoId(url)) {
+          // No server qualities for YouTube (the server cannot read
+          // it reliably): show the extension save row instead. Mark
+          // it as a full result so a later Stage 2 failure cannot
+          // erase it — and a Stage 2 success cannot replace it
+          // either (youTubeExtShown guard): with the extension
+          // installed, the visitor's YouTube download stays
+          // client-side. Without the extension the install row shows
+          // instead, and server qualities (when they come) still
+          // render as before.
+          renderPreview(data);
+          renderYouTubeExt(youTubeVideoId(url));
+          resultRendered = true;
+          timerDone((Date.now() - timerStart) / 1000);
         } else {
           renderPreview(data);
           timerShown((Date.now() - timerStart) / 1000);
@@ -546,6 +614,16 @@
       currentInfoOrigin = res.origin;
       renderedForReq = true;
       resultRendered = true;
+      if (platform === 'YouTube' && youTubeExtShown) {
+        // The extension row stays: with the extension installed, the
+        // visitor's YouTube download must never go through the server
+        // — the server's YouTube access is intermittent datacenter
+        // luck (it 502s most of the time, 200s sometimes), and a
+        // server Save would download the bytes on the server. A late
+        // Stage 2 success must not replace the extension save.
+        timerDone((Date.now() - timerStart) / 1000);
+        return;
+      }
       renderResult(res.data);
       timerDone((Date.now() - timerStart) / 1000);
     } catch (err) {
