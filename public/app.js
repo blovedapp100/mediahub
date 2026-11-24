@@ -257,11 +257,14 @@
   var latestReq = 0;
 
   // ---- multi-region fallback ---------------------------------------------
-  // The site runs in two regions. If this region's API cannot read a link
-  // (YouTube/TikTok block some datacenter IPs), the same request is tried
-  // against the backup region, and the download then comes from there.
-  // currentInfoOrigin remembers which region answered the quality list,
-  // so the Save button downloads from that same region.
+  // The site runs on 15 free Render services (1 main + 14 backups). If
+  // this region's API cannot read a link (YouTube/TikTok block some
+  // datacenter IPs), the same request is tried against a backup region,
+  // and the download then comes from there. currentInfoOrigin remembers
+  // which region answered the quality list, so the Save button downloads
+  // from that same region. Only a few backups are ever tried (see the
+  // caps below): every backup tried is a sleeping free service that wakes
+  // up and burns shared instance hours.
   var origins = null; // [own origin, backup origin] — filled lazily
   var originsPromise = null;
   var currentInfoOrigin = '';
@@ -284,8 +287,12 @@
   }
   // Try each origin in order until one answers with ok JSON.
   // Returns { data, origin }. Throws the last error when all fail.
-  // maxOrigins caps how many origins are tried: /api/info is capped at
-  // 4 (own + 3 backups) so a row of sleeping backup regions cannot
+  // 4xx answers are terminal: they are decided by the LINK (not the
+  // region), so another region would answer the same way — trying it
+  // only burns seconds and wakes a sleeping backup service for nothing.
+  // 5xx / timeouts / network errors fall through to the next origin.
+  // maxOrigins caps how many origins are tried: /api/meta is capped at
+  // 2 and /api/info at 3, so a row of sleeping backup regions cannot
   // stretch the wait to minutes — each origin already burns its full
   // per-origin timeout while a free Render service wakes (~50s).
   async function tryOrigins(path, options, timeoutMs, maxOrigins) {
@@ -299,9 +306,15 @@
         var r = await fetch(list[i] + path, Object.assign({}, options, { signal: ctrl.signal }));
         var data = await r.json().catch(function () { return null; });
         if (!data) { lastErr = new Error('Something went wrong.'); continue; }
-        if (!r.ok) { lastErr = new Error(data.error || 'Something went wrong.'); continue; }
+        if (!r.ok) {
+          lastErr = new Error(data.error || 'Something went wrong.');
+          if (r.status >= 400 && r.status < 500) lastErr._terminal = true;
+          if (lastErr._terminal) throw lastErr;
+          continue;
+        }
         return { data: data, origin: list[i] };
       } catch (e) {
+        if (e && e._terminal) throw e;
         lastErr = e;
       } finally {
         clearTimeout(timer);
@@ -310,27 +323,28 @@
     throw lastErr || new Error('Something went wrong.');
   }
 
-  // Typical seconds each platform takes to show the video (measured live).
-  // meta = title/thumbnail, info = full quality list, max = give up after this.
+  // Typical seconds each platform takes to show the video (measured live,
+  // warm server). meta = title/thumbnail, info = full quality list,
+  // max = give up after this.
   var PLATFORM_TIME = {
-    'YouTube': { meta: 2, info: 8, max: 30 },
-    'TikTok': { meta: 2, info: 6, max: 30 },
-    'Douyin': { meta: 4, info: 10, max: 30 },
-    'Facebook': { meta: 3, info: 12, max: 35 },
-    'Instagram': { meta: 3, info: 8, max: 30 },
-    'X (Twitter)': { meta: 4, info: 10, max: 30 },
-    'Reddit': { meta: 5, info: 10, max: 30 },
-    'Vimeo': { meta: 4, info: 8, max: 30 },
-    'Dailymotion': { meta: 4, info: 8, max: 30 },
-    'Bluesky': { meta: 3, info: 8, max: 30 },
-    'Tumblr': { meta: 3, info: 8, max: 30 },
-    'Twitch': { meta: 4, info: 12, max: 35 },
-    'Pinterest': { meta: 4, info: 10, max: 30 },
-    'LinkedIn': { meta: 4, info: 10, max: 30 },
-    'Moj': { meta: 3, info: 8, max: 30 },
-    'ShareChat': { meta: 3, info: 8, max: 30 },
-    'Snapchat': { meta: 3, info: 8, max: 30 },
-    'Tencent Video': { meta: 4, info: 10, max: 30 },
+    'YouTube': { meta: 1, info: 8, max: 30 },
+    'TikTok': { meta: 1, info: 6, max: 30 },
+    'Douyin': { meta: 2, info: 10, max: 30 },
+    'Facebook': { meta: 2, info: 12, max: 35 },
+    'Instagram': { meta: 2, info: 8, max: 30 },
+    'X (Twitter)': { meta: 1, info: 10, max: 30 },
+    'Reddit': { meta: 1, info: 10, max: 30 },
+    'Vimeo': { meta: 1, info: 8, max: 30 },
+    'Dailymotion': { meta: 2, info: 8, max: 30 },
+    'Bluesky': { meta: 2, info: 8, max: 30 },
+    'Tumblr': { meta: 1, info: 8, max: 30 },
+    'Twitch': { meta: 2, info: 12, max: 35 },
+    'Pinterest': { meta: 2, info: 10, max: 30 },
+    'LinkedIn': { meta: 2, info: 10, max: 30 },
+    'Moj': { meta: 2, info: 8, max: 30 },
+    'ShareChat': { meta: 2, info: 8, max: 30 },
+    'Snapchat': { meta: 2, info: 8, max: 30 },
+    'Tencent Video': { meta: 2, info: 10, max: 30 },
   };
   var timerEl = document.getElementById('timer');
   var timerInt = null;
@@ -393,24 +407,30 @@
     msg.textContent = '';
     result.hidden = true;
     formatsEl.innerHTML = '';
-    // TikTok: try the browser itself first (tikwm is public and
-    // cross-origin). If that fails, fall through to the server flow below.
+    // TikTok: the browser itself asks tikwm (public, cross-origin) at
+    // the SAME time as the server stages below — it used to be awaited
+    // first, which held the whole flow up to 8s when tikwm was slow.
+    // Whichever answers first renders; the server result replaces it
+    // when it lands.
+    var ttRendered = false;
     if (platform === 'TikTok') {
-      var tt = await fetchTikwmBrowser(url);
-      if (tt && reqId === latestReq) {
-        renderedForReq = true;
-        renderResult(tt);
-        timerDone((Date.now() - timerStart) / 1000);
-        return;
-      }
+      fetchTikwmBrowser(url).then(function (tt) {
+        if (tt && reqId === latestReq && !renderedForReq) {
+          renderedForReq = true;
+          ttRendered = true;
+          renderResult(tt);
+          timerDone((Date.now() - timerStart) / 1000);
+        }
+      }).catch(function () {});
     }
-    // Stage 1 — fast preview (title + thumbnail) in about 2 seconds.
-    // Tries the backup region too when this region cannot read the link.
+    // Stage 1 — fast preview (title + thumbnail) in about a second.
+    // At most 2 origins (own + 1 backup): a 404 means "no preview for
+    // this link" on every region, so trying more only burns time.
     tryOrigins('/api/meta', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url: url }),
-    }, 8000)
+    }, 5000, 2)
       .then(function (res) {
         var data = res && res.data;
         if (reqId !== latestReq || !data || !data.title) return;
@@ -419,12 +439,20 @@
         timerShown((Date.now() - timerStart) / 1000);
       })
       .catch(function () {});
+    // Cold start: if nothing has rendered after 4s the service is
+    // probably waking up (free tier sleeps after 15 min idle) — say so
+    // instead of leaving the "usually shows in ~2s" estimate on screen.
+    setTimeout(function () {
+      if (reqId === latestReq && !renderedForReq && timerEl) {
+        timerEl.innerHTML = 'Waking up the server… first load can take a few seconds, please wait.';
+      }
+    }, 4000);
     // Stage 2 — full quality list (takes a few seconds longer).
     // Tries the backup region too when this region cannot read the link.
-    // Bounded: at most 4 origins at 12s each, and a 45s global budget
+    // Bounded: at most 3 origins at 10s each, and a 45s global budget
     // for the whole stage — after that the error below is shown instead
     // of "Finding qualities…" hanging forever. (/api/meta above is
-    // unchanged at 8s per origin: it is only the fast preview.)
+    // capped at 2 origins, 5s each: it is only the fast preview.)
     // Note: timing.max is no longer used for /api/info; the table keeps
     // its measured per-platform figures for the on-screen estimate.
     try {
@@ -440,7 +468,7 @@
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url: url }),
-        }, 12000, 4),
+        }, 10000, 3),
         infoBudget,
       ]);
       if (reqId !== latestReq) return;
@@ -456,11 +484,11 @@
       // keep it and show the failure inside the quality list instead.
       if (err && err.name === 'AbortError') {
         if (!renderedForReq) { clearResult(); msg.textContent = platform + ' is taking too long right now. Please try again.'; }
-        else formatsEl.innerHTML = '<li class="loading">Taking too long — please try again.</li>';
+        else if (!ttRendered) formatsEl.innerHTML = '<li class="loading">Taking too long — please try again.</li>';
       } else if (!renderedForReq) {
         clearResult();
         msg.textContent = err.message || 'Something went wrong. Please try another link.';
-      } else {
+      } else if (!ttRendered) {
         formatsEl.innerHTML = '<li class="loading">Could not load qualities — please try again.</li>';
       }
     } finally {
