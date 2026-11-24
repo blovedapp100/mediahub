@@ -355,6 +355,14 @@ async function proxyArgs(url, allowProxy = true) {
 // Without cookies the site behaves exactly as before.
 const COOKIE_PLATFORMS = ['youtube', 'tiktok', 'facebook', 'instagram'];
 const cookieFiles = {};
+// Parse a Netscape cookies.txt string: returns the cookie lines (non-empty,
+// non-comment), or null when the content is not a Netscape file at all.
+// Shared by startup loading and the /api/cookies sync endpoint.
+function netscapeLines(content) {
+  const lines = String(content || '').split('\n').filter((l) => l.trim() && !l.trim().startsWith('#'));
+  if (!lines.length || !lines.some((l) => l.split('\t').length >= 6)) return null;
+  return lines;
+}
 function loadCookies() {
   for (const p of COOKIE_PLATFORMS) {
     const envName = 'COOKIES_' + p.toUpperCase();
@@ -371,8 +379,8 @@ function loadCookies() {
     // A real Netscape file is tab-separated lines; a pasted single cookie
     // or an empty file is not usable — skip it loudly instead of passing
     // junk to yt-dlp on every call.
-    const lines = content.split('\n').filter((l) => l.trim() && !l.trim().startsWith('#'));
-    if (!lines.length || !lines.some((l) => l.split('\t').length >= 6)) {
+    const lines = netscapeLines(content);
+    if (!lines) {
       console.error(`cookies ignored for ${p}: not a Netscape cookies.txt file`);
       continue;
     }
@@ -1060,6 +1068,42 @@ function renderLanding(platform, req) {
 app.get('/api/config', rateLimit(30, 60000), (req, res) => res.json({ backupOrigins: BACKUP_ORIGINS, backupOrigin: BACKUP_ORIGINS[0] || null }));
 
 app.get('/api/health', (req, res) => res.json({ ok: true, cookies: cookieStatus() }));
+
+// ---- cookie sync (private, owner-only) -------------------------------------
+// POST /api/cookies lets the owner's private browser extension push fresh
+// cookies to this server, so downloads keep working without a restart.
+// Auth is a shared secret (COOKIE_SYNC_SECRET, set in the Render env vars
+// on every region). Without the secret the endpoint is disabled; the
+// secret and all cookie contents are never logged and never returned.
+// The extension runs only in the owner's browser and only ever talks to
+// the MediaHub origins — visitors' cookies are never involved.
+app.post('/api/cookies', rateLimit(10, 60000), (req, res) => {
+  const secret = process.env.COOKIE_SYNC_SECRET;
+  if (!secret) return res.status(503).json({ error: 'Cookie sync is not configured on this server.' });
+  const provided = String(req.headers['x-mediahub-secret'] || '');
+  let ok = false;
+  if (provided.length === secret.length) {
+    try { ok = crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(secret)); } catch { ok = false; }
+  }
+  if (!ok) return res.status(401).json({ error: 'Unauthorized.' });
+  const platform = req.body && req.body.platform;
+  const cookies = req.body && req.body.cookies;
+  if (!COOKIE_PLATFORMS.includes(platform) || typeof cookies !== 'string') {
+    return res.status(400).json({ error: 'Expected {platform, cookies}.' });
+  }
+  const lines = netscapeLines(cookies);
+  if (!lines) return res.status(400).json({ error: 'Cookies must be a Netscape cookies.txt file.' });
+  try {
+    const file = path.join(os.tmpdir(), `mediahub-cookies-${platform}.txt`);
+    fs.writeFileSync(file, cookies, { mode: 0o600 });
+    cookieFiles[platform] = file;
+    console.log(`cookies synced for ${platform} (${lines.length} cookies)`);
+    return res.json({ ok: true, platform, count: lines.length });
+  } catch (e) {
+    console.error(`cookies sync failed for ${platform}:`, scrub(e.message));
+    return res.status(500).json({ error: 'Could not save cookies.' });
+  }
+});
 
 app.get('/robots.txt', (req, res) => {
   const base = req.protocol + '://' + req.get('host');
