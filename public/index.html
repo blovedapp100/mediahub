@@ -4,14 +4,14 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Save Video | YouTube, TikTok, Facebook &amp; Instagram Video Downloader</title>
-<meta name="description" content="Save Video is a free YouTube video downloader, TikTok video downloader, Facebook video downloader and Instagram video downloader. Paste any video link, preview it, and save it in 1080p, 720p or as audio — no account needed.">
+<meta name="description" content="Save Video is a free YouTube video downloader, TikTok video downloader, Facebook video downloader and Instagram video downloader. Paste any video link, preview it, and save it in 1080p, 720p or as audio — no account needed. Also works with X, Bluesky, Tumblr, Twitch clips, Pinterest, VK, Moj, ShareChat, LinkedIn and Snapchat.">
 <meta property="og:type" content="website">
 <meta property="og:title" content="Save Video | YouTube, TikTok, Facebook &amp; Instagram Video Downloader">
-<meta property="og:description" content="Paste a video link, preview the clip, pick a quality, and save it. Works with TikTok, Facebook, Instagram, YouTube, X, Reddit, Vimeo and Dailymotion.">
+<meta property="og:description" content="Paste a video link, preview the clip, pick a quality, and save it. Works with TikTok, Facebook, Instagram, YouTube, X, Bluesky, Tumblr, Twitch clips, Pinterest, VK, Moj, ShareChat, LinkedIn and Snapchat.">
 <meta name="twitter:card" content="summary">
 <script type="application/ld+json">
 {"@context":"https://schema.org","@type":"FAQPage","mainEntity":[
-{"@type":"Question","name":"What is Save Video?","acceptedAnswer":{"@type":"Answer","text":"Save Video is a free online tool that works as a YouTube video downloader, TikTok video downloader, Facebook video downloader, Instagram video downloader and Twitter video downloader. Paste a video link, preview the clip, and save it in the quality you choose."}},
+{"@type":"Question","name":"What is Save Video?","acceptedAnswer":{"@type":"Answer","text":"Save Video is a free online tool that works as a YouTube video downloader, TikTok video downloader, Facebook video downloader, Instagram video downloader and Twitter video downloader. It also works with Bluesky, Tumblr, Twitch clips, Pinterest, VK, Moj, ShareChat, LinkedIn and Snapchat. Paste a video link, preview the clip, and save it in the quality you choose."}},
 {"@type":"Question","name":"Is Save Video free?","acceptedAnswer":{"@type":"Answer","text":"Yes. Save Video is completely free to use, with no account and no software to install."}},
 {"@type":"Question","name":"What qualities can I save a video in?","acceptedAnswer":{"@type":"Answer","text":"It depends on the video itself. Most videos offer 1080p, 720p, 480p and 360p with sound, plus an audio-only option. You only ever get the qualities the original video actually has."}},
 {"@type":"Question","name":"Do I need an account?","acceptedAnswer":{"@type":"Answer","text":"No. You never need an account, and you never need to log in to any social media account to use Save Video."}},
@@ -34,7 +34,7 @@
 <main class="wrap">
   <section class="hero">
     <h1>Watch &amp; keep your <span class="grad">favourite clips</span></h1>
-    <p class="intro">Paste a video link from TikTok, Facebook, Instagram, YouTube, X, Reddit, Vimeo or Dailymotion — preview the clip and save it in the quality you choose.</p>
+    <p class="intro">Paste a video link from TikTok, Facebook, Instagram, YouTube, X, Bluesky, Tumblr, Twitch, Pinterest, VK, Moj, ShareChat, LinkedIn or Snapchat — preview the clip and save it in the quality you choose.</p>
     <form id="form" class="url-form">
       <label class="visually-hidden" for="url">Paste a video link</label>
       <input id="url" type="url" data-example="https://www.youtube.com/watch?v=2ptQ0Z1deuA" placeholder="Paste a video link here…" autocomplete="off" spellcheck="false" required>
@@ -63,6 +63,15 @@
       <a class="chip" href="/instagram">Instagram</a>
       <a class="chip" href="/youtube">YouTube</a>
       <a class="chip" href="/twitter">X (Twitter)</a>
+      <a class="chip" href="/bluesky">Bluesky</a>
+      <a class="chip" href="/tumblr">Tumblr</a>
+      <a class="chip" href="/twitch">Twitch</a>
+      <a class="chip" href="/pinterest">Pinterest</a>
+      <a class="chip" href="/vk">VK</a>
+      <a class="chip" href="/moj">Moj</a>
+      <a class="chip" href="/sharechat">ShareChat</a>
+      <a class="chip" href="/linkedin">LinkedIn</a>
+      <a class="chip" href="/snapchat">Snapchat</a>
     </nav>
   </section>
 
@@ -81,6 +90,7 @@
       </div>
     </div>
     <h3>Choose a quality</h3>
+    <p id="platformNote" class="hint" hidden></p>
     <ul id="formats" class="quality-grid"></ul>
     <p class="hint">Pick a quality to save the clip to your device.</p>
   </section>
@@ -108,7 +118,7 @@
 
   <section class="card faq">
     <h2>Frequently asked questions</h2>
-    <details><summary>What is Save Video?</summary><p>Save Video is a free online tool that works as a YouTube video downloader, TikTok video downloader, Facebook video downloader, Instagram video downloader and Twitter video downloader. Paste a video link, preview the clip, and save it in the quality you choose.</p></details>
+    <details><summary>What is Save Video?</summary><p>Save Video is a free online tool that works as a YouTube video downloader, TikTok video downloader, Facebook video downloader, Instagram video downloader and Twitter video downloader. It also works with Bluesky, Tumblr, Twitch clips, Pinterest, VK, Moj, ShareChat, LinkedIn and Snapchat. Paste a video link, preview the clip, and save it in the quality you choose.</p></details>
     <details><summary>Is Save Video free?</summary><p>Yes. Save Video is completely free to use, with no account and no software to install.</p></details>
     <details><summary>What qualities can I save a video in?</summary><p>It depends on the video itself. Most videos offer 1080p, 720p, 480p and 360p with sound, plus an audio-only option. You only ever get the qualities the original video actually has.</p></details>
     <details><summary>Do I need an account?</summary><p>No. You never need an account, and you never need to log in to any social media account to use Save Video.</p></details>
@@ -120,7 +130,7 @@
 
 <footer class="foot">
   <nav aria-label="Platforms">
-    <a href="/youtube">YouTube</a> · <a href="/tiktok">TikTok</a> · <a href="/facebook">Facebook</a> · <a href="/instagram">Instagram</a> · <a href="/twitter">X (Twitter)</a>
+    <a href="/youtube">YouTube</a> · <a href="/tiktok">TikTok</a> · <a href="/facebook">Facebook</a> · <a href="/instagram">Instagram</a> · <a href="/twitter">X (Twitter)</a> · <a href="/bluesky">Bluesky</a> · <a href="/tumblr">Tumblr</a> · <a href="/twitch">Twitch</a> · <a href="/pinterest">Pinterest</a> · <a href="/vk">VK</a> · <a href="/moj">Moj</a> · <a href="/sharechat">ShareChat</a> · <a href="/linkedin">LinkedIn</a> · <a href="/snapchat">Snapchat</a>
   </nav>
   <p>Save Video — watch &amp; keep your favourite clips.</p>
   <p class="fine">Only save clips you have the right to keep. Save Video does not store your links or your files.</p>

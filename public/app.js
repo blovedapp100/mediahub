@@ -78,6 +78,7 @@
   var uploaderEl = document.getElementById('uploader');
   var durationEl = document.getElementById('duration');
   var formatsEl = document.getElementById('formats');
+  var noteEl = document.getElementById('platformNote');
   if (!form || !urlInput) return;
 
   var PLATFORMS = [
@@ -93,10 +94,24 @@
     ['vimeo.com', 'Vimeo'],
     ['dailymotion.com', 'Dailymotion'],
     ['dai.ly', 'Dailymotion'],
+    ['bsky.app', 'Bluesky'],
+    ['tumblr.com', 'Tumblr'],
+    ['tmblr.co', 'Tumblr'],
+    ['twitch.tv', 'Twitch'],
+    ['clips.twitch.tv', 'Twitch'],
+    ['pinterest.com', 'Pinterest'],
+    ['pin.it', 'Pinterest'],
+    ['vk.com', 'VK'],
+    ['linkedin.com', 'LinkedIn'],
+    ['mojapp.in', 'Moj'],
+    ['sharechat.com', 'ShareChat'],
+    ['snapchat.com', 'Snapchat'],
+    ['t.snapchat.com', 'Snapchat'],
   ];
 
   var currentUrl = '';
   var currentTitle = '';
+  var currentClientSide = false;
 
   function detectPlatform(url) {
     try {
@@ -276,6 +291,15 @@
     'Reddit': { meta: 5, info: 10, max: 30 },
     'Vimeo': { meta: 4, info: 8, max: 30 },
     'Dailymotion': { meta: 4, info: 8, max: 30 },
+    'Bluesky': { meta: 3, info: 8, max: 30 },
+    'Tumblr': { meta: 3, info: 8, max: 30 },
+    'Twitch': { meta: 4, info: 12, max: 35 },
+    'Pinterest': { meta: 4, info: 10, max: 30 },
+    'VK': { meta: 4, info: 10, max: 30 },
+    'LinkedIn': { meta: 4, info: 10, max: 30 },
+    'Moj': { meta: 3, info: 8, max: 30 },
+    'ShareChat': { meta: 3, info: 8, max: 30 },
+    'Snapchat': { meta: 3, info: 8, max: 30 },
   };
   var timerEl = document.getElementById('timer');
   var timerInt = null;
@@ -391,9 +415,14 @@
 
   function renderResult(data) {
     currentTitle = data.title || 'video';
+    currentClientSide = !!data.clientSide;
     titleEl.textContent = currentTitle;
     uploaderEl.textContent = data.uploader ? 'By ' + data.uploader : '';
     durationEl.textContent = data.duration ? 'Length: ' + fmtDuration(data.duration) : '';
+    if (noteEl) {
+      if (data.note) { noteEl.textContent = data.note; noteEl.hidden = false; }
+      else noteEl.hidden = true;
+    }
 
     // Proper preview player: play the source stream when possible,
     // fall back to the still image if the stream cannot play.
@@ -444,10 +473,20 @@
         };
         // Direct download when this quality carries its own link: the
         // browser fetches the file straight from the video CDN. Falls
-        // back to the server save when the direct fetch fails.
+        // back to the server save when the direct fetch fails — except
+        // on client-side-only platforms, where there IS no server save:
+        // the browser then opens the file itself in a new tab, and the
+        // file still comes straight from the video CDN to this device,
+        // never through our server. (Some CDNs refuse cross-origin
+        // reads, so the open-in-tab step is how those files arrive.)
         if (f.url) {
           downloadDirect(f.url, safeFileName(currentTitle, f.ext)).then(function (ok) {
             if (ok) { btn.textContent = 'Saved ✓'; reset(); }
+            else if (currentClientSide) {
+              window.open(f.url, '_blank', 'noopener');
+              btn.textContent = 'Opened ↗';
+              reset();
+            }
             else serverSave();
           });
           return;
