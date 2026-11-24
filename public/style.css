@@ -107,7 +107,7 @@ a:hover { text-decoration: underline; }
 .hero { text-align: center; padding: 28px 8px 8px; }
 .hero h1 {
   font-size: clamp(30px, 5.4vw, 46px); line-height: 1.12; letter-spacing: -.03em;
-  margin: 0 0 10px; font-weight: 900;
+  margin: 0 0 20px; font-weight: 900;
   animation: fadeUp .6s cubic-bezier(.22, .61, .36, 1) both;
 }
 .hero h1 .grad {
