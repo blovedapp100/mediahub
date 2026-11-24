@@ -27,6 +27,41 @@
     });
   }
 
+  // ---- extension install button (header, no popup) ----------------------
+  // The companion extension marks the page (data-mh-ext="1") when it is
+  // installed, so the button only ever shows when it is NOT installed.
+  // It is a plain button on the site itself — never a popup.
+  var extBtn = document.getElementById('extInstallBtn');
+  var extSteps = document.getElementById('extSteps');
+  var extStepsClose = document.getElementById('extStepsClose');
+  function extInstalled() {
+    return document.documentElement.getAttribute('data-mh-ext') === '1';
+  }
+  function syncExtBtn() {
+    if (!extBtn) return;
+    extBtn.style.display = extInstalled() ? 'none' : '';
+  }
+  if (extBtn) {
+    syncExtBtn();
+    setTimeout(syncExtBtn, 1200); // the marker may land just after this script
+    extBtn.addEventListener('click', function () {
+      // Download the extension file, then show the install steps inline.
+      var a = document.createElement('a');
+      a.href = '/MediaHub-Extension-v1.8.zip';
+      a.download = 'MediaHub-Extension-v1.8.zip';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      if (extSteps) {
+        extSteps.hidden = false;
+        extSteps.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      }
+    });
+  }
+  if (extStepsClose && extSteps) {
+    extStepsClose.addEventListener('click', function () { extSteps.hidden = true; });
+  }
+
   // ---- elements ------------------------------------------------------------
   var form = document.getElementById('form');
   var urlInput = document.getElementById('url');
