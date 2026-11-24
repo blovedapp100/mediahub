@@ -71,11 +71,15 @@ const ALLOWED_HOSTS = [
   'twitch.tv', 'www.twitch.tv', 'clips.twitch.tv', 'www.clips.twitch.tv',
   'm.twitch.tv',
   'pinterest.com', 'www.pinterest.com', 'pin.it', 'www.pin.it',
-  'vk.com', 'www.vk.com',
   'linkedin.com', 'www.linkedin.com',
   'mojapp.in', 'www.mojapp.in',
   'sharechat.com', 'www.sharechat.com',
   'snapchat.com', 'www.snapchat.com', 't.snapchat.com', 'story.snapchat.com',
+  'v.qq.com', 'www.v.qq.com', 'm.v.qq.com',
+  // Douyin (added 2026-11-24): the server only ever reads the video's
+  // INFO through Douyin's own embed-player API — the file itself is
+  // downloaded by the visitor's own browser, from Douyin's CDN.
+  'douyin.com', 'www.douyin.com', 'v.douyin.com', 'www.iesdouyin.com',
 ];
 
 function hostAllowed(u) {
@@ -176,8 +180,8 @@ function platformOf(u) {
 // Platforms whose videos have NO direct single file (HLS/DASH playlists
 // only, or unplayable segments) are NOT listed at all — see the report.
 const CLIENT_SIDE_ONLY = new Set([
-  'x', 'twitter', 'bluesky', 'tumblr', 'twitch', 'pinterest', 'vk',
-  'linkedin', 'moj', 'sharechat', 'snapchat',
+  'x', 'twitter', 'bluesky', 'tumblr', 'twitch', 'pinterest',
+  'linkedin', 'moj', 'sharechat', 'snapchat', 'tencent', 'douyin',
 ]);
 function clientSideKey(url) {
   try {
@@ -187,11 +191,12 @@ function clientSideKey(url) {
     if (h === 'tumblr.com' || h.endsWith('.tumblr.com') || h === 'tmblr.co' || h.endsWith('.tmblr.co')) return 'tumblr';
     if (h === 'twitch.tv' || h.endsWith('.twitch.tv')) return 'twitch';
     if (h === 'pinterest.com' || h.endsWith('.pinterest.com') || h === 'pin.it' || h.endsWith('.pin.it')) return 'pinterest';
-    if (h === 'vk.com' || h.endsWith('.vk.com')) return 'vk';
     if (h === 'linkedin.com' || h.endsWith('.linkedin.com')) return 'linkedin';
     if (h === 'mojapp.in' || h.endsWith('.mojapp.in')) return 'moj';
     if (h === 'sharechat.com' || h.endsWith('.sharechat.com')) return 'sharechat';
     if (h === 'snapchat.com' || h.endsWith('.snapchat.com')) return 'snapchat';
+    if (h === 'v.qq.com' || h.endsWith('.v.qq.com')) return 'tencent';
+    if (h === 'douyin.com' || h.endsWith('.douyin.com') || h === 'iesdouyin.com' || h.endsWith('.iesdouyin.com')) return 'douyin';
   } catch {}
   return null;
 }
@@ -437,9 +442,17 @@ function warpCheck() {
 // proxy is only the fallback when direct fails — otherwise WARP would
 // mask a working IP (that is exactly what happened on the first WARP
 // deploy: the proxy was up, so every call used it).
+// Tumblr is a WARP platform too: its pages and CDN are the ones failing
+// from Render's IPs, same as YouTube/TikTok. Every other host stays
+// direct-only — the proxy is never spent on a host that works without it.
+function isWarpPlatform(url) {
+  if (isYouTube(url) || isTikTok(url)) return true;
+  const k = clientSideKey(url);
+  return k === 'tumblr';
+}
 async function proxyArgs(url, allowProxy = true) {
   if (!allowProxy) return [];
-  if (!isYouTube(url) && !isTikTok(url)) return [];
+  if (!isWarpPlatform(url)) return [];
   return (await warpCheck()) ? ['--proxy', WARP_PROXY] : [];
 }
 
@@ -579,7 +592,9 @@ function withTimeout(promise, ms, msg) {
 // Invidious/Piped mirrors, and the result with the most qualities is
 // kept. TikTok: the plain client races two other API hostnames (the
 // iPhone user-agent breaks TikTok in yt-dlp, so it is NOT used here).
-// Everything else: plain + iPhone user-agent, 20s, direct only.
+// Everything else: plain + iPhone user-agent, 20s, direct only —
+// except Tumblr, which gets a second WARP-proxy round (20s) after
+// the direct round (15s), because Render's IPs fail on it.
 // Returns { info, clientArgs, viaProxy } — clientArgs are the yt-dlp
 // extra args of the client that produced this info (null for mirrors),
 // so /api/save can download with the same client AND the same egress:
@@ -633,9 +648,16 @@ async function ytdlpInfoWithFallbacks(url) {
         [],
         ['--user-agent', 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'],
       ];
+  const isTumblr = clientSideKey(url) === 'tumblr';
   const rounds = isTikTok(url)
     ? [{ allowProxy: false, timeout: 8000 }, { allowProxy: true, timeout: 12000 }]
-    : [{ allowProxy: false, timeout: 20000 }];
+    : isTumblr
+      // Direct first (15s — the extractor answers in ~15s locally), then
+      // the WARP proxy round (20s). The proxy is never tried when direct
+      // works, and a down proxy falls back cleanly via warpCheck, so a
+      // WARP outage costs nothing here.
+      ? [{ allowProxy: false, timeout: 15000 }, { allowProxy: true, timeout: 20000 }]
+      : [{ allowProxy: false, timeout: 20000 }];
   let lastErr = null;
   for (const round of rounds) {
     try {
@@ -661,10 +683,19 @@ function decodeEntities(s) {
 }
 
 function ogTag(html, prop) {
-  const i = html.indexOf('property="' + prop + '"');
-  if (i < 0) return '';
-  const seg = html.slice(i, i + 600);
-  const m = seg.match(/content="([^"]+)"/) || seg.match(/content='([^']+)'/);
+  // The whole <meta> tag carrying property="prop" — content="..." may
+  // sit BEFORE property="..." (React Helmet pages, e.g. Tumblr) or after
+  // it, so the content is read from inside that one tag only. The old
+  // version sliced 600 chars after the property and took the first
+  // content="..." in the window — on Tumblr that returned the NEXT tag's
+  // value (og:title gave og:description, og:image gave og:image:width's
+  // "576", og:site_name gave og:type's "video"). The property name is
+  // matched with its closing quote, so og:image never matches
+  // og:image:width.
+  const esc = String(prop).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const tag = String(html || '').match(new RegExp('<meta[^>]*property="' + esc + '"[^>]*>', 'i'));
+  if (!tag) return '';
+  const m = tag[0].match(/content="([^"]*)"/i) || tag[0].match(/content='([^']*)'/i);
   return m ? m[1] : '';
 }
 
@@ -692,8 +723,13 @@ async function fastMeta(url) {
   if (!out) {
     try {
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 2500);
-      const r = await fetch(url, {
+      const timer = setTimeout(() => ctrl.abort(), 5000);
+      // Tumblr: a blog's own subdomain answers with a JS challenge page
+      // that has no og: tags at all — fetch the canonical www.tumblr.com
+      // page instead (same rewrite the scrape uses), so the fast preview
+      // works for pasted subdomain links too.
+      const metaUrl = clientSideKey(url) === 'tumblr' ? (await tumblrPageUrl(url)) || url : url;
+      const r = await fetch(metaUrl, {
         signal: ctrl.signal, redirect: 'follow',
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
@@ -702,8 +738,13 @@ async function fastMeta(url) {
       });
       clearTimeout(timer);
       const html = await r.text();
-      const title = decodeEntities(ogTag(html, 'og:title'));
-      const img = ogTag(html, 'og:image');
+      // Tumblr's og:title is only "Post by @blog · 1 video" — the real
+      // post text is parsely-title, and the poster frame is
+      // parsely-image-url; prefer those when the page carries them.
+      const title = decodeEntities(
+        metaContent(html, 'name', 'parsely-title').replace(/ – @\S+ on Tumblr$/, '') ||
+        ogTag(html, 'og:title'));
+      const img = metaContent(html, 'name', 'parsely-image-url') || ogTag(html, 'og:image');
       if (title || img) out = { title: title || 'Video', thumbnail: img, uploader: ogTag(html, 'og:site_name') || '', duration: 0 };
     } catch {}
   }
@@ -946,7 +987,7 @@ function heightFromUrl(u) {
 
 // Best playable stream for the in-page preview player. Direct single
 // files come FIRST: an HLS playlist URL cannot play in a normal <video>
-// tag, while a direct mp4 can — so X / LinkedIn / VK previews play their
+// tag, while a direct mp4 can — so X / LinkedIn previews play their
 // direct file instead of failing on a playlist. The old order (any
 // progressive, then any video) is kept as the fallback for platforms
 // whose only streams are playlists (YouTube etc.).
@@ -1045,9 +1086,12 @@ function buildDirectFormats(info) {
       // the source's own ready file — treat it as progressive, like the
       // unknown-codec branch of buildFormats. Only when no real
       // progressive file exists at this height (its _key is -1, so any
-      // real format replaces it).
+      // real format replaces it). First one wins at a height: several
+      // mirrors can share one height (Tencent Video ships 4 mirrors at
+      // 352p, the last one a dispatch URL that answers 418), so a later
+      // mirror must not displace an earlier, working one.
       const cur = prog.get(h);
-      if (!cur || (cur._key !== undefined && cur._key < 0)) {
+      if (!cur) {
         prog.set(h, { ...f, height: h, filesize: size, _key: -1 });
       }
     }
@@ -1221,14 +1265,15 @@ function buildFormats(info, opts) {
   return out;
 }
 
-// ---- Direct-file pages: Pinterest / Moj / ShareChat / Snapchat ----------
-// These four have no usable yt-dlp path to a direct file (Pinterest and
+// ---- Direct-file pages: Pinterest / Moj / ShareChat / Snapchat / Tumblr ----
+// These have no usable yt-dlp path to a direct file (Pinterest and
 // Snapchat: HLS playlists only through yt-dlp; Moj/ShareChat: no extractor
-// at all), but their own pages embed the direct mp4 — so the server
-// fetches the PAGE HTML only (never the video file) and returns the file's
-// URL for the visitor's browser to download. Pages are capped (~3 MB) and
-// the fetch times out in 8s; a page that embeds no usable file returns
-// null and the caller answers 404.
+// at all; Tumblr: yt-dlp works locally but times out from Render's IPs),
+// but their own pages embed the direct mp4 — so the server fetches the
+// PAGE HTML only (never the video file) and returns the file's URL for
+// the visitor's browser to download. Pages are capped (~3 MB) and the
+// fetch times out in 8s; a page that embeds no usable file returns null
+// and the caller falls through to yt-dlp.
 async function fetchPageHtml(url, timeoutMs = 8000) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -1263,8 +1308,78 @@ function directFormat(url, label) {
     url, filesize: 0, note: 'With sound', kind: 'progressive',
   };
 }
+
+// content="..." of a <meta> tag found by any other attribute, whatever
+// order the attributes come in (ogTag above only handles property="..."
+// followed by content="..."; Tumblr puts content="..." first and uses
+// name="parsely-title" / name="parsely-image-url").
+function metaContent(html, attr, value) {
+  const esc = String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const tag = String(html || '').match(new RegExp('<meta[^>]*' + attr + '="' + esc + '"[^>]*>', 'i'));
+  if (!tag) return '';
+  const m = tag[0].match(/content="([^"]*)"/i) || tag[0].match(/content='([^']*)'/i);
+  return m ? m[1] : '';
+}
+
+// Canonical www.tumblr.com page URL for a post link. A blog's own
+// subdomain (<blog>.tumblr.com) answers datacenter IPs with a JS
+// hashcash challenge page ("Checking your browser...") that contains no
+// video at all — the same post on www.tumblr.com serves the real HTML,
+// including the direct va.media.tumblr.com mp4. Short tmblr.co links are
+// resolved by hand so the next hop can be rewritten the same way instead
+// of followed into the challenge page.
+async function tumblrPageUrl(url) {
+  try {
+    const u = new URL(url);
+    const host = u.hostname.toLowerCase();
+    if (host === 'www.tumblr.com') return url;
+    if (host === 'tumblr.com') return 'https://www.tumblr.com' + u.pathname + u.search;
+    const sub = host.match(/^([a-z0-9-]+)\.tumblr\.com$/);
+    if (sub) {
+      const p = u.pathname.replace(/^\/post\//, '/');
+      return 'https://www.tumblr.com/' + sub[1] + p + u.search;
+    }
+    if (host === 'tmblr.co' || host === 'www.tmblr.co') {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 5000);
+      try {
+        const r = await fetch(url, {
+          signal: ctrl.signal, redirect: 'manual',
+          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36' },
+        });
+        const loc = r.headers.get('location');
+        if (!loc) return null;
+        return tumblrPageUrl(new URL(loc, url).href);
+      } catch { return null; } finally { clearTimeout(timer); }
+    }
+    return null;
+  } catch { return null; }
+}
+
+async function scrapeTumblr(url) {
+  const pageUrl = await tumblrPageUrl(url);
+  if (!pageUrl) return null;
+  const html = await fetchPageHtml(pageUrl);
+  if (!html) return null;
+  const mp4s = pageMp4s(html).filter((u) => u.includes('va.media.tumblr.com/'));
+  if (!mp4s.length) return null;
+  const titleRaw = metaContent(html, 'name', 'parsely-title') ||
+    ((html.match(/<title[^>]*>([^<]+)<\/title>/i) || [])[1] || '');
+  const title = decodeEntities(titleRaw).replace(/ – @\S+ on Tumblr$/, '').trim() || 'Tumblr video';
+  const thumb = metaContent(html, 'name', 'parsely-image-url') || ogTag(html, 'og:image');
+  // The poster frame shares its stem with the video file
+  // (tumblr_<id>_smart1.jpg <-> tumblr_<id>.mp4) — prefer that file
+  // when a post carries more than one video.
+  const stem = (thumb.match(/(tumblr_[A-Za-z0-9]+)_smart1\./) || [])[1] || '';
+  const video = (stem && mp4s.find((u) => u.includes(stem))) || mp4s[0];
+  const blog = (pageUrl.match(/tumblr\.com\/([^/?#]+)/) || [])[1] ||
+    metaContent(html, 'name', 'parsely-author') || '';
+  return { source: 'tumblr', title, thumbnail: thumb, duration: 0, uploader: blog, previewUrl: video, formats: [directFormat(video)] };
+}
+
 async function scrapeDirectInfo(url) {
   const key = clientSideKey(url);
+  if (key === 'tumblr') return scrapeTumblr(url);
   const html = await fetchPageHtml(url);
   if (!html) return null;
   const title = decodeEntities(ogTag(html, 'og:title'));
@@ -1317,6 +1432,133 @@ async function scrapeDirectInfo(url) {
   return null;
 }
 
+// yt-dlp fallback for ShareChat / Snapchat when the page scrape finds no
+// direct file. Two 12s attempts, native extractor first, then the generic
+// extractor (og:video): Snapchat's native extractor fails on Spotlight
+// pages ("Unable to extract next.js data") while the generic extractor
+// reads og:video; ShareChat's native extractor works but returns a
+// playlist, so its first entry with formats is unwrapped below. The
+// /api/info outer cap (25s) bounds the pair. Formats go through
+// buildDirectFormats like the other client-side platforms, so only direct
+// single files are ever offered and video bytes still never pass through
+// this server. Returns null on any failure (caller keeps its clear error).
+async function ytdlpDirectFallback(url) {
+  for (const extra of [[], ['--force-generic-extractor']]) {
+    let info = null;
+    try {
+      info = await ytdlpJson(url, 12000, extra);
+    } catch { continue; }
+    // ShareChat answers as a playlist: use its first entry that has formats.
+    if (info && info._type === 'playlist' && Array.isArray(info.entries)) {
+      const entry = info.entries.find((e) => e && Array.isArray(e.formats) && e.formats.length);
+      if (entry) {
+        info = {
+          ...entry,
+          title: entry.title || info.title,
+          thumbnail: entry.thumbnail || info.thumbnail,
+          duration: entry.duration ?? info.duration,
+          uploader: entry.uploader || info.uploader || info.channel || '',
+        };
+      }
+    }
+    if (!info || !Array.isArray(info.formats) || !info.formats.length) continue;
+    const formats = buildDirectFormats(info);
+    if (!formats.length) continue;
+    return {
+      source: 'generic',
+      title: info.title || 'Video',
+      thumbnail: info.thumbnail || '',
+      duration: info.duration || 0,
+      uploader: info.uploader || info.channel || '',
+      previewUrl: previewUrl(info),
+      formats,
+      clientSide: true,
+      note: clientSideNote(url, info),
+    };
+  }
+  return null;
+}
+
+// ---- Douyin via its own embed-player lane (no login) ----------------------
+// Douyin's web API has two anti-bot lanes. The browser-app lane needs a
+// device token, but the EMBEDDABLE PLAYER lane (open.douyin.com/player —
+// the iframe third-party sites are given) is admitted on its Origin
+// alone, because the player calls the API cross-site and cannot carry
+// first-party cookies. No cookies, no signature, no login.
+// The API answers ACAO: https://open.douyin.com ONLY, so the browser
+// cannot call it — the server makes this call and returns the CDN URL
+// for the visitor's browser to download. The video bytes never pass
+// through the server. Verified 2026-11-24 (5/5 API calls from this VM).
+// play_addr is the WATERMARK-FREE stream — download_addr is the
+// watermarked one and is never used. yt-dlp is NOT used here: its
+// Douyin extractor needs cookies (dead route, tested).
+// Signed CDN URLs live ~5 min, so results from here are NEVER cached
+// (see the /api/info hook) — a cached URL would be expired on arrival.
+const DOUYIN_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+function douyinId(u) {
+  try {
+    const m = new URL(u).pathname.match(/\/video\/(\d+)/);
+    return m ? m[1] : '';
+  } catch { return ''; }
+}
+async function resolveDouyinShort(url, timeoutMs = 8000) {
+  // v.douyin.com/<code> 302s to an iesdouyin.com share URL — the video
+  // id sits in the Location path. Follow the redirect, do not fetch it.
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, { signal: ctrl.signal, redirect: 'manual', headers: { 'User-Agent': DOUYIN_UA } });
+    return douyinId(r.headers.get('location') || '');
+  } catch { return ''; } finally { clearTimeout(timer); }
+}
+function pickDouyinPlayUrl(urls) {
+  // Prefer a real file host: *.zjcdn.com first, then *.douyinvod.com.
+  // api-play.amemv.com / api.amemv.com entries are API hosts, not file
+  // hosts — skip them.
+  const list = (Array.isArray(urls) ? urls : []).filter(Boolean);
+  const hostOf = (u) => { try { return new URL(u).hostname.toLowerCase(); } catch { return ''; } };
+  const usable = list.filter((u) => {
+    const h = hostOf(u);
+    return h && !h.includes('amemv.com');
+  });
+  return usable.find((u) => hostOf(u).endsWith('.zjcdn.com')) ||
+    usable.find((u) => hostOf(u).endsWith('.douyinvod.com')) ||
+    usable[0] || '';
+}
+async function douyinInfo(url, timeoutMs = 10000) {
+  let id = douyinId(url);
+  if (!id) {
+    id = await resolveDouyinShort(url);
+    if (!id) return null;
+  }
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const api = 'https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=' + encodeURIComponent(id) + '&aid=1128';
+    const r = await fetch(api, {
+      signal: ctrl.signal,
+      headers: { 'User-Agent': DOUYIN_UA, 'Origin': 'https://open.douyin.com' },
+    });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const d = j && j.aweme_detail;
+    if (!d || !d.video || !d.video.play_addr || !Array.isArray(d.video.play_addr.url_list)) return null;
+    const playUrl = pickDouyinPlayUrl(d.video.play_addr.url_list);
+    if (!playUrl) return null;
+    const h = d.video.height || 0;
+    const cover = (d.video.cover && Array.isArray(d.video.cover.url_list)) ? (d.video.cover.url_list[0] || '') : '';
+    return {
+      source: 'douyin',
+      title: d.desc || 'Douyin video',
+      thumbnail: cover,
+      duration: Math.round((d.video.duration || 0) / 1000),
+      uploader: (d.author && d.author.nickname) || '',
+      previewUrl: playUrl,
+      formats: [directFormat(playUrl, h ? h + 'p' : 'Best quality')],
+    };
+  } catch { return null; } finally { clearTimeout(timer); }
+}
+
 // ---- SEO: per-platform landing pages --------------------------------------
 // Visible brand stays neutral ("Save Video"). Keywords live in the <title>,
 // meta description, URL slug, intro text and FAQ — never in the logo or
@@ -1352,6 +1594,22 @@ const PLATFORMS = {
       ['What qualities are available?', 'TikTok videos are usually offered in HD and SD, plus an audio-only option. The quality always matches the original upload.'],
       ['Do I need a TikTok account?', 'No. Paste any public TikTok link and go.'],
       ['Does it work on iPhone and Android?', 'Yes — it works in any modern mobile browser.'],
+    ],
+  },
+  douyin: {
+    name: 'Douyin',
+    keyword: 'Douyin video downloader',
+    title: 'Douyin Video Downloader — Save Douyin Videos Without Watermark | Save Video',
+    description: 'Douyin video downloader: paste a Douyin video link, preview it and save it without watermark as MP4 with sound. Free, no account, works on phone and PC.',
+    h1: 'Douyin videos in every quality',
+    intro: 'A free Douyin video downloader: paste the video link, preview the clip, and save it without watermark as MP4 with sound. Works with douyin.com video links, iesdouyin.com share links and short v.douyin.com links. No account, no app to install.',
+    example: 'https://www.douyin.com/video/7334514828465147176',
+    faq: [
+      ['Is the Douyin video downloader free?', 'Yes — free, with no account and nothing to install.'],
+      ['Are Douyin videos saved without watermark?', 'Yes. The video file comes without the Douyin watermark on it — what you save is the clean video as uploaded.'],
+      ['What qualities are available?', 'Douyin serves the video as an MP4 with sound, in the quality it was uploaded — usually 720p or 1080p.'],
+      ['Do I need a Douyin account?', 'No. Only the public video link is needed.'],
+      ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
     ],
   },
   facebook: {
@@ -1466,22 +1724,6 @@ const PLATFORMS = {
       ['Can I save private Pinterest pins?', 'No. Only public pins can be read.'],
     ],
   },
-  vk: {
-    name: 'VK',
-    keyword: 'VK video downloader',
-    title: 'VK Video Downloader — Save VK Videos in HD | Save Video',
-    description: 'VK video downloader: paste a VK video link, preview it and save the video and audio files. Free, no account, works on phone and PC.',
-    h1: 'VK videos in every quality',
-    intro: 'A free VK video downloader: paste the video link, preview it, and save the video file and the sound file. VK keeps picture and sound as separate files, so you get both to keep together.',
-    example: 'https://vk.com/video-31480508_456239018',
-    faq: [
-      ['Is the VK video downloader free?', 'Yes — free, with no account and nothing to install.'],
-      ['Why are there separate video and audio files?', 'VK stores the picture and the sound as separate files. Save both: the video file for the picture and the audio file for the sound.'],
-      ['What qualities are available?', 'Public VK videos are usually offered up to 720p, plus the sound file.'],
-      ['Do I need a VK account?', 'No. Only the public video link is needed.'],
-      ['Can I save private VK videos?', 'No. Only public videos can be read.'],
-    ],
-  },
   moj: {
     name: 'Moj',
     keyword: 'Moj video downloader',
@@ -1543,6 +1785,22 @@ const PLATFORMS = {
       ['Which Snapchat links work?', 'Spotlight video links (snapchat.com/spotlight/…) work. Stories only last 24 hours, so an expired story is gone.'],
       ['What qualities are available?', 'Spotlight videos are served as MP4 files with sound, in the quality they were uploaded.'],
       ['Do I need a Snapchat account?', 'No. Only the public Spotlight link is needed.'],
+      ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+    ],
+  },
+  tencent: {
+    name: 'Tencent Video',
+    keyword: 'Tencent Video downloader',
+    title: 'Tencent Video Downloader — Save Tencent Videos as MP4 | Save Video',
+    description: 'Tencent Video downloader: paste a Tencent Video link, preview the video and save it as MP4 with sound. Free, no account, works on phone and PC.',
+    h1: 'Tencent Video videos in every quality',
+    intro: 'A free Tencent Video downloader: paste the video link, preview it, and save it as MP4 with sound. Works with public Tencent Video videos.',
+    example: 'https://v.qq.com/x/page/t0338rg171l.html',
+    faq: [
+      ['Is the Tencent Video downloader free?', 'Yes — free, with no account and nothing to install.'],
+      ['Which Tencent Video links work?', 'Video page links (v.qq.com/x/page/…) work. Cover pages (v.qq.com/x/cover/…) do not always offer a file to save.'],
+      ['What qualities are available?', 'Tencent Video serves its videos as MP4 files with sound, in the quality the video was uploaded — usually 480p or lower. VIP-only videos cannot be saved.'],
+      ['Do I need a Tencent Video account?', 'No. Only the public video link is needed.'],
       ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
     ],
   },
@@ -1639,7 +1897,7 @@ app.get('/sitemap.xml', (req, res) => {
     urls.join('\n') + '\n</urlset>');
 });
 
-app.get('/:platform(youtube|tiktok|facebook|instagram|twitter|bluesky|tumblr|twitch|pinterest|vk|moj|sharechat|linkedin|snapchat)', (req, res) => {
+app.get('/:platform(youtube|tiktok|douyin|facebook|instagram|twitter|bluesky|tumblr|twitch|pinterest|moj|sharechat|linkedin|snapchat|tencent)', (req, res) => {
   res.type('text/html').send(renderLanding(req.params.platform, req));
 });
 
@@ -1656,26 +1914,57 @@ app.post('/api/meta', rateLimit(30, 60000), async (req, res) => {
 app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
   const url = String(req.body && req.body.url || '').trim();
   if (!url || !(await validateUserUrl(url))) {
-    return res.status(400).json({ error: 'Please paste a valid video link from TikTok, Facebook, Instagram, YouTube, X, Bluesky, Tumblr, Twitch, Pinterest, VK, Moj, ShareChat, LinkedIn or Snapchat.' });
+    return res.status(400).json({ error: 'Please paste a valid video link from TikTok, Douyin, Facebook, Instagram, YouTube, X, Bluesky, Tumblr, Twitch, Pinterest, Moj, ShareChat, LinkedIn, Snapchat or Tencent Video.' });
   }
-  const cached = cacheGet(url);
+  // Douyin: signed CDN URLs live ~5 min, shorter than the 10-min info
+  // cache — never serve a cached Douyin result, and never store one.
+  const isDouyin = clientSideKey(url) === 'douyin';
+  const cached = isDouyin ? null : cacheGet(url);
   if (cached) return res.json(cached);
+  // Hard 25s overall cap: whatever the extraction path does (tikwm,
+  // page scrape, yt-dlp fallback rounds), /api/info ALWAYS answers
+  // within 25s — success, a clear 404/502 from the lookup, or the
+  // timeout 502 below. The lookup itself returns {status, body} and
+  // never touches res, so a late background finish cannot double-send.
+  // (Per-attempt timeouts inside are unchanged; this is only the outer cap.)
+  async function computeInfo() {
   try {
     let result = null;
     if (isTikTok(url)) {
       result = await tikwmInfo(url, 6000);
       // fall through to yt-dlp when tikwm has nothing
     }
+    if (!result && isDouyin) {
+      // Douyin embed-player lane (no login): the server calls Douyin's
+      // own aweme detail API and returns the watermark-free CDN file
+      // for the visitor's browser to fetch. yt-dlp is NOT used here —
+      // its Douyin extractor needs cookies.
+      result = await douyinInfo(url);
+      if (!result) throw new Error('Could not read this Douyin link. The video may be private, removed, or Douyin is blocking us right now.');
+      result.clientSide = true;
+      return { status: 200, body: result }; // no cacheSet: signed URLs live ~5 min
+    }
     if (!result) {
-      // Pinterest / Moj / ShareChat / Snapchat: the direct file is read
-      // off the page itself (see scrapeDirectInfo) — no yt-dlp involved.
+      // Pinterest / Moj / ShareChat / Snapchat / Tumblr: the direct file
+      // is read off the page itself (see scrapeDirectInfo) — scrape first
+      // (fast, no yt-dlp). When the page embeds no usable file — an image
+      // post, or a Tumblr post the scrape cannot read — Tumblr falls
+      // through to yt-dlp below; the others fail with a clear error.
       const scrapeKey = clientSideKey(url);
-      if (scrapeKey === 'pinterest' || scrapeKey === 'moj' || scrapeKey === 'sharechat' || scrapeKey === 'snapchat') {
+      if (scrapeKey === 'pinterest' || scrapeKey === 'moj' || scrapeKey === 'sharechat' || scrapeKey === 'snapchat' || scrapeKey === 'tumblr') {
         result = await scrapeDirectInfo(url);
-        if (!result) throw new Error('Could not find a video file on this page. The video may be private, removed, or an image post.');
-        result.clientSide = true;
-        cacheSet(url, result);
-        return res.json(result);
+        // ShareChat / Snapchat only: when the page embeds no usable file,
+        // try yt-dlp once (12s) before giving up — it reads og:video /
+        // the snapchat extractor where the scrape cannot.
+        if (!result && (scrapeKey === 'sharechat' || scrapeKey === 'snapchat')) {
+          result = await ytdlpDirectFallback(url);
+        }
+        if (result) {
+          result.clientSide = true;
+          cacheSet(url, result);
+          return { status: 200, body: result };
+        }
+        if (scrapeKey !== 'tumblr') throw new Error('Could not find a video file on this page. The video may be private, removed, or an image post.');
       }
       let info = null;
       try {
@@ -1693,7 +1982,7 @@ app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
       // Refuse them plainly instead of offering a download that cannot
       // ever complete as one file.
       if (scrapeKey === 'twitch' && (info.duration || 0) > 7200) {
-        return res.status(404).json({ error: 'This is a full Twitch broadcast (' + Math.round(info.duration / 3600) + 'h long). Broadcasts stream only and cannot be saved as one file — only short Twitch clips can be saved.' });
+        return { status: 404, body: { error: 'This is a full Twitch broadcast (' + Math.round(info.duration / 3600) + 'h long). Broadcasts stream only and cannot be saved as one file — only short Twitch clips can be saved.' } };
       }
       rawCacheSet(url, info);
       if (isClientSideOnly(url)) {
@@ -1701,7 +1990,7 @@ app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
         // No merged pairs, no server save: a video with no direct file
         // is reported as such instead of being listed.
         const formats = buildDirectFormats(info);
-        if (!formats.length) return res.status(404).json({ error: 'This video has no direct file to save. It only streams, so the browser cannot download it as one file.' });
+        if (!formats.length) return { status: 404, body: { error: 'This video has no direct file to save. It only streams, so the browser cannot download it as one file.' } };
         result = {
           source: 'generic',
           title: info.title || 'Video',
@@ -1715,7 +2004,7 @@ app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
         };
       } else {
         const formats = buildFormats(info, { noSeparateAudio: isTikTok(url) });
-        if (!formats.length) return res.status(404).json({ error: 'No playable versions were found for this link.' });
+        if (!formats.length) return { status: 404, body: { error: 'No playable versions were found for this link.' } };
         result = {
           source: 'generic',
           title: info.title || 'Video',
@@ -1728,18 +2017,25 @@ app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
       }
     }
     cacheSet(url, result);
-    return res.json(result);
+    return { status: 200, body: result };
   } catch (e) {
     console.error('info failed:', scrub(e.message));
-    return res.status(502).json({ error: e.message || 'Could not read this link. Please try another one.' });
+    return { status: 502, body: { error: e.message || 'Could not read this link. Please try another one.' } };
+  }
+  }
+  try {
+    const out = await withTimeout(computeInfo(), 25000, 'Info lookup timed out. Please try again.');
+    return res.status(out.status).json(out.body);
+  } catch (e) {
+    console.error('info timed out:', platformOf(url));
+    return res.status(502).json({ error: 'This link is taking too long to read. Please try again.' });
   }
 });
 
 // Short honest note shown under a client-side-only platform's qualities:
-// VK keeps sound apart from the picture; Twitch only saves clips.
+// Twitch only saves clips.
 function clientSideNote(url, info) {
   const key = clientSideKey(url);
-  if (key === 'vk') return 'VK keeps the picture and the sound as separate files — save both the video file and the audio file.';
   if (key === 'twitch') return 'Twitch clips only — full broadcasts stream only and cannot be saved as one file.';
   if (key === 'tumblr') return 'Only posts with a video uploaded to Tumblr work — GIFs and embedded YouTube/Vimeo players have no Tumblr file.';
   return '';
