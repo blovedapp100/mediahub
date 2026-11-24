@@ -72,6 +72,7 @@ a:hover { text-decoration: underline; }
   margin-left: auto; background: rgba(255,255,255,.16); color: #fff;
   border: 1px solid rgba(255,255,255,.35); border-radius: 999px;
   padding: 6px 14px; font-size: 13px; font-weight: 600; cursor: pointer;
+  flex-shrink: 0; /* header must never squeeze the label below its width */
   transition: background .2s ease, transform .15s ease;
 }
 .theme-toggle:hover { background: rgba(255,255,255,.28); transform: translateY(-1px); }
@@ -83,6 +84,7 @@ a:hover { text-decoration: underline; }
   background: #fff; color: #0b5e57;
   border: 1px solid rgba(255,255,255,.6); border-radius: 999px;
   padding: 6px 14px; font-size: 13px; font-weight: 700; cursor: pointer;
+  flex-shrink: 0; /* header must never squeeze the label below its width */
   transition: background .2s ease, transform .15s ease;
 }
 .ext-install:hover { background: #e6f4f2; transform: translateY(-1px); }
@@ -133,7 +135,13 @@ input[type="url"]::placeholder { color: var(--faint); }
 button {
   background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: var(--accent-text);
   border: 0; border-radius: 999px;
-  padding: 12px 22px; font-size: 16px; font-weight: 700; cursor: pointer; white-space: nowrap;
+  padding: 12px 22px; font-size: 16px; font-weight: 700; cursor: pointer;
+  /* Button-fit fix (2026-11-24): labels must fit INSIDE the button, never
+     clip. The old `white-space: nowrap` + `overflow: hidden` (kept for the
+     shine sweep below) cut any label wider than the button — e.g. "Save with
+     extension" rendered as "Save with extens…". Now a label wraps to a
+     second centred line instead of being cut off; the font size never shrinks. */
+  white-space: normal; line-height: 1.3; text-align: center; overflow-wrap: break-word;
   transition: transform .18s ease, box-shadow .25s ease, opacity .2s ease, filter .2s ease;
   position: relative; overflow: hidden;
 }
@@ -260,7 +268,11 @@ button.secondary:hover:not(:disabled) { box-shadow: none; background: var(--bord
   color: var(--accent); width: fit-content;
 }
 .quality-grid .n { color: var(--muted); font-size: 13px; flex: 1; }
-.quality-grid button { width: 100%; padding: 10px; font-size: 14px; margin-top: 8px; }
+/* Button-fit fix (2026-11-24): the quality button is as wide as its grid
+   cell, so a long label wraps to two centred lines at the same 14px size
+   instead of being cut off by the old nowrap rule. min-height keeps
+   one-line buttons at their current height; wrapped buttons grow taller. */
+.quality-grid button { width: 100%; padding: 10px; font-size: 14px; margin-top: 8px; min-height: 38px; white-space: normal; line-height: 1.3; text-align: center; }
 .hint { color: var(--muted); font-size: 13px; margin-top: 14px; }
 
 /* Steps / features */
