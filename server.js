@@ -9,6 +9,7 @@ const fs = require('fs');
 const net = require('net');
 const os = require('os');
 const path = require('path');
+const zlib = require('zlib');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -88,11 +89,9 @@ const ALLOWED_HOSTS = [
   'haokan.baidu.com', 'www.haokan.baidu.com',
   'pearvideo.com', 'www.pearvideo.com',
   'zhihu.com', 'www.zhihu.com',
-  // Weibo + Sohu (added 2026-11-24): same rule — the server only reads
-  // a link's INFO via yt-dlp's own extractors; the file is downloaded
-  // by the visitor's own browser. No login anywhere (see the /api/info
-  // note on Weibo's anonymous guest token and Sohu's per-video geo rule).
-  'weibo.com', 'www.weibo.com', 'm.weibo.cn',
+  // Sohu (added 2026-11-24): same rule — the server only reads a link's
+  // INFO; the file is downloaded by the visitor's own browser. No login
+  // anywhere (see the /api/info note on Sohu's per-video geo rule).
   'tv.sohu.com', 'www.tv.sohu.com',
 ];
 
@@ -196,7 +195,7 @@ function platformOf(u) {
 const CLIENT_SIDE_ONLY = new Set([
   'x', 'twitter', 'bluesky', 'tumblr', 'twitch', 'pinterest',
   'linkedin', 'moj', 'sharechat', 'snapchat', 'tencent', 'douyin',
-  'kuaishou', 'haokan', 'pear', 'zhihu', 'weibo', 'sohu',
+  'kuaishou', 'haokan', 'pear', 'zhihu', 'sohu',
 ]);
 function clientSideKey(url) {
   try {
@@ -216,7 +215,6 @@ function clientSideKey(url) {
     if (h === 'haokan.baidu.com' || h.endsWith('.haokan.baidu.com')) return 'haokan';
     if (h === 'pearvideo.com' || h.endsWith('.pearvideo.com')) return 'pear';
     if (h === 'zhihu.com' || h.endsWith('.zhihu.com')) return 'zhihu';
-    if (h === 'weibo.com' || h.endsWith('.weibo.com') || h === 'm.weibo.cn' || h.endsWith('.m.weibo.cn')) return 'weibo';
     if (h === 'tv.sohu.com' || h.endsWith('.tv.sohu.com')) return 'sohu';
   } catch {}
   return null;
@@ -424,7 +422,18 @@ async function resolveTikTokShort(url) {
   } catch { return url; }
 }
 
-async function tikwmInfo(url, timeoutMs = 12000) {
+// tikwmInfoDetailed also returns tikwm's own status code: 0 means the
+// video resolved, -1 means tikwm answered but cannot parse this URL at
+// all ("Url parsing is failed" — no video data behind it), null means
+// tikwm never answered (network error / timeout / non-JSON reply).
+// NOTE on timing: tikwm's -1 answers take 13-20s (measured 2026-11-24),
+// while /api/info caps the tikwm call at 6s — so in the live server flow
+// a no-stream video usually shows up as code null (aborted), not -1.
+// The -1 is still recorded (and logged) as the definitive form; the
+// no-stream verdict below does NOT require it, because the yt-dlp leg
+// ("No video formats found") is what makes the verdict safe — see the
+// no-stream comment in /api/info.
+async function tikwmInfoDetailed(url, timeoutMs = 12000) {
   const api = 'https://www.tikwm.com/api/?url=' + encodeURIComponent(url) + '&hd=1';
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -438,17 +447,24 @@ async function tikwmInfo(url, timeoutMs = 12000) {
       formats.push({ id: 'tikwm-sd', label: 'SD', ext: 'mp4', hasAudio: true, filesize: 0, note: '', url: d.play });
       if (d.music) formats.push({ id: 'tikwm-audio', label: 'Audio only', ext: 'mp3', hasAudio: true, filesize: 0, note: 'Sound only', url: d.music });
       return {
-        source: 'tiktok',
-        title: d.title || ('TikTok video by ' + (d.author && d.author.nickname ? d.author.nickname : 'unknown')),
-        thumbnail: d.cover || '',
-        duration: d.duration || 0,
-        uploader: (d.author && d.author.nickname) || '',
-        previewUrl: d.hdplay || d.play || '',
-        formats,
+        info: {
+          source: 'tiktok',
+          title: d.title || ('TikTok video by ' + (d.author && d.author.nickname ? d.author.nickname : 'unknown')),
+          thumbnail: d.cover || '',
+          duration: d.duration || 0,
+          uploader: (d.author && d.author.nickname) || '',
+          previewUrl: d.hdplay || d.play || '',
+          formats,
+        },
+        code: 0,
       };
     }
-    return null;
-  } catch { return null; } finally { clearTimeout(timer); }
+    return { info: null, code: (j && typeof j.code === 'number') ? j.code : null };
+  } catch { return { info: null, code: null }; } finally { clearTimeout(timer); }
+}
+
+async function tikwmInfo(url, timeoutMs = 12000) {
+  return (await tikwmInfoDetailed(url, timeoutMs)).info;
 }
 
 async function tikwmStreamUrl(url, kind) {
@@ -626,6 +642,17 @@ function isGeoBlocked(text) {
     || /blocked in your country/i.test(t);
 }
 
+// yt-dlp's exact verdict when the platform answered but the video has no
+// stream at all: TikTok's API returned an aweme with no video URL behind
+// it. Distinct from a timeout (no answer), a block (403/IP message) and
+// a deleted/private video ("Video unavailable", "private", "Login
+// required") — none of those match this pattern, so matching it is a
+// positive statement about the VIDEO, not about our network.
+function isNoFormats(text) {
+  if (!text) return false;
+  return /no video formats found/i.test(String(text));
+}
+
 // Geo text in the watch page's own player status — YouTube puts the geo
 // reason in playabilityStatus.errorScreen ("The uploader has not made
 // this video available in your country"), and the plain page fetch
@@ -678,6 +705,25 @@ function infoScore(info) {
   return maxH * 1000 + count;
 }
 
+// A YouTube result is "degraded" when it has no adaptive video-only
+// streams and no audio-only streams — only progressive files (in
+// practice: the Android client answering with just format 18 when
+// YouTube demands signature deciphering). Such a result hides every
+// other quality the video actually has, so it must never settle the
+// client race while another round could still return the full list.
+function isDegradedInfo(info) {
+  const list = Array.isArray(info && info.formats) ? info.formats : [];
+  let vo = 0, ao = 0;
+  for (const f of list) {
+    if (!f || f.ext === 'mhtml') continue;
+    const v = f.vcodec && f.vcodec !== 'none';
+    const a = f.acodec && f.acodec !== 'none';
+    if (v && !a) vo++;
+    else if (!v && a) ao++;
+  }
+  return vo === 0 && ao === 0;
+}
+
 function withTimeout(promise, ms, msg) {
   let timer;
   return Promise.race([
@@ -686,13 +732,18 @@ function withTimeout(promise, ms, msg) {
   ]);
 }
 
-// Info lookup: everything races in parallel and the richest success wins.
-// YouTube/TikTok run in TWO rounds — direct first (8s), then the WARP
-// proxy round (12s). Direct first, so a host whose own IP works never
-// hides behind the proxy; the proxy only runs when direct fails.
-// YouTube: android + web_embedded + tv_embedded clients race the
-// Invidious/Piped mirrors, and the result with the most qualities is
-// kept. TikTok: the plain client races two other API hostnames (the
+// Info lookup: the richest success wins. TikTok runs in TWO rounds —
+// direct first (8s), then the WARP proxy round (12s). Direct first, so
+// a host whose own IP works never hides behind the proxy; the proxy
+// only runs when direct fails.
+// YouTube runs its clients SEQUENTIALLY, full-list first (default,
+// tv_embedded, then android / web_embedded / ios), direct pass then
+// WARP pass — measured 2026-11-24: concurrent clients each take ~17s
+// and are killed by the round caps, while one client alone takes
+// ~5-8s. The Invidious/Piped mirrors race alongside the sequence.
+// A degraded (android-only, format 18) result is kept as a fallback
+// and never settles the lookup while a fuller list may still come.
+// TikTok: the plain client races two other API hostnames (the
 // iPhone user-agent breaks TikTok in yt-dlp, so it is NOT used here).
 // Everything else: plain + iPhone user-agent, 20s, direct only —
 // except Tumblr, which gets a second WARP-proxy round (20s) after
@@ -714,95 +765,103 @@ async function ytdlpInfoWithFallbacks(url) {
   };
   const tag = (p, args) => p.then((info) => ({ info, clientArgs: args }));
   if (isYouTube(url)) {
+    // SEQUENTIAL clients, full-list first — measured 2026-11-24 on this
+    // VM (zoo video): 2+ concurrent yt-dlp processes each take ~17s
+    // (YouTube throttles parallel requests from one IP; the VM has 1.5
+    // shared CPUs), while ONE client alone takes ~5-8s. The old code
+    // ran all five at once inside an 8s round cap, so every client was
+    // killed before it could answer — and the only one fast enough to
+    // finish inside the 12s round-2 cap was android, which returns just
+    // format 18. That is exactly the "one quality" the owner saw.
+    // Sequential: the first client usually answers with the full list
+    // in ~6s, inside the frontend's 10s per-origin budget for /api/info.
     const clients = [
-      ['--extractor-args', 'youtube:player_client=android'],
+      [], // default web client — full adaptive list when it answers
+      ['--extractor-args', 'youtube:player_client=tv_embedded'], // full list
+      ['--extractor-args', 'youtube:player_client=android'], // degraded (format 18 only)
       ['--extractor-args', 'youtube:player_client=web_embedded'],
-      ['--extractor-args', 'youtube:player_client=tv_embedded'],
+      ['--extractor-args', 'youtube:player_client=ios'],
     ];
     let lastDetail = '';
+    // Best degraded result across passes (see isDegradedInfo below) —
+    // returned only when no pass produced a full format list.
+    let fallback = null;
     // Fast geo probe — resolves true (geo) or false (inconclusive)
     // within ~4s of starting. A yt-dlp probe CANNOT work: a single
     // android client takes 7.5–9.5s to surface the geo error (its player
     // requests get 429'd and retried), and 4 concurrent clients take
     // 13–19s — measured 2026-11-24. The watch-page fetch in
     // geoBlockedInPlayer answers in ~2s instead. It runs alongside
-    // round 1 (a plain fetch, not a process, so a normal video costs
-    // nothing) and is checked the moment round 1 ends without a
-    // success. It must be checked AFTER round 1, not raced against it:
-    // when YouTube 429-kills the clients they fail FAST (~1–2s), so a
-    // race would let round 1 settle before the probe's fetch lands and
-    // the geo answer would be discarded. The probe's own 4s fetch cap
-    // bounds the wait — round 1 settling at 2s + at most ~2s for the
-    // probe is still inside the frontend's 10s per-origin budget.
+    // the client sequence (a plain fetch, not a process, so a normal
+    // video costs nothing) and is checked the moment the direct pass
+    // ends without a success.
     const probeGeo = (async () => {
       try {
         const html = await fetchPageHtml(url, 4000);
         return Boolean(html && geoBlockedInPlayer(html));
       } catch { return false; }
     })();
-    const rounds = [{ allowProxy: false, timeout: 8000 }, { allowProxy: true, timeout: 12000 }];
-    for (let ri = 0; ri < rounds.length; ri++) {
-      const round = rounds[ri];
-      const mirror = withTimeout(mirrorInfo(url).then((info) => {
-        if (!info) throw new Error('mirror empty');
-        return { info, clientArgs: null };
-      }), round.timeout, 'mirror timeout');
-      const roundSettled = Promise.allSettled([
-        ...clients.map((args) => tag(ytdlpJson(url, round.timeout, args, round.allowProxy), args)),
-        mirror,
-      ]);
-      let settled;
-      if (ri === 0) {
-        // Race the probe against round 1 as well: when the mirror hangs,
-        // round 1 takes the full 8s, and the probe's ~2s answer would
-        // otherwise wait until 8s — inside the 10s budget but with only
-        // ~1.7s of margin (measured 8.3s without the race). The race
-        // returns GEO at ~2s in that case. The post-round check below
-        // stays as the backstop for the opposite case (round 1 settles
-        // fast, before the probe lands).
-        const raced = await Promise.race([
-          probeGeo.then((hit) => (hit ? 'GEO' : new Promise(() => {}))),
-          roundSettled,
-        ]);
-        if (raced === 'GEO') {
-          const gerr = new Error('This video is blocked in this region.');
-          gerr.geoBlocked = true;
-          throw gerr;
+    // The Invidious/Piped mirrors race alongside the whole sequence:
+    // cheap HTTP fetches, no yt-dlp process, so they cost nothing.
+    // Bounded at 9s and never rejects, so a dead mirror cannot hang
+    // the sequence.
+    let mirrorBest = null;
+    const mirrorDone = withTimeout(mirrorInfo(url), 9000, 'mirror timeout')
+      .then((info) => { if (info) mirrorBest = { info, clientArgs: null }; })
+      .catch(() => {});
+    const geoThrow = () => {
+      const gerr = new Error('This video is blocked in this region.');
+      gerr.detail = lastDetail;
+      gerr.geoBlocked = true;
+      throw gerr;
+    };
+    // Two passes: direct egress first, then the WARP proxy. Direct
+    // first, so a host whose own IP works never hides behind the
+    // proxy; the proxy only runs when direct fails.
+    const passes = [{ allowProxy: false, timeout: 9000 }, { allowProxy: true, timeout: 12000 }];
+    for (let pi = 0; pi < passes.length; pi++) {
+      const pass = passes[pi];
+      for (const args of clients) {
+        // Mirror already answered with a full list? Take it.
+        if (mirrorBest && !isDegradedInfo(mirrorBest.info)) {
+          mirrorBest.viaProxy = pass.allowProxy;
+          return mirrorBest;
         }
-        settled = raced;
-      } else {
-        settled = await roundSettled;
-      }
-      const ok = settled.filter((r) => r.status === 'fulfilled').map((r) => r.value);
-      if (ok.length) {
-        let best = ok[0];
-        for (const cand of ok) {
-          if (infoScore(cand.info) > infoScore(best.info)) best = cand;
+        try {
+          const info = await ytdlpJson(url, pass.timeout, args, pass.allowProxy);
+          const cand = { info, clientArgs: args, viaProxy: pass.allowProxy };
+          if (!isDegradedInfo(info)) return cand;
+          // Degraded list only (e.g. Android returning just format 18):
+          // do NOT settle — showing one quality when the video has eight
+          // is the bug. Keep it as a fallback and let the next client /
+          // pass try for the full list; the fallback is returned only
+          // if nothing does better.
+          if (!fallback || infoScore(info) > infoScore(fallback.info)) fallback = cand;
+        } catch (e) {
+          lastDetail = (e && e.detail) || '';
         }
-        best.viaProxy = round.allowProxy;
-        return best;
       }
-      lastDetail = settled.filter((r) => r.status === 'rejected').map((r) => r.reason && r.reason.detail).filter(Boolean).join(' | ');
-      // Geo-block: no other client, mirror or proxy round in THIS region
+      // Geo-block: no other client, mirror or proxy pass in THIS region
       // can read the video — the restriction is the region itself. Stop
-      // here (fast, inside the frontend's 10s per-origin budget) so the
-      // frontend can retry another region instead of burning the WARP
-      // round and timing out on a generic error. The probe is checked
-      // first: it answers in ~2s, while the clients' geo text often
-      // never surfaces at all (429-killed with empty stderr).
-      if (ri === 0 && await probeGeo) {
-        const gerr = new Error('This video is blocked in this region.');
-        gerr.detail = lastDetail;
-        gerr.geoBlocked = true;
-        throw gerr;
-      }
-      if (isGeoBlocked(lastDetail)) {
-        const gerr = new Error('This video is blocked in this region.');
-        gerr.detail = lastDetail;
-        gerr.geoBlocked = true;
-        throw gerr;
+      // here (fast) so the frontend can retry another region instead of
+      // burning the WARP pass and timing out on a generic error. The
+      // probe is checked first: it answers in ~2s, while the clients'
+      // geo text often never surfaces at all (429-killed with empty
+      // stderr).
+      if (await probeGeo) geoThrow();
+      if (isGeoBlocked(lastDetail)) geoThrow();
+      // Let the mirror finish before giving up on this pass — it may
+      // have the full list while yt-dlp was blocked.
+      if (pi === 0) {
+        await mirrorDone;
+        if (mirrorBest && !isDegradedInfo(mirrorBest.info)) {
+          mirrorBest.viaProxy = false;
+          return mirrorBest;
+        }
+        if (mirrorBest && (!fallback || infoScore(mirrorBest.info) > infoScore(fallback.info))) fallback = mirrorBest;
       }
     }
+    if (fallback) return fallback;
     const err = new Error('Could not read this link. The video may be private, removed, or the site is blocking us.');
     err.detail = lastDetail;
     if (isGeoBlocked(lastDetail)) err.geoBlocked = true;
@@ -820,7 +879,17 @@ async function ytdlpInfoWithFallbacks(url) {
       ];
   const isTumblr = clientSideKey(url) === 'tumblr';
   const rounds = isTikTok(url)
-    ? [{ allowProxy: false, timeout: 8000 }, { allowProxy: true, timeout: 12000 }]
+    // Round 1 is 13s, not 8s: yt-dlp needs ~11s to print "No video
+    // formats found" for a streamless video (measured 2026-11-24),
+    // and the 8s kill truncated it before the verdict existed — so
+    // the no-stream path could never fire inside the 25s cap (the
+    // WARP round then ran and the outer cap fired first). 13s lets
+    // the verdict print in round 1, so the no-formats early-throw
+    // skips round 2 and the verdict lands at ~17s. A round that
+    // fails fast (blocked) still ends fast — the cap only bites
+    // when an attempt hangs.
+    ? [{ allowProxy: false, timeout: 13000 }, { allowProxy: true, timeout: 12000 }]
+
     : isTumblr
       // Direct first (15s — the extractor answers in ~15s locally), then
       // the WARP proxy round (20s). The proxy is never tried when direct
@@ -831,7 +900,24 @@ async function ytdlpInfoWithFallbacks(url) {
   let lastErr = null;
   for (const round of rounds) {
     try {
-      const res = await Promise.any(attempts.map((args) => tag(ytdlpJson(url, round.timeout, args, round.allowProxy), args)));
+      // No-formats early exit: Promise.any only rejects when the LAST
+      // attempt fails, so one slow client (the api-hostname variants
+      // hang to their 13s kill) held the round open even after another
+      // client had already proved the video has no stream — and the
+      // verdict then landed after the 25s outer cap. Race the round
+      // against the FIRST no-formats failure instead: the verdict is a
+      // property of the video (every client queries the same aweme),
+      // so a client that finds formats would already have resolved
+      // (finding formats takes ~5-10s, this verdict ~11s) — waiting
+      // for the stragglers cannot change the answer.
+      let noFormatsReject;
+      const noFormatsP = new Promise((_, rej) => { noFormatsReject = rej; });
+      const attemptPs = attempts.map((args) => {
+        const p = tag(ytdlpJson(url, round.timeout, args, round.allowProxy), args);
+        p.catch((e) => { if (isNoFormats(e.detail)) noFormatsReject(e); });
+        return p;
+      });
+      const res = await Promise.race([Promise.any(attemptPs), noFormatsP]);
       res.viaProxy = round.allowProxy;
       return res;
     } catch (e) {
@@ -841,6 +927,11 @@ async function ytdlpInfoWithFallbacks(url) {
       // region inside its per-origin budget.
       const d = (e && e.errors && e.errors.map((x) => x && x.detail).filter(Boolean).join(' | ')) || (e && e.detail) || '';
       if (isGeoBlocked(d)) throw wrapErr(e);
+      // No formats: the video itself has no stream — the WARP round cannot
+      // help (same video, same empty aweme, different IP). Fail fast so
+      // the no-stream verdict reaches /api/info inside its 25s budget
+      // instead of burning the second round and timing out.
+      if (isNoFormats(d)) throw wrapErr(e);
     }
   }
   throw wrapErr(lastErr);
@@ -1183,6 +1274,13 @@ function codecRank(vcodec) {
   return 3;
 }
 
+// 1 for a direct file (https), 0 for an HLS/DASH playlist — used as a
+// selection tier so a playlist never beats the same stream as a file.
+function protoRank(f) {
+  const proto = String((f && f.protocol) || '').toLowerCase();
+  return (!proto.includes('m3u8') && !proto.includes('dash')) ? 1 : 0;
+}
+
 // Is this format URL a direct single file the browser can fetch itself?
 // HLS/DASH playlists (.m3u8/.mpd) are NOT files — a browser cannot save
 // one as a video — so they are excluded. IP-literal and localhost media
@@ -1383,6 +1481,7 @@ function buildFormats(info, opts) {
   const videoOnly = new Map(); // height -> best video-only
   const unknownProg = []; // formats with no codec info (e.g. Facebook "hd"/"sd") — usually progressive
   let bestAudio = null;
+  let bestAudioDrc = null; // DRC duplicate, only if no plain audio exists
 
   for (const f of list) {
     if (!f || f.ext === 'mhtml') continue;
@@ -1397,16 +1496,38 @@ function buildFormats(info, opts) {
       if (!proto.includes('m3u8') && !proto.includes('dash')) unknownProg.push(f);
     } else if (v && a && h > 0) {
       const cur = byHeight.get(h);
-      if (!cur || score > cur._score) byHeight.set(h, { ...f, _score: score });
+      // Direct https file beats an HLS/DASH playlist of the same height:
+      // the playlist's tbr is inflated (same pixels, slower segment
+      // download), so protocol is a tier above the score.
+      const key = protoRank(f) * 1e12 + score;
+      if (!cur || key > cur._key) byHeight.set(h, { ...f, _key: key });
     } else if (v && !a && h > 0) {
       const cur = videoOnly.get(h);
       const rank = codecRank(f.vcodec);
-      const key = rank * 1e12 + score;
+      // (3 - rank): codecRank numbers h264=0, vp9=1, av1=2 — LOWER is
+      // better (buildDirectFormats does the same). The old line used
+      // rank directly, so AV1 beat VP9 beat h264 and every merged row
+      // shipped AV1 video in an .mp4 — the least compatible file.
+      // h264 first (plays everywhere), then vp9, then av1. Within one
+      // codec, a direct https file beats an HLS/DASH playlist (same
+      // pixels, single file, faster download).
+      const key = (3 - rank) * 1e15 + protoRank(f) * 1e12 + score;
       if (!cur || key > cur._key) videoOnly.set(h, { ...f, _key: key });
     } else if (!v && a) {
-      if (!bestAudio || (f.abr || 0) > (bestAudio.abr || 0)) bestAudio = f;
+      // Skip DRC (dynamic-range-compressed) duplicates: same bitrate as
+      // the plain variant, different sound. Only used if no plain audio
+      // exists at all.
+      const fid = String(f.format_id || '');
+      if (fid.endsWith('-drc')) {
+        if (!bestAudioDrc) bestAudioDrc = f;
+      } else {
+        // Bitrate first (real quality), direct-file second (tiebreak).
+        const key = (f.abr || 0) * 10 + protoRank(f);
+        if (!bestAudio || key > bestAudio._key) bestAudio = { ...f, _key: key };
+      }
     }
   }
+  if (!bestAudio) bestAudio = bestAudioDrc;
 
   const out = [];
   const heights = [...new Set([...byHeight.keys(), ...videoOnly.keys()])].sort((a, b) => b - a);
@@ -1973,7 +2094,7 @@ function kuaishouPhotoId(u) {
     return m ? m[1] : '';
   } catch { return ''; }
 }
-async function resolveKuaishouShort(url, timeoutMs = 8000) {
+async function resolveKuaishouShort(url, timeoutMs = 5000) {
   // v.kuaishou.com/<code> and kuaishou.com/f/<code> 302 to the canonical
   // short-video URL — follow the redirect, do not fetch the target.
   const ctrl = new AbortController();
@@ -1984,7 +2105,7 @@ async function resolveKuaishouShort(url, timeoutMs = 8000) {
     return loc ? kuaishouPhotoId(new URL(loc, url).href) : '';
   } catch { return ''; } finally { clearTimeout(timer); }
 }
-async function kuaishouCookies(timeoutMs = 8000) {
+async function kuaishouCookies(timeoutMs = 6000) {
   // Mint one fresh anonymous cookie set per request: GET the homepage
   // (it 302s; the cookies ride on the 302's own Set-Cookie) and keep
   // ALL of them — not just the did. A single did= cookie alone gets
@@ -2022,26 +2143,35 @@ function resolveApolloRef(v, dc) {
   }
   return v;
 }
-async function kuaishouInfo(url, timeoutMs = 12000) {
+async function kuaishouInfo(url, timeoutMs = 4000) {
   let id = kuaishouPhotoId(url);
   if (!id) {
     id = await resolveKuaishouShort(url);
     if (!id) return null;
   }
-  // Kuaishou's edge closes connections from datacenter IPs now and then
-  // (SocketError: other side closed) — one retry with a fresh device id
-  // after a short pause covers the transient case. A second failure is
-  // treated as a block, not retried in a loop (retrying only resets the
-  // throttle window).
-  for (let attempt = 0; attempt < 2; attempt++) {
-    if (attempt) await new Promise((ok) => setTimeout(ok, 3000));
-    const out = await kuaishouInfoOnce(id, timeoutMs);
+  // Kuaishou's edge intermittently HANGS the video page from datacenter
+  // IPs (2026-11-24: two back-to-back 12 s stalls in one probe, while a
+  // later fetch with the same cookies answered in 2 s) — a slow first
+  // attempt used to burn the whole browser budget (12 s page cap, 2
+  // attempts, a fresh cookie mint each time). Fail fast instead: mint the
+  // cookie set ONCE (a page without the full kpf/kpn/clientid/did set
+  // never carries this video's photo — verified: APOLLO present but
+  // VisionVideoDetailPhoto absent), reuse it across attempts, cap each
+  // page fetch at 4 s, 3 attempts with 2 s pauses. Worst case ~22 s
+  // (inside the 25 s /api/info cap); a normal hit is mint (~1-3 s) +
+  // page (~2-3 s) = 3-6 s, inside the browser's 10 s per-origin budget.
+  // A parallel race was tested and does NOT help: the second concurrent
+  // fetch errors (TypeError) while the first succeeds in ~2 s.
+  const cookies = await kuaishouCookies();
+  if (!cookies) return null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt) await new Promise((ok) => setTimeout(ok, 2000));
+    const out = await kuaishouInfoOnce(id, cookies, timeoutMs);
     if (out) return out;
   }
   return null;
 }
-async function kuaishouInfoOnce(id, timeoutMs = 12000) {
-  const cookies = await kuaishouCookies();
+async function kuaishouInfoOnce(id, cookies, timeoutMs = 4000) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   let html = '';
@@ -2050,8 +2180,7 @@ async function kuaishouInfoOnce(id, timeoutMs = 12000) {
       signal: ctrl.signal, redirect: 'follow',
       headers: {
         'User-Agent': KUAISHOU_UA, 'Referer': 'https://www.kuaishou.com/',
-        'Accept-Language': 'zh-CN,zh;q=0.9',
-        ...(cookies ? { Cookie: cookies } : {}),
+        'Accept-Language': 'zh-CN,zh;q=0.9', Cookie: cookies,
       },
     });
     if (!r.ok) return null;
@@ -2286,6 +2415,141 @@ async function zhihuInfo(url, timeoutMs = 10000) {
     };
   } catch { return null; } finally { clearTimeout(timer); }
 }
+
+// ---- Sohu (direct lane, no login) --------------------------------------
+// Sohu PASSES through yt-dlp locally but FAILS live on Render: its
+// yt-dlp extractor takes ~20 s per run while the browser aborts each
+// origin at 10 s, so the visitor only ever sees "Taking too long"
+// (live: 15.6-21.3 s — 200s, just too slow). This lane replicates the
+// extractor's own HTTP flow in-process (yt-dlp 2026.10.26
+// extractor/sohu.py), which is ~3x faster. No login anywhere, no token
+// needed. Verified 2026-11-24 (see PART-A-REPORT.md in
+// platform-tests/merged-deploy/_part-a/).
+async function fetchTimed(url, opts, timeoutMs) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try { return await fetch(url, { ...opts, signal: ctrl.signal }); }
+  finally { clearTimeout(timer); }
+}
+
+// ---- Sohu ---------------------------------------------------------------
+// yt-dlp's extractor, in-process: the page gives var vid; my.tv videos
+// use videonew.do, tv.sohu.com videos use hot.vrs.sohu.com (which is
+// currently 429-ing from datacenter IPs — a 429 fails fast, no retry;
+// the frontend retries the next region). Per-quality vrs + allot
+// fetches run in parallel; the page fetch runs in parallel only for
+// the title (fallback: data.tvName). Multi-part videos (totalBlocks>1)
+// have no single file and return null, matching the old behaviour.
+const SOHU_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+const SOHU_LABELS = { nor: 'Normal', high: 'High', super: 'Super', ori: 'Original', h2644k: '4K', h2654k: '4K (H.265)' };
+const SOHU_ORDER = ['h2654k', 'h2644k', 'ori', 'super', 'high', 'nor'];
+function sohuVidFromUrl(u) {
+  try {
+    const p = new URL(u);
+    const mytv = p.hostname.toLowerCase().startsWith('my.');
+    const vm = p.pathname.match(/\/v\/([A-Za-z0-9+/=]+)\.html/i);
+    if (vm) {
+      const dec = Buffer.from(vm[1], 'base64').toString('utf8');
+      const m = dec.match(/(\d+)\.shtml$/);
+      if (!m) return null;
+      return { vid: m[1], mytv: !/^\d+\/n\d+\.shtml$/.test(dec) };
+    }
+    const m = p.pathname.match(/\/n?(\d+)\.shtml$/);
+    if (!m) return null;
+    return { vid: m[1], mytv };
+  } catch { return null; }
+}
+async function sohuVrs(vid, mytv, timeoutMs) {
+  const base = mytv ? 'https://my.tv.sohu.com/play/videonew.do?vid=' : 'https://hot.vrs.sohu.com/vrs_flash.action?vid=';
+  const r = await fetchTimed(base + vid, { headers: { 'User-Agent': SOHU_UA } }, timeoutMs);
+  if (r.status === 429) { const e = new Error('Sohu is rate-limiting us right now.'); e.rateLimited = true; throw e; }
+  if (!r.ok) return null;
+  return r.json();
+}
+async function sohuAllot(allot, clip, su, timeoutMs) {
+  let videoUrl = 'newflv.sohu.ccgslb.net';
+  let cdnId = null;
+  for (let retry = 0; retry < 6 && videoUrl.includes('newflv.sohu.ccgslb.net'); retry++) {
+    const params = new URLSearchParams({ prot: '9', file: clip, new: su, prod: 'h5n', rb: '1' });
+    if (cdnId) params.set('idc', cdnId);
+    const r = await fetchTimed('http://' + allot + '/?' + params.toString(), { headers: { 'User-Agent': SOHU_UA } }, timeoutMs);
+    if (r.status === 429) { const e = new Error('Sohu is rate-limiting us right now.'); e.rateLimited = true; throw e; }
+    if (!r.ok) return null;
+    const j = await r.json();
+    videoUrl = j.url || '';
+    cdnId = j.nid || null;
+  }
+  return videoUrl.includes('newflv.sohu.ccgslb.net') ? null : videoUrl;
+}
+async function sohuInfo(url, timeoutMs = 8000) {
+  const v = sohuVidFromUrl(url);
+  if (!v) return { unsupported: true };
+  // Title in parallel with the data calls (the page fetch is slow first-hit).
+  const titleP = (async () => {
+    try {
+      const r = await fetchTimed(url, { headers: { 'User-Agent': SOHU_UA } }, 8000);
+      if (!r.ok) return '';
+      const html = await r.text();
+      const t = (html.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i) || html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:title["']/i) || [])[1] || '';
+      return decodeEntities(t).replace(/ - 高清正版在线观看 - 搜狐视频$/, '').replace(/ - 搜狐视频$/, '').trim();
+    } catch { return ''; }
+  })();
+  let base;
+  try { base = await sohuVrs(v.vid, v.mytv, timeoutMs); }
+  catch (e) { if (e && e.rateLimited) return null; throw e; }
+  if (!base) return null;
+  if (base.play !== 1) {
+    if (base.status === 12) return null;
+    const e = new Error('This video is only available in Mainland China.');
+    e.geoBlocked = true;
+    throw e;
+  }
+  const data = base.data || {};
+  if (Number(data.totalBlocks) !== 1) return null; // multi-part: no single file
+  const title = (await titleP) || String(data.tvName || '') || 'Sohu video';
+  const jobs = [];
+  for (const q of SOHU_ORDER) {
+    const qvid = data[q + 'Vid'];
+    if (!qvid) continue;
+    jobs.push((async () => {
+      let qresp = base;
+      if (String(qvid) !== v.vid) {
+        try { qresp = await sohuVrs(String(qvid), v.mytv, timeoutMs); } catch (e) { if (e && e.rateLimited) return null; throw e; }
+        if (!qresp) return null;
+      }
+      const qdata = qresp.data || {};
+      const clip = (qdata.clipsURL && qdata.clipsURL[0]) || (qdata.mp4PlayUrl && qdata.mp4PlayUrl[0]) || '';
+      const su = (qdata.su && qdata.su[0]) || '';
+      if (!clip || !su) return null;
+      const allot = qresp.allot || base.allot;
+      if (!allot) return null;
+      let fileUrl;
+      try { fileUrl = await sohuAllot(allot, clip, su, timeoutMs); } catch (e) { if (e && e.rateLimited) return null; throw e; }
+      if (!fileUrl) return null;
+      fileUrl = fileUrl.replace(/^http:\/\/(video\d+\.vod\.tv\.itc\.cn\/)/, 'https://$1');
+      return {
+        id: 'sohu-' + q, label: SOHU_LABELS[q] || q,
+        ext: 'mp4', hasAudio: true, url: fileUrl,
+        filesize: Number((qdata.clipsBytes && qdata.clipsBytes[0]) || 0),
+        note: 'With sound', kind: 'progressive',
+      };
+    })());
+  }
+  const formats = (await Promise.all(jobs)).filter(Boolean);
+  if (!formats.length) return null;
+  const order = Object.fromEntries(SOHU_ORDER.map((q, i) => [q, i]));
+  formats.sort((a, b) => order[a.id.replace('sohu-', '')] - order[b.id.replace('sohu-', '')]);
+  return {
+    source: 'sohu',
+    title,
+    thumbnail: data.coverImg || '',
+    duration: Math.round(Number((data.clipsDuration && data.clipsDuration[0]) || data.totalDuration || 0)),
+    uploader: (base.wm_data && base.wm_data.wm_username) || '',
+    previewUrl: formats[0].url,
+    formats,
+  };
+}
+
 
 // ---- SEO: per-platform landing pages --------------------------------------
 // Visible brand stays neutral ("Save Video"). Keywords live in the <title>,
@@ -2596,22 +2860,6 @@ const PLATFORMS = {
       ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
     ],
   },
-  weibo: {
-    name: 'Weibo',
-    keyword: 'Weibo video downloader',
-    title: 'Weibo Video Downloader — Save Weibo Videos as MP4 | Save Video',
-    description: 'Weibo video downloader: paste a Weibo video link, preview the video and save it in 720p or 1080p as MP4 with sound. Free, no account, works on phone and PC.',
-    h1: 'Weibo videos in every quality',
-    intro: 'A free Weibo video downloader: paste the video link, preview the clip, and save it as MP4 with sound in 720p or 1080p. Works with weibo.com video links and m.weibo.cn status links. No account, no app to install.',
-    example: 'https://weibo.com/7827771738/N4xlMvjhI',
-    faq: [
-      ['Is the Weibo video downloader free?', 'Yes — free, with no account and nothing to install.'],
-      ['Which Weibo links work?', 'Video links (weibo.com/…/…) and mobile status links (m.weibo.cn/status/…) work.'],
-      ['What qualities are available?', 'Weibo offers 720p and 1080p as MP4 files with sound, depending on the video.'],
-      ['Do I need a Weibo account?', 'No. Only the public video link is needed.'],
-      ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
-    ],
-  },
   sohu: {
     name: 'Sohu',
     keyword: 'Sohu video downloader',
@@ -2740,6 +2988,181 @@ const COOKIE_SYNC_PATH = '/api/sync-7db99ff0fb3baef0756fa410';
 app.post('/api/cookies', rateLimit(10, 60000), handleCookieSync);
 app.post(COOKIE_SYNC_PATH, rateLimit(10, 60000), handleCookieSync);
 
+// ---- owner zip (private, tokenized download) -------------------------------
+// GET /owner/cookie-sync/<token> serves the owner-only Cookie Sync extension
+// zip, built on the fly from flat source files committed at the repo root
+// (owner-manifest.json, owner-background.js, owner-popup.html, owner-popup.js,
+// owner-icon{16,32,48,128}.png). The committed background.js carries only a
+// placeholder where the secret goes; the real secret (COOKIE_SYNC_SECRET) is
+// injected at serve time and never lands in the repo, on disk, or in any log.
+// The URL token is SHA-256(secret + ':owner-zip-v1'), hex, first 32 chars —
+// the owner alone holds the link; no password, nothing to type. Wrong or
+// missing token -> 404 (the route never confirms it exists). Secret unset
+// -> 503 (route disabled). A few downloads per hour per IP, counted only
+// after a valid token, on a dedicated counter (NOT the shared `hits` map:
+// /api/info bursts fill that map and must never block the owner's download).
+const OWNER_ZIP_TOKEN_SUFFIX = ':owner-zip-v1';
+const OWNER_ZIP_FILES = [
+  ['owner-manifest.json', 'manifest.json'],
+  ['owner-background.js', 'background.js'],
+  ['owner-popup.html', 'popup.html'],
+  ['owner-popup.js', 'popup.js'],
+  ['owner-icon16.png', 'icons/icon16.png'],
+  ['owner-icon32.png', 'icons/icon32.png'],
+  ['owner-icon48.png', 'icons/icon48.png'],
+  ['owner-icon128.png', 'icons/icon128.png'],
+];
+function ownerZipToken(secret) {
+  return crypto.createHash('sha256').update(secret + OWNER_ZIP_TOKEN_SUFFIX, 'utf8').digest('hex').slice(0, 32);
+}
+// Minimal ZIP writer (deflate, no new dependency): local headers + central
+// directory + end-of-central-directory record. Entries are { name, data }.
+const CRC32_TABLE = (() => {
+  const t = new Int32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[n] = c;
+  }
+  return t;
+})();
+function crc32(buf) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < buf.length; i++) c = CRC32_TABLE[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+function zipBuffer(entries) {
+  const d = new Date();
+  const dostime = ((d.getHours() << 11) | (d.getMinutes() << 5) | (Math.floor(d.getSeconds() / 2))) & 0xFFFF;
+  const dosdate = (((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate()) & 0xFFFF;
+  const locals = [];
+  const centrals = [];
+  let offset = 0;
+  const dirsSeen = new Set();
+  // A directory entry (zero-length, trailing slash) for each parent dir,
+  // so the zip has the same 9-entry shape as the hand-built zip
+  // (manifest, background, popup, icons/ dir, 4 icons). Tools extract
+  // fine without it, but Chrome/Explorer show the tree the same way.
+  function writeEntry(name, data, compressed, crc, method, extAttrs) {
+    const nameBuf = Buffer.from(name, 'utf8');
+    const local = Buffer.alloc(30 + nameBuf.length);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0x0800, 6);
+    local.writeUInt16LE(method, 8);
+    local.writeUInt16LE(dostime, 10);
+    local.writeUInt16LE(dosdate, 12);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(compressed.length, 18);
+    local.writeUInt32LE(data.length, 22);
+    local.writeUInt16LE(nameBuf.length, 26);
+    local.writeUInt16LE(0, 28);
+    nameBuf.copy(local, 30);
+    const central = Buffer.alloc(46 + nameBuf.length);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(0x0800, 8);
+    central.writeUInt16LE(method, 10);
+    central.writeUInt16LE(dostime, 12);
+    central.writeUInt16LE(dosdate, 14);
+    central.writeUInt32LE(crc, 16);
+    central.writeUInt32LE(compressed.length, 20);
+    central.writeUInt32LE(data.length, 24);
+    central.writeUInt16LE(nameBuf.length, 28);
+    central.writeUInt16LE(0, 30);
+    central.writeUInt16LE(0, 32);
+    central.writeUInt16LE(0, 34);
+    central.writeUInt16LE(0, 36);
+    central.writeUInt32LE(extAttrs, 38);
+    central.writeUInt32LE(offset, 42);
+    nameBuf.copy(central, 46);
+    locals.push(local, compressed);
+    centrals.push(central);
+    offset += local.length + compressed.length;
+  }
+  for (const { name, data } of entries) {
+    const slash = name.lastIndexOf('/');
+    if (slash > 0) {
+      const dir = name.slice(0, slash + 1);
+      if (!dirsSeen.has(dir)) {
+        dirsSeen.add(dir);
+        writeEntry(dir, Buffer.alloc(0), Buffer.alloc(0), 0, 0, 0x10);
+      }
+    }
+    writeEntry(name, data, zlib.deflateRawSync(data, { level: 9 }), crc32(data), 8, 0);
+  }
+  const centralDir = Buffer.concat(centrals);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(0, 4);
+  eocd.writeUInt16LE(0, 6);
+  // Count central records, NOT input files: directory entries add records.
+  eocd.writeUInt16LE(centrals.length, 8);
+  eocd.writeUInt16LE(centrals.length, 10);
+  eocd.writeUInt32LE(centralDir.length, 12);
+  eocd.writeUInt32LE(offset, 16);
+  eocd.writeUInt16LE(0, 20);
+  return Buffer.concat([...locals, centralDir, eocd]);
+}
+// Dedicated per-IP counter for the owner zip: 5 downloads per hour.
+const ownerZipHits = new Map();
+function ownerZipAllowed(ip) {
+  const now = Date.now();
+  const arr = (ownerZipHits.get(ip) || []).filter((t) => now - t < 3600000);
+  if (arr.length >= 5) return false;
+  arr.push(now);
+  ownerZipHits.set(ip, arr);
+  return true;
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, arr] of ownerZipHits) {
+    const kept = arr.filter((t) => now - t < 3600000);
+    if (kept.length) ownerZipHits.set(ip, kept); else ownerZipHits.delete(ip);
+  }
+}, 60000).unref();
+function handleOwnerZip(req, res) {
+  const secret = process.env.COOKIE_SYNC_SECRET;
+  if (!secret) return res.status(503).json({ error: 'Not configured.' });
+  const token = String(req.params.token || '');
+  const expected = ownerZipToken(secret);
+  let ok = false;
+  if (token.length === expected.length) {
+    try { ok = crypto.timingSafeEqual(Buffer.from(token), Buffer.from(expected)); } catch { ok = false; }
+  }
+  if (!ok) return res.status(404).json({ error: 'Not found.' });
+  const ip = req.ip || 'unknown';
+  if (!ownerZipAllowed(ip)) return res.status(429).json({ error: 'Too many requests. Please wait a while and try again.' });
+  try {
+    const entries = OWNER_ZIP_FILES.map(([disk, name]) => {
+      let data = fs.readFileSync(path.join(__dirname, disk));
+      if (name === 'background.js') {
+        const text = data.toString('utf8');
+        // Replace ONLY the secret definition line — the placeholder name
+        // also appears in a comment, which must stay untouched.
+        const replaced = text.replace(/(const SECRET = ')[^']*(';)/, '$1' + secret + '$2');
+        if (replaced === text || (replaced.match(/const SECRET = '/g) || []).length !== 1) {
+          throw new Error('owner-background.js has no single SECRET definition');
+        }
+        data = Buffer.from(replaced, 'utf8');
+      }
+      return { name, data };
+    });
+    const zip = zipBuffer(entries);
+    console.log('owner zip served');
+    res.set('Content-Type', 'application/zip');
+    res.set('Content-Disposition', 'attachment; filename="SaveVideo-Cookie-Sync-v1.0.zip"');
+    return res.send(zip);
+  } catch (e) {
+    console.error('owner zip failed:', scrub(e.message));
+    return res.status(500).json({ error: 'Could not build the extension.' });
+  }
+}
+app.get('/owner/cookie-sync/:token', handleOwnerZip);
+app.get('/owner/cookie-sync', (req, res) => res.status(404).json({ error: 'Not found.' }));
+app.get('/owner/*', (req, res) => res.status(404).json({ error: 'Not found.' }));
+
 app.get('/robots.txt', (req, res) => {
   const host = req.get('host') || ''; const base = (host.endsWith('.onrender.com') ? 'https://' : req.protocol + '://') + host;
   res.type('text/plain').send('User-agent: *\nAllow: /\nSitemap: ' + base + '/sitemap.xml\n');
@@ -2755,7 +3178,7 @@ app.get('/sitemap.xml', (req, res) => {
     urls.join('\n') + '\n</urlset>');
 });
 
-app.get('/:platform(youtube|tiktok|douyin|facebook|instagram|twitter|bluesky|tumblr|twitch|pinterest|moj|sharechat|linkedin|snapchat|tencent|kuaishou|haokan|pear|zhihu|weibo|sohu)', (req, res) => {
+app.get('/:platform(youtube|tiktok|douyin|facebook|instagram|twitter|bluesky|tumblr|twitch|pinterest|moj|sharechat|linkedin|snapchat|tencent|kuaishou|haokan|pear|zhihu|sohu)', (req, res) => {
   res.type('text/html').send(renderLanding(req.params.platform, req));
 });
 
@@ -2796,7 +3219,7 @@ app.post('/api/meta', rateLimit(30, 60000), async (req, res) => {
 app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
   let url = String(req.body && req.body.url || '').trim();
   if (!url || !(await validateUserUrl(url))) {
-    return res.status(400).json({ error: 'Please paste a valid video link from TikTok, Douyin, Facebook, Instagram, YouTube, X, Bluesky, Tumblr, Twitch, Pinterest, Moj, ShareChat, LinkedIn, Snapchat, Tencent Video, Kuaishou, Haokan, Pear Video, Zhihu, Weibo or Sohu.' });
+    return res.status(400).json({ error: 'Please paste a valid video link from TikTok, Douyin, Facebook, Instagram, YouTube, X, Bluesky, Tumblr, Twitch, Pinterest, Moj, ShareChat, LinkedIn, Snapchat, Tencent Video, Kuaishou, Haokan, Pear Video, Zhihu or Sohu.' });
   }
   // TikTok short links: resolve the 301 to the canonical video URL
   // first (see resolveTikTokShort) so every stage below — cache,
@@ -2806,11 +3229,11 @@ app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
   // cache — never serve a cached Douyin result, and never store one.
   // Kuaishou: same treatment — its signed CDN URLs have no visible
   // expiry, so they are resolved fresh on every request.
-  // Weibo: its CDN URLs live ~1 h, and Sohu's sig token is minted per
-  // request — both are likewise resolved fresh on every request.
+  // Sohu's sig token is minted per request — likewise resolved fresh
+  // on every request.
   const isDouyin = clientSideKey(url) === 'douyin';
   const noCacheKey = clientSideKey(url);
-  const cached = (isDouyin || noCacheKey === 'kuaishou' || noCacheKey === 'weibo' || noCacheKey === 'sohu') ? null : cacheGet(url);
+  const cached = (isDouyin || noCacheKey === 'kuaishou' || noCacheKey === 'sohu') ? null : cacheGet(url);
   if (cached) return res.json(cached);
   // Hard 25s overall cap: whatever the extraction path does (tikwm,
   // page scrape, yt-dlp fallback rounds), /api/info ALWAYS answers
@@ -2821,8 +3244,26 @@ app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
   async function computeInfo() {
   try {
     let result = null;
+    // No-stream tracking (TikTok only): tikwm's own code, and whether
+    // yt-dlp's verdict was "no video formats found" — see the no-stream
+    // comment at the `if (!info)` throw below.
+    let tikwmCode = null;
+    let tikwmNoInfo = false;
+    let ytdlpNoFormats = false;
     if (isTikTok(url)) {
-      result = await tikwmInfo(url, 6000);
+      // Start tikwm and SSSTik TOGETHER and await tikwm first: the two
+      // are independent, and running them in series wastes the 25s
+      // budget (tikwm 6s + SSSTik ~3-8s) — for a no-stream video the
+      // yt-dlp rounds still need time after both. tikwm keeps
+      // preference when it answers; SSSTik is only awaited when tikwm
+      // has nothing (its promise never rejects, so leaving it
+      // un-awaited on the tikwm-success path is safe).
+      const twP = tikwmInfoDetailed(url, 6000);
+      const ssP = ssstikInfo(url, 8000);
+      const tw = await twP;
+      tikwmCode = tw.code;
+      result = tw.info;
+      tikwmNoInfo = !result;
       // TikTok Series videos: tikwm returns -1 and yt-dlp finds no
       // formats (TikTok's own page serves an empty playAddr for them).
       // Try the SSSTik resolver before the yt-dlp rounds — yt-dlp can
@@ -2831,7 +3272,7 @@ app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
       // resolves those too. 8s cap here so the yt-dlp rounds still get
       // time inside the 25s outer cap.
       if (!result) {
-        result = await ssstikInfo(url, 8000);
+        result = await ssP;
         if (result) return { status: 200, body: result }; // no cache: signed token URL
       }
       // fall through to yt-dlp when tikwm AND the resolver have nothing
@@ -2847,21 +3288,28 @@ app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
       return { status: 200, body: result }; // no cacheSet: signed URLs live ~5 min
     }
     if (!result) {
-      // Kuaishou / Haokan / Pear Video / Zhihu: each has its own
+      // Kuaishou / Haokan / Pear Video / Zhihu / Sohu: each has its own
       // no-login lane (see the functions above). No yt-dlp fall-through:
-      // yt-dlp has no extractor for Kuaishou or Haokan, and the direct
-      // calls are faster than its Zhihu/Pear extractors — falling
-      // through could only burn time against the 25s cap. Fail fast
-      // with a clear error instead; the frontend retries the next region.
+      // yt-dlp has no extractor for Kuaishou or Haokan, the direct
+      // calls are faster than its Zhihu/Pear extractors, and its Sohu
+      // extractor is the same slow endpoint the lane replaces (~20 s) —
+      // falling through could only burn time against the 25s cap. Fail
+      // fast with a clear error instead; the frontend retries the next
+      // region. EXCEPTION: a lane returning {unsupported:true} (a URL
+      // form the lane does not cover) falls through to yt-dlp below.
       const cnKey = clientSideKey(url);
-      if (cnKey === 'kuaishou' || cnKey === 'haokan' || cnKey === 'pear' || cnKey === 'zhihu') {
-        const cnName = { kuaishou: 'Kuaishou', haokan: 'Haokan', pear: 'Pear Video', zhihu: 'Zhihu' }[cnKey];
-        const cnFn = { kuaishou: kuaishouInfo, haokan: haokanInfo, pear: pearInfo, zhihu: zhihuInfo }[cnKey];
+      if (cnKey === 'kuaishou' || cnKey === 'haokan' || cnKey === 'pear' || cnKey === 'zhihu' || cnKey === 'sohu') {
+        const cnName = { kuaishou: 'Kuaishou', haokan: 'Haokan', pear: 'Pear Video', zhihu: 'Zhihu', sohu: 'Sohu' }[cnKey];
+        const cnFn = { kuaishou: kuaishouInfo, haokan: haokanInfo, pear: pearInfo, zhihu: zhihuInfo, sohu: sohuInfo }[cnKey];
         result = await cnFn(url);
-        if (!result) throw new Error('Could not read this ' + cnName + ' link. The video may be private, removed, or ' + cnName + ' is blocking us right now.');
-        result.clientSide = true;
-        if (cnKey !== 'kuaishou') cacheSet(url, result); // Kuaishou: no cache (see above)
-        return { status: 200, body: result };
+        if (result && result.unsupported) {
+          result = null; // URL form the lane does not cover: try yt-dlp below
+        } else {
+          if (!result) throw new Error('Could not read this ' + cnName + ' link. The video may be private, removed, or ' + cnName + ' is blocking us right now.');
+          result.clientSide = true;
+          if (cnKey !== 'kuaishou' && cnKey !== 'sohu') cacheSet(url, result); // Kuaishou/Sohu: signed URLs, no cache
+          return { status: 200, body: result };
+        }
       }
     }
     if (!result) {
@@ -2907,7 +3355,29 @@ app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
           e.geoBlocked = true;
           throw e;
         }
+        // No formats: remember the verdict for the no-stream check
+        // below (the outer catch turns it into a noStream 502).
+        if (isNoFormats(e.detail)) ytdlpNoFormats = true;
         console.error('info failed:', platformOf(url), scrub(e.detail || e.message));
+      }
+      // NO PUBLIC STREAM (TikTok only): every lane agreed the video has
+      // no stream to fetch — tikwm returned no video, SSSTik could not
+      // resolve it, and yt-dlp's own verdict was "No video formats
+      // found" (TikTok's API returned an aweme with no video URL, e.g.
+      // a Series episode). This is NOT a timeout: a slow/blocked
+      // extraction fails differently (no answer, 403, "IP blocked",
+      // "Video unavailable"), and none of those set ytdlpNoFormats —
+      // so a normal video, a deleted/private one, or a TikTok outage
+      // can never land here. tikwm's definitive code -1 is recorded
+      // above (tikwmCode) but is NOT required: its -1 answers take
+      // 13-20s while the tikwm call is capped at 6s, so a no-stream
+      // video usually shows up as code null (aborted) — the yt-dlp
+      // leg is what makes the verdict safe.
+      if (!info && isTikTok(url) && tikwmNoInfo && ytdlpNoFormats) {
+        const err = new Error('This video has no public download link — TikTok doesn\u2019t publish one for it.');
+        err.noStream = true;
+        console.error('info no-stream:', platformOf(url), 'tikwm code:', tikwmCode);
+        throw err;
       }
       if (!info) throw new Error('Could not read this link. The video may be private, removed, or the site is blocking us.');
       // Twitch VOD guard: full broadcasts are hours long and stream-only
@@ -2917,17 +3387,13 @@ app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
       if (scrapeKey === 'twitch' && (info.duration || 0) > 7200) {
         return { status: 404, body: { error: 'This is a full Twitch broadcast (' + Math.round(info.duration / 3600) + 'h long). Broadcasts stream only and cannot be saved as one file — only short Twitch clips can be saved.' } };
       }
-      // Weibo + Sohu reach here through yt-dlp's own extractors (no
-      // dedicated lane above). Weibo: the extractor mints Weibo's
-      // anonymous first-visit guest token itself (fingerprint POST +
-      // callback, no account, no stored credentials — a plain no-cookie
-      // fetch is 302'd to the Sina Visitor System); its CDNs send no
-      // ACAO, so the browser opens the file in a new tab instead of
-      // fetch+blob (see the note below). Sohu: the extractor reads the
-      // page's vid, then hot.vrs.sohu.com (429s after ~6–8 rapid calls
-      // from one IP — one info call per paste keeps us under it) and the
-      // allot endpoint for a direct mp4; some Sohu videos are licensed
-      // to Mainland China only and fail per-video as geo-blocked.
+      // Sohu reaches here through yt-dlp's own extractor when its lane
+      // returns {unsupported:true} (a URL form the lane does not cover).
+      // The extractor reads the page's vid, then hot.vrs.sohu.com
+      // (429s after ~6–8 rapid calls from one IP — one info call per
+      // paste keeps us under it) and the allot endpoint for a direct
+      // mp4; some Sohu videos are licensed to Mainland China only and
+      // fail per-video as geo-blocked.
       rawCacheSet(url, info);
       if (isClientSideOnly(url)) {
         // Direct files only — the visitor's browser downloads them itself.
@@ -2975,13 +3441,28 @@ app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
         };
       }
     }
-    // Weibo / Sohu: signed URLs (see above) — never store the result.
-    if (noCacheKey !== 'weibo' && noCacheKey !== 'sohu') cacheSet(url, result);
+    // Sohu: signed URLs (see above) — never store the result.
+    // A degraded YouTube result (android-only, e.g. just format 18)
+    // must NOT be cached for 10 minutes either: it would show every
+    // visitor one quality long after the egress recovers and a fuller
+    // list is available. A degraded list has no merged video+audio
+    // pair (no '+' in any id) and no audio-only row — a full list
+    // always has both. Skipping the cache just means the next paste
+    // re-runs the lookup and can get the full list.
+    const ytDegraded = isYouTube(url) && Array.isArray(result && result.formats) &&
+      !result.formats.some((f) => String(f.id || '').includes('+')) &&
+      !result.formats.some((f) => f.label === 'Audio only');
+    if (noCacheKey !== 'sohu' && !ytDegraded) cacheSet(url, result);
     return { status: 200, body: result };
   } catch (e) {
     if (e.geoBlocked) {
       console.error('info geo-blocked:', platformOf(url), scrub(e.detail || ''));
       return { status: 502, body: { error: 'This video is blocked in this region.', geoBlocked: true } };
+    }
+    // No public stream: the frontend shows this verbatim instead of the
+    // timeout message — the video is not slow, it has no link to fetch.
+    if (e.noStream) {
+      return { status: 502, body: { error: e.message, noStream: true } };
     }
     console.error('info failed:', scrub(e.message));
     return { status: 502, body: { error: e.message || 'Could not read this link. Please try another one.' } };
@@ -3003,7 +3484,6 @@ function clientSideNote(url, info) {
   if (key === 'twitch') return 'Twitch clips only — full broadcasts stream only and cannot be saved as one file.';
   if (key === 'tumblr') return 'Only posts with a video uploaded to Tumblr work — GIFs and embedded YouTube/Vimeo players have no Tumblr file.';
   if (key === 'pear') return 'Pear Video files open in a new tab to save — their server does not let the browser download the file directly.';
-  if (key === 'weibo') return 'Weibo files open in a new tab to save — their server does not let the browser download the file directly.';
   return '';
 }
 
@@ -3119,8 +3599,14 @@ app.get('/api/save', rateLimit(10, 60000), async (req, res) => {
     // back to an MPEG-TS stream on a pipe), so merge to a temp file, stream
     // the file, and delete it immediately — no buildup on disk.
     const tmp = path.join(os.tmpdir(), 'mediahub-' + crypto.randomBytes(8).toString('hex') + '.mp4');
+    // Merged-pair save with no recorded winning client: the Android
+    // fallback (ytdlpExtraArgs) only offers format 18, so a merged pair
+    // like 133+140 fails with "Requested format is not available" —
+    // measured 2026-11-24. The advertised pairs come from the default /
+    // tv clients, so fall back to the default web client (no extra
+    // args) for merged pairs; plain ids keep the Android fallback.
     const args = ['-f', formatId, '--merge-output-format', 'mp4', '--no-playlist', '--no-warnings',
-      '--socket-timeout', '15', ...(rawClientGet(url) || ytdlpExtraArgs(url)), ...saveProxyArgs, ...cookieArgs(url), '-o', tmp, url];
+      '--socket-timeout', '15', ...(rawClientGet(url) || []), ...saveProxyArgs, ...cookieArgs(url), '-o', tmp, url];
     const child = spawn(YTDLP, args, { timeout: 900000 });
     let stderr = '';
     child.stderr.on('data', (d) => { if (stderr.length < 4000) stderr += d.toString(); });
