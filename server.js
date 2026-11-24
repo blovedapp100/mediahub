@@ -265,9 +265,9 @@ async function tikwmInfo(url, timeoutMs = 12000) {
     if (j && j.code === 0 && j.data && j.data.play) {
       const d = j.data;
       const formats = [];
-      if (d.hdplay) formats.push({ id: 'tikwm-hd', label: 'HD', ext: 'mp4', hasAudio: true, filesize: 0, note: 'Best quality' });
-      formats.push({ id: 'tikwm-sd', label: 'SD', ext: 'mp4', hasAudio: true, filesize: 0, note: '' });
-      if (d.music) formats.push({ id: 'tikwm-audio', label: 'Audio only', ext: 'mp3', hasAudio: true, filesize: 0, note: 'Sound only' });
+      if (d.hdplay) formats.push({ id: 'tikwm-hd', label: 'HD', ext: 'mp4', hasAudio: true, filesize: 0, note: 'Best quality', url: d.hdplay });
+      formats.push({ id: 'tikwm-sd', label: 'SD', ext: 'mp4', hasAudio: true, filesize: 0, note: '', url: d.play });
+      if (d.music) formats.push({ id: 'tikwm-audio', label: 'Audio only', ext: 'mp3', hasAudio: true, filesize: 0, note: 'Sound only', url: d.music });
       return {
         source: 'tiktok',
         title: d.title || ('TikTok video by ' + (d.author && d.author.nickname ? d.author.nickname : 'unknown')),
@@ -858,6 +858,11 @@ function buildFormats(info, opts) {
         label: h + 'p' + (prog.fps && prog.fps > 30 ? ' ' + Math.round(prog.fps) + 'fps' : ''),
         ext: prog.ext || 'mp4',
         hasAudio: true,
+        // Direct file URL: the browser downloads it straight from the
+        // video CDN, so the server never touches the bytes. Only
+        // progressive (single-file) formats carry one; merged
+        // video+audio pairs have none and keep the server save path.
+        url: prog.url || '',
         filesize: prog.filesize || prog.filesize_approx || 0,
         note: 'With sound',
       });
@@ -885,6 +890,7 @@ function buildFormats(info, opts) {
       label,
       ext: f.ext || 'mp4',
       hasAudio: true,
+      url: f.url || '',
       filesize: f.filesize || f.filesize_approx || 0,
       note: 'With sound',
     });
@@ -895,6 +901,7 @@ function buildFormats(info, opts) {
       label: 'Audio only',
       ext: bestAudio.ext || 'm4a',
       hasAudio: true,
+      url: bestAudio.url || '',
       filesize: bestAudio.filesize || bestAudio.filesize_approx || 0,
       note: 'Sound only',
     });
@@ -907,7 +914,7 @@ function buildFormats(info, opts) {
         out.push({
           id: String(prog.format_id),
           label: (prog.height ? prog.height + 'p' : 'Best quality'),
-          ext: prog.ext || 'mp4', hasAudio: true,
+          ext: prog.ext || 'mp4', hasAudio: true, url: prog.url || '',
           filesize: prog.filesize || prog.filesize_approx || 0, note: 'With sound',
         });
       }
