@@ -220,10 +220,14 @@
   // cross-origin calls, so the browser itself asks tikwm for the video's
   // direct links — no server involved at all. Returns the same shape
   // renderResult expects, or null when tikwm cannot be reached (then the
-  // server flow below runs instead).
+  // server flow below runs instead). The timeout is generous (20s) on
+  // purpose: tikwm's answers swing from ~3s to ~15s, and this call runs
+  // concurrently with the server stages, so waiting longer costs nothing
+  // when tikwm is fast — but an 8s timeout threw away slow answers that
+  // would have rendered.
   async function fetchTikwmBrowser(url) {
     var ctrl = new AbortController();
-    var timer = setTimeout(function () { ctrl.abort(); }, 8000);
+    var timer = setTimeout(function () { ctrl.abort(); }, 20000);
     try {
       var r = await fetch('https://www.tikwm.com/api/?url=' + encodeURIComponent(url) + '&hd=1', { signal: ctrl.signal });
       var j = await r.json();
@@ -400,7 +404,13 @@
   async function fetchInfo(url) {
     currentUrl = url;
     var reqId = ++latestReq;
-    var renderedForReq = false;
+    var renderedForReq = false; // anything at all shown (preview or full result)
+    var resultRendered = false; // the FULL result (qualities) shown — a meta
+    // preview must not block the browser tikwm result from rendering its
+    // qualities: renderPreview only shows title/thumbnail + "Finding
+    // qualities…", so discarding the tikwm answer after a preview left
+    // the user stuck on "Could not load qualities" even though the
+    // browser already had the whole quality list.
     var platform = detectPlatform(url) || 'Video';
     var timing = startTimer(platform);
     setBusy(true);
@@ -415,8 +425,9 @@
     var ttRendered = false;
     if (platform === 'TikTok') {
       fetchTikwmBrowser(url).then(function (tt) {
-        if (tt && reqId === latestReq && !renderedForReq) {
+        if (tt && reqId === latestReq && !resultRendered) {
           renderedForReq = true;
+          resultRendered = true;
           ttRendered = true;
           renderResult(tt);
           timerDone((Date.now() - timerStart) / 1000);
@@ -474,6 +485,7 @@
       if (reqId !== latestReq) return;
       currentInfoOrigin = res.origin;
       renderedForReq = true;
+      resultRendered = true;
       renderResult(res.data);
       timerDone((Date.now() - timerStart) / 1000);
     } catch (err) {
