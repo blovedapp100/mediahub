@@ -2106,8 +2106,32 @@ app.post('/api/meta', rateLimit(30, 60000), async (req, res) => {
   if (!url || !(await validateUserUrl(url))) {
     return res.status(400).json({ error: 'Please paste a valid video link.' });
   }
+  // X: the tweet page already carries the direct mp4s, and the preview
+  // scrape (og tags) fetches that same page — so run the X scrape in
+  // parallel and attach the qualities to the preview when it lands.
+  // This is what makes X robust when Stage 2 (/api/info) stalls in a
+  // real browser: the qualities arrive WITH the preview (~1s) instead
+  // of depending on Stage 2's timers at all. The scrape is capped at
+  // 2.5s and never delays the preview past that; when it misses, the
+  // meta returns as before and Stage 2 handles the link as today.
+  // Formats are attached to a COPY — fastMeta's cache must stay
+  // format-free (the cached meta is shared; the twimg URLs are fresh
+  // per paste from the scrape).
+  const scrapeP = clientSideKey(url) === 'x' ? scrapeDirectInfo(url).catch(() => null) : null;
   const meta = await fastMeta(url);
   if (!meta) return res.status(404).json({ error: 'No preview available yet.' });
+  if (scrapeP) {
+    const scraped = await Promise.race([scrapeP, new Promise((ok) => setTimeout(() => ok(null), 2500))]);
+    if (scraped && Array.isArray(scraped.formats) && scraped.formats.length) {
+      const out = Object.assign({}, meta);
+      out.formats = scraped.formats;
+      out.previewUrl = scraped.previewUrl || meta.previewUrl;
+      out.clientSide = true;
+      out.duration = out.duration || scraped.duration || 0;
+      out.uploader = out.uploader || scraped.uploader || '';
+      return res.json(out);
+    }
+  }
   return res.json(meta);
 });
 
