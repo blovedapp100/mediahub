@@ -369,6 +369,40 @@ setInterval(() => {
 
 // ---- TikTok via the free tikwm API (primary), yt-dlp as fallback -----------
 
+// Short TikTok links (tiktok.com/t/<code> — the form the app shares
+// when a user taps "Share" in TikTok) cost yt-dlp an extra redirect hop,
+// which pushes its round-1 attempts past the 8s timeout: locally the
+// short form took 24.8s (round 1 dead, round 2 saved it) against 12.7s
+// for the canonical URL — 0.2s from the 25s outer cap, so one slow day
+// turns a working-egress success into a 502. Resolve the 301 once (no
+// body downloaded, 5s cap, same-host only) and extract on the canonical
+// video URL instead. Any failure returns the original link untouched.
+async function resolveTikTokShort(url) {
+  try {
+    const u = new URL(url);
+    if (!/tiktok\.com$/.test(u.hostname.toLowerCase())) return url;
+    if (!/^\/t\/[^/]+\/?$/.test(u.pathname)) return url;
+    let current = url;
+    for (let hop = 0; hop < 3; hop++) {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 5000);
+      try {
+        const r = await fetch(current, {
+          signal: ctrl.signal, redirect: 'manual',
+          headers: { 'User-Agent': 'Mozilla/5.0' },
+        });
+        const loc = r.headers.get('location');
+        if (!loc) return url;
+        const abs = new URL(loc, current).href;
+        if (!/tiktok\.com$/.test(new URL(abs).hostname.toLowerCase())) return url;
+        if (abs.includes('/video/')) return abs;
+        current = abs;
+      } catch { return url; } finally { clearTimeout(timer); }
+    }
+    return url;
+  } catch { return url; }
+}
+
 async function tikwmInfo(url, timeoutMs = 12000) {
   const api = 'https://www.tikwm.com/api/?url=' + encodeURIComponent(url) + '&hd=1';
   const ctrl = new AbortController();
@@ -1461,6 +1495,32 @@ async function scrapeDirectInfo(url) {
     const handle = (title.match(/@([A-Za-z0-9_.]+)/) || [])[1] || '';
     return { source: 'snapchat', title: cleanTitle, thumbnail: thumb, duration: 0, uploader: handle, previewUrl: video, formats: [directFormat(video)] };
   }
+  if (key === 'x') {
+    // The tweet page embeds the video's direct mp4s (video.twimg.com)
+    // in its video_info JSON — one file per resolution, with sound.
+    // yt-dlp's X extractor needs the GraphQL API, which blocks /
+    // rate-limits datacenter IPs (the live "Finding qualities…" hang),
+    // so the scrape is the route. Prefer the tweet's own files
+    // (ext_tw_video) over the amplify copy; best resolution first.
+    const mine = pageMp4s(html).filter((u) => u.includes('video.twimg.com/') && u.includes('/vid/'));
+    if (!mine.length) return null;
+    const own = mine.filter((u) => u.includes('/ext_tw_video/'));
+    const pool = own.length ? own : mine;
+    const byRes = new Map();
+    for (const u of pool) {
+      const m = u.match(/\/vid\/(\d+)x(\d+)\//);
+      const h = m ? Number(m[2]) : 0;
+      if (!byRes.has(h) || u.length < byRes.get(h).length) byRes.set(h, u);
+    }
+    const durMs = Number((html.match(/duration_millis\\?":(\d+)/) || [])[1] || 0);
+    const handle = (title.match(/@([A-Za-z0-9_]+)/) || [])[1] || '';
+    const formats = [...byRes.entries()].sort((a, b) => b[0] - a[0]).map(([h, u], i) => ({
+      id: 'direct-' + (h || i), label: h ? h + 'p' : 'Best quality', ext: 'mp4', hasAudio: true,
+      url: u, filesize: 0, note: i === 0 ? 'Best quality' : 'With sound', kind: 'progressive',
+    }));
+    if (!formats.length) return null;
+    return { source: 'x', title: title || 'X video', thumbnail: thumb, duration: Math.round(durMs / 1000) || 0, uploader: handle, previewUrl: formats[0].url, formats };
+  }
   return null;
 }
 
@@ -1944,10 +2004,14 @@ app.post('/api/meta', rateLimit(30, 60000), async (req, res) => {
 });
 
 app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
-  const url = String(req.body && req.body.url || '').trim();
+  let url = String(req.body && req.body.url || '').trim();
   if (!url || !(await validateUserUrl(url))) {
     return res.status(400).json({ error: 'Please paste a valid video link from TikTok, Douyin, Facebook, Instagram, YouTube, X, Bluesky, Tumblr, Twitch, Pinterest, Moj, ShareChat, LinkedIn, Snapchat or Tencent Video.' });
   }
+  // TikTok short links: resolve the 301 to the canonical video URL
+  // first (see resolveTikTokShort) so every stage below — cache,
+  // tikwm, yt-dlp — works on the fast form.
+  if (isTikTok(url)) url = await resolveTikTokShort(url);
   // Douyin: signed CDN URLs live ~5 min, shorter than the 10-min info
   // cache — never serve a cached Douyin result, and never store one.
   const isDouyin = clientSideKey(url) === 'douyin';
@@ -1983,7 +2047,7 @@ app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
       // post, or a Tumblr post the scrape cannot read — Tumblr falls
       // through to yt-dlp below; the others fail with a clear error.
       const scrapeKey = clientSideKey(url);
-      if (scrapeKey === 'pinterest' || scrapeKey === 'moj' || scrapeKey === 'sharechat' || scrapeKey === 'snapchat' || scrapeKey === 'tumblr') {
+      if (scrapeKey === 'pinterest' || scrapeKey === 'moj' || scrapeKey === 'sharechat' || scrapeKey === 'snapchat' || scrapeKey === 'tumblr' || scrapeKey === 'x') {
         result = await scrapeDirectInfo(url);
         // ShareChat / Snapchat only: when the page embeds no usable file,
         // try yt-dlp once (12s) before giving up — it reads og:video /
@@ -1996,7 +2060,10 @@ app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
           cacheSet(url, result);
           return { status: 200, body: result };
         }
-        if (scrapeKey !== 'tumblr') throw new Error('Could not find a video file on this page. The video may be private, removed, or an image post.');
+        // Tumblr and X fall through to yt-dlp when the scrape finds
+        // nothing (Tumblr: image post or unreadable post; X: the page
+        // carried no video file) instead of failing outright.
+        if (scrapeKey !== 'tumblr' && scrapeKey !== 'x') throw new Error('Could not find a video file on this page. The video may be private, removed, or an image post.');
       }
       let info = null;
       try {
