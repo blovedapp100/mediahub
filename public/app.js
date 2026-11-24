@@ -112,6 +112,67 @@
     return v.toFixed(v >= 100 ? 0 : 1) + ' ' + units[i];
   }
 
+  function safeFileName(name, ext) {
+    var s = String(name || 'video').replace(/[\\/:*?"<>|\n\r\t]/g, '').replace(/\s+/g, ' ').trim().slice(0, 80) || 'video';
+    return s + '.' + (ext || 'mp4');
+  }
+
+  // Download a file straight from the video CDN in this browser: fetch it
+  // (TikTok / Facebook / Instagram CDNs allow cross-origin reads) and save
+  // the blob with a proper name. The server never sees the bytes — it only
+  // keeps the website live. Returns false when the direct fetch fails, so
+  // the caller can fall back to the server save. YouTube's CDN does not
+  // allow cross-origin reads, so YouTube qualities keep the server path.
+  async function downloadDirect(url, filename) {
+    try {
+      var r = await fetch(url);
+      if (!r.ok) return false;
+      var blob = await r.blob();
+      if (!blob || !blob.size) return false;
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 10000);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // TikTok straight from the visitor's browser: tikwm's public API allows
+  // cross-origin calls, so the browser itself asks tikwm for the video's
+  // direct links — no server involved at all. Returns the same shape
+  // renderResult expects, or null when tikwm cannot be reached (then the
+  // server flow below runs instead).
+  async function fetchTikwmBrowser(url) {
+    var ctrl = new AbortController();
+    var timer = setTimeout(function () { ctrl.abort(); }, 8000);
+    try {
+      var r = await fetch('https://www.tikwm.com/api/?url=' + encodeURIComponent(url) + '&hd=1', { signal: ctrl.signal });
+      var j = await r.json();
+      if (!j || j.code !== 0 || !j.data || !j.data.play) return null;
+      var d = j.data;
+      var formats = [];
+      if (d.hdplay) formats.push({ id: 'tt-hd', label: 'HD', ext: 'mp4', hasAudio: true, filesize: 0, note: 'Best quality', url: d.hdplay });
+      formats.push({ id: 'tt-sd', label: 'SD', ext: 'mp4', hasAudio: true, filesize: 0, note: '', url: d.play });
+      if (d.music) formats.push({ id: 'tt-audio', label: 'Audio only', ext: 'mp3', hasAudio: true, filesize: 0, note: 'Sound only', url: d.music });
+      return {
+        title: d.title || 'TikTok video',
+        uploader: (d.author && d.author.nickname) || '',
+        duration: d.duration || 0,
+        thumbnail: d.cover || '',
+        previewUrl: d.hdplay || d.play || '',
+        formats: formats,
+      };
+    } catch (e) {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   function setBusy(busy) {
     goBtn.disabled = busy;
     goBtn.textContent = busy ? 'Loading…' : 'Get video';
@@ -241,6 +302,16 @@
     msg.textContent = '';
     result.hidden = true;
     formatsEl.innerHTML = '';
+    // TikTok: try the browser itself first (tikwm is public and
+    // cross-origin). If that fails, fall through to the server flow below.
+    if (platform === 'TikTok') {
+      var tt = await fetchTikwmBrowser(url);
+      if (tt && reqId === latestReq) {
+        renderResult(tt);
+        timerDone((Date.now() - timerStart) / 1000);
+        return;
+      }
+    }
     // Stage 1 — fast preview (title + thumbnail) in about 2 seconds.
     // Tries the backup region too when this region cannot read the link.
     tryOrigins('/api/meta', {
@@ -329,11 +400,24 @@
         var btn = ev.target;
         btn.disabled = true;
         btn.textContent = 'Saving…';
-        var saveUrl = (currentInfoOrigin || '') + '/api/save?url=' + encodeURIComponent(currentUrl) +
-          '&formatId=' + encodeURIComponent(f.id) +
-          '&t=' + encodeURIComponent(currentTitle);
-        window.location.href = saveUrl;
-        setTimeout(function () { btn.disabled = false; btn.textContent = 'Save'; }, 3000);
+        var reset = function () { setTimeout(function () { btn.disabled = false; btn.textContent = 'Save'; }, 3000); };
+        var serverSave = function () {
+          window.location.href = (currentInfoOrigin || '') + '/api/save?url=' + encodeURIComponent(currentUrl) +
+            '&formatId=' + encodeURIComponent(f.id) +
+            '&t=' + encodeURIComponent(currentTitle);
+          reset();
+        };
+        // Direct download when this quality carries its own link: the
+        // browser fetches the file straight from the video CDN. Falls
+        // back to the server save when the direct fetch fails.
+        if (f.url) {
+          downloadDirect(f.url, safeFileName(currentTitle, f.ext)).then(function (ok) {
+            if (ok) { btn.textContent = 'Saved ✓'; reset(); }
+            else serverSave();
+          });
+          return;
+        }
+        serverSave();
       });
       formatsEl.appendChild(li);
     });
