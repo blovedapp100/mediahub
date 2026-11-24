@@ -538,6 +538,18 @@ const cookieFiles = {};
 function netscapeLines(content) {
   const lines = String(content || '').split('\n').filter((l) => l.trim() && !l.trim().startsWith('#'));
   if (!lines.length || !lines.some((l) => l.split('\t').length >= 6)) return null;
+  // Strict flag check (MozillaCookieJar rule): the flag field must be TRUE
+  // exactly when the domain starts with '.', FALSE otherwise. A mismatch
+  // makes yt-dlp reject the whole file ("invalid Netscape format") while
+  // health would still flip true — so reject it here with a 400 instead
+  // of storing a file that silently does nothing. Added 2026-11-24.
+  for (const l of lines) {
+    const f = l.split('\t');
+    if (f.length >= 7) {
+      const wantsTrue = f[0].startsWith('.');
+      if ((f[1] === 'TRUE') !== wantsTrue) return null;
+    }
+  }
   return lines;
 }
 function loadCookies() {
@@ -2667,7 +2679,33 @@ app.get('/api/health', (req, res) => res.json({ ok: true, cookies: cookieStatus(
 // secret and all cookie contents are never logged and never returned.
 // The extension runs only in the owner's browser and only ever talks to
 // the Save Video origins — visitors' cookies are never involved.
-app.post('/api/cookies', rateLimit(10, 60000), (req, res) => {
+// Second lock: the extension encrypts the cookies text with AES-256-GCM
+// before POSTing (key = SHA-256 of the same shared secret, fresh random
+// 12-byte IV per request; WebCrypto's output is ciphertext with the 16-byte
+// auth tag appended). The extension posts to the hidden path below; the old
+// /api/cookies path stays as an alias so extension versions already sent
+// to the owner keep working. The old plaintext {platform, cookies} shape
+// is still accepted for those versions; a failed decrypt is a 400 and
+// nothing about the payload is ever logged.
+function syncKey(secret) {
+  return crypto.createHash('sha256').update(secret, 'utf8').digest();
+}
+function decryptSyncPayload(secret, body) {
+  if (!body || typeof body !== 'object') return null;
+  if (typeof body.cookies === 'string') return body.cookies; // legacy plaintext
+  if (typeof body.data !== 'string' || typeof body.iv !== 'string') return null;
+  try {
+    const iv = Buffer.from(body.iv, 'base64');
+    const raw = Buffer.from(body.data, 'base64');
+    if (iv.length !== 12 || raw.length <= 16) return null;
+    const tag = raw.subarray(raw.length - 16);
+    const ct = raw.subarray(0, raw.length - 16);
+    const d = crypto.createDecipheriv('aes-256-gcm', syncKey(secret), iv);
+    d.setAuthTag(tag);
+    return Buffer.concat([d.update(ct), d.final()]).toString('utf8');
+  } catch { return null; }
+}
+function handleCookieSync(req, res) {
   const secret = process.env.COOKIE_SYNC_SECRET;
   if (!secret) return res.status(503).json({ error: 'Cookie sync is not configured on this server.' });
   const provided = String(req.headers['x-mediahub-secret'] || '');
@@ -2677,9 +2715,13 @@ app.post('/api/cookies', rateLimit(10, 60000), (req, res) => {
   }
   if (!ok) return res.status(401).json({ error: 'Unauthorized.' });
   const platform = req.body && req.body.platform;
-  const cookies = req.body && req.body.cookies;
-  if (!COOKIE_PLATFORMS.includes(platform) || typeof cookies !== 'string') {
-    return res.status(400).json({ error: 'Expected {platform, cookies}.' });
+  if (!COOKIE_PLATFORMS.includes(platform)) {
+    return res.status(400).json({ error: 'Expected {platform, cookies} or {platform, iv, data}.' });
+  }
+  const hadEncrypted = req.body && (typeof req.body.data === 'string' || typeof req.body.iv === 'string');
+  const cookies = decryptSyncPayload(secret, req.body);
+  if (cookies === null) {
+    return res.status(400).json({ error: hadEncrypted ? 'Could not decrypt cookies.' : 'Expected {platform, cookies} or {platform, iv, data}.' });
   }
   const lines = netscapeLines(cookies);
   if (!lines) return res.status(400).json({ error: 'Cookies must be a Netscape cookies.txt file.' });
@@ -2693,7 +2735,10 @@ app.post('/api/cookies', rateLimit(10, 60000), (req, res) => {
     console.error(`cookies sync failed for ${platform}:`, scrub(e.message));
     return res.status(500).json({ error: 'Could not save cookies.' });
   }
-});
+}
+const COOKIE_SYNC_PATH = '/api/sync-7db99ff0fb3baef0756fa410';
+app.post('/api/cookies', rateLimit(10, 60000), handleCookieSync);
+app.post(COOKIE_SYNC_PATH, rateLimit(10, 60000), handleCookieSync);
 
 app.get('/robots.txt', (req, res) => {
   const host = req.get('host') || ''; const base = (host.endsWith('.onrender.com') ? 'https://' : req.protocol + '://') + host;
