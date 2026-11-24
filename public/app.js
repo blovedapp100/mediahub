@@ -1,4 +1,4 @@
-// MediaHub frontend — no frameworks, no heavy libs.
+// Save Video frontend — no frameworks, no heavy libs.
 (function () {
   'use strict';
 
@@ -47,8 +47,8 @@
     extBtn.addEventListener('click', function () {
       // Download the extension file, then show the install steps inline.
       var a = document.createElement('a');
-      a.href = '/MediaHub-Extension-v1.8.zip';
-      a.download = 'MediaHub-Extension-v1.8.zip';
+      a.href = '/SaveVideo-Extension-v1.8.zip';
+      a.download = 'SaveVideo-Extension-v1.8.zip';
       document.body.appendChild(a);
       a.click();
       a.remove();
