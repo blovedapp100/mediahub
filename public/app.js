@@ -600,6 +600,11 @@
           answered++;
           if (data.geoBlocked) geoFails++;
           lastErr = new Error(data.error || 'Something went wrong.');
+          // Carry the flags the caller needs to decide what to do next:
+          // a geo-block is final, and a no-stream video has no file to
+          // wait for — neither should start a background job.
+          if (data.geoBlocked) lastErr.geoBlocked = true;
+          if (data.noStream) lastErr.noStream = true;
           if (r.status >= 400 && r.status < 500) lastErr._terminal = true;
           if (lastErr._terminal) throw lastErr;
           continue;
@@ -716,6 +721,7 @@
     // the user stuck on "Could not load qualities" even though the
     // full quality list had already arrived.
     var platform = detectPlatform(url) || 'Video';
+    var metaDuration = 0; // seconds, from Stage 1 — decides "long video"
     var timing = startTimer(platform);
     setBusy(true);
     msg.textContent = '';
@@ -733,6 +739,7 @@
         var data = res && res.data;
         if (reqId !== latestReq || !data || !data.title) return;
         renderedForReq = true;
+        metaDuration = data.duration || 0;
         if (data.formats && data.formats.length) {
           // The preview already carries this link's qualities (X: the
           // tweet page embeds the direct files, so /api/meta attaches
@@ -767,6 +774,120 @@
     // capped at 2 origins, 5s each: it is only the fast preview.)
     // Note: timing.max is no longer used for /api/info; the table keeps
     // its measured per-platform figures for the on-screen estimate.
+    // ---- Background jobs (slow videos) ---------------------------------
+    // Some videos can never finish inside /api/info's 25s cap: long
+    // YouTube videos, Douyin/Kuaishou, Moj/ShareChat, Zhihu. For those
+    // the server runs the same lookup in the background (POST /api/job)
+    // and this code polls it. The fast path above is untouched: a video
+    // that answers in time never starts a job. A job starts only when
+    // the sync lookup is about to time out (12s for known-slow links,
+    // 25s otherwise) or when it already timed out below.
+    var jobStarted = false; // a job is running for this request
+    var jobStopped = false; // Stage 2 won, or a newer request started
+    var jobId = null;
+    var jobOrigin = '';
+    var jobPollTimer = null;
+    function isSlowJobLink() {
+      if (platform === 'Douyin' || platform === 'Kuaishou' ||
+          platform === 'Moj' || platform === 'ShareChat' || platform === 'Zhihu') return true;
+      if (platform === 'YouTube' && metaDuration >= 240) return true;
+      return false;
+    }
+    function jobStop() {
+      jobStopped = true;
+      if (jobPollTimer) { clearTimeout(jobPollTimer); jobPollTimer = null; }
+      if (jobTimer) { clearTimeout(jobTimer); jobTimer = null; }
+      // Free the server-side per-IP slot: the lookup keeps running, but
+      // its result is discarded once the job record is gone.
+      if (jobId && jobOrigin) {
+        fetch(jobOrigin + '/api/job/' + jobId, { method: 'DELETE' }).catch(function () {});
+        jobId = null;
+      }
+    }
+    function jobShowProgress(pct, step) {
+      if (reqId !== latestReq || jobStopped || resultRendered) return;
+      if (timerEl) timerEl.innerHTML = 'Working in the background… <b class="elapsed">' + ((Date.now() - timerStart) / 1000).toFixed(1) + 's</b>';
+      formatsEl.innerHTML = '<li class="loading job">' +
+        '<span class="job-text">' + step + ' ' + pct + '%</span>' +
+        '<span class="job-progress"><span class="job-bar" style="width:' + pct + '%"></span></span>' +
+        '<span class="job-note">This one is slow — it keeps working in the background.</span></li>';
+    }
+    function jobShowError(text) {
+      if (reqId !== latestReq || jobStopped) return;
+      stopTimer();
+      if (!renderedForReq) { clearResult(); msg.textContent = text; }
+      else if (!resultRendered) formatsEl.innerHTML = '<li class="loading">' + text + '</li>';
+      if (reqId === latestReq) setBusy(false);
+    }
+    async function startJobFlow() {
+      if (jobStarted || reqId !== latestReq || resultRendered) return;
+      jobStarted = true;
+      var origins;
+      try { origins = await getOrigins(); } catch (e) { origins = [location.origin]; }
+      origins = orderOriginsByRegion(origins.slice());
+      var started = null;
+      for (var i = 0; i < Math.min(3, origins.length); i++) {
+        try {
+          var r = await fetch(origins[i] + '/api/job', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url: url }),
+          });
+          var d = await r.json().catch(function () { return null; });
+          if (r.ok && d && d.jobId) { started = { origin: origins[i], jobId: d.jobId }; break; }
+          if (r.status === 429 || r.status === 400) break; // decided: do not burn other origins
+        } catch (e) { /* next origin */ }
+        if (reqId !== latestReq || jobStopped) return;
+      }
+      if (!started) { jobShowError(platform + ' is taking too long right now. Please try again.'); return; }
+      jobOrigin = started.origin;
+      jobId = started.jobId;
+      var jobStart = Date.now();
+      var poll = async function () {
+        if (reqId !== latestReq || jobStopped) return;
+        if (Date.now() - jobStart > 320000) { jobShowError(platform + ' is taking too long right now. Please try again.'); return; }
+        var pr, pd;
+        try {
+          pr = await fetch(jobOrigin + '/api/job/' + jobId);
+          pd = await pr.json().catch(function () { return null; });
+        } catch (e) { pd = null; }
+        if (reqId !== latestReq || jobStopped) return;
+        if (!pd) { jobPollTimer = setTimeout(poll, 3000); return; }
+        if (pd.status === 'ready' && pd.formats && pd.formats.length) {
+          currentInfoOrigin = jobOrigin;
+          renderedForReq = true;
+          resultRendered = true;
+          jobStopped = true;
+          renderResult(pd);
+          timerDone((Date.now() - timerStart) / 1000);
+          if (reqId === latestReq) setBusy(false);
+          return;
+        }
+        if (pd.status === 'failed') {
+          if (pd.geoBlocked) { jobShowError('This video is blocked in every region we can reach (US, Europe and Asia). It is only available in the country where the uploader allowed it.'); return; }
+          jobShowError(pd.error || 'Could not load qualities — please try again.');
+          return;
+        }
+        if (pr.status === 404) { jobShowError(platform + ' is taking too long right now. Please try again.'); return; }
+        jobShowProgress(pd.progress || 0, pd.step || 'Getting it ready…');
+        jobPollTimer = setTimeout(poll, 3000);
+      };
+      jobShowProgress(0, 'Getting it ready…');
+      poll();
+    }
+    // The delay is decided when the timer FIRES, not when it is set:
+    // Stage 1's meta (which carries the duration) usually lands in ~1s,
+    // but the timer is created before that — deciding at creation time
+    // would see duration 0 and always take the 25s branch for YouTube.
+    // At 12s, start the job if the link is known-slow by then; otherwise
+    // wait out the remaining time to 25s and start it then.
+    function jobTimerDue() {
+      if (reqId !== latestReq || resultRendered) return;
+      var elapsed = Date.now() - timerStart;
+      if (isSlowJobLink() || elapsed >= 25000) { startJobFlow(); return; }
+      jobTimer = setTimeout(jobTimerDue, 25000 - elapsed);
+    }
+    var jobTimer = setTimeout(jobTimerDue, 12000);
     try {
       var infoBudget = new Promise(function (resolve, reject) {
         setTimeout(function () {
@@ -783,6 +904,7 @@
         }, 10000, 3, { regionDiverse: true }),
         infoBudget,
       ]);
+      jobStop(); // Stage 2 won: stop any job polling and free its slot
       if (reqId !== latestReq) return;
       currentInfoOrigin = res.origin;
       renderedForReq = true;
@@ -791,6 +913,8 @@
       timerDone((Date.now() - timerStart) / 1000);
     } catch (err) {
       if (reqId !== latestReq) return;
+      clearTimeout(jobTimer);
+      if (jobStarted) return; // the job flow owns the UI now
       stopTimer();
       // Nothing rendered for this request: clear the old card so no
       // stale video sits under the error. When the preview did render,
@@ -809,6 +933,12 @@
         var geoMsg = 'This video is blocked in every region we can reach (US, Europe and Asia). It is only available in the country where the uploader allowed it.';
         if (!renderedForReq) { clearResult(); msg.textContent = geoMsg; }
         else if (!resultRendered) formatsEl.innerHTML = '<li class="loading">' + geoMsg + '</li>';
+      } else if (err && !err._terminal && !err.noStream &&
+                 (err.name === 'AbortError' || /taking too long/i.test(err.message || ''))) {
+        // Slow, not decided: hand over to the background job instead of
+        // showing the timeout. (Geo-block, no-stream and terminal 4xx
+        // never reach here — they are final.)
+        startJobFlow();
       } else if (err && err.name === 'AbortError') {
         if (!renderedForReq) { clearResult(); msg.textContent = platform + ' is taking too long right now. Please try again.'; }
         else if (!resultRendered) formatsEl.innerHTML = '<li class="loading">Taking too long — please try again.</li>';

@@ -224,6 +224,19 @@ button.secondary:hover:not(:disabled) { box-shadow: none; background: var(--bord
   background-size: 400px 100%;
   animation: shimmer 1.6s linear infinite;
 }
+/* Background-job progress (slow videos): determinate bar + note inside
+   the same loading row, so the job state needs no extra markup. */
+.quality-grid li.loading.job { animation: none; }
+.quality-grid li.loading.job .job-text { display: block; font-weight: 700; color: var(--text); }
+.quality-grid li.loading.job .job-progress {
+  display: block; height: 6px; margin-top: 10px; border-radius: 3px;
+  background: var(--surface-2); overflow: hidden;
+}
+.quality-grid li.loading.job .job-bar {
+  display: block; height: 100%; border-radius: 3px;
+  background: var(--accent); transition: width .3s ease;
+}
+.quality-grid li.loading.job .job-note { display: block; margin-top: 8px; font-size: 13px; }
 .quality-grid li:hover { transform: translateY(-4px); border-color: var(--accent-2); box-shadow: var(--shadow-lg); }
 .quality-grid li.best {
   border-color: var(--accent-2); background: var(--accent-soft);
