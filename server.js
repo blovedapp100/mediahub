@@ -2090,8 +2090,9 @@ app.get('/robots.txt', (req, res) => {
 
 app.get('/sitemap.xml', (req, res) => {
   const base = req.protocol + '://' + req.get('host');
-  const urls = ['', ...Object.keys(PLATFORMS)].map((p) =>
-    '  <url><loc>' + base + '/' + p + '</loc><changefreq>weekly</changefreq><priority>' + (p === '' ? '1.0' : '0.8') + '</priority></url>');
+  const legal = ['privacy.html', 'terms.html', 'about.html', 'contact.html', 'disclaimer.html', 'cookie-policy.html'];
+  const urls = ['', ...Object.keys(PLATFORMS), ...legal].map((p) =>
+    '  <url><loc>' + base + '/' + p + '</loc><changefreq>weekly</changefreq><priority>' + (p === '' ? '1.0' : (legal.indexOf(p) >= 0 ? '0.5' : '0.8')) + '</priority></url>');
   res.type('application/xml').send(
     '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n' +
     urls.join('\n') + '\n</urlset>');
