@@ -27,40 +27,6 @@
     });
   }
 
-  // ---- extension install button (header, no popup) ----------------------
-  // The companion extension marks the page (data-mh-ext="1") when it is
-  // installed, so the button only ever shows when it is NOT installed.
-  // It is a plain button on the site itself — never a popup.
-  var extBtn = document.getElementById('extInstallBtn');
-  var extSteps = document.getElementById('extSteps');
-  var extStepsClose = document.getElementById('extStepsClose');
-  function extInstalled() {
-    return document.documentElement.getAttribute('data-mh-ext') === '1';
-  }
-  function syncExtBtn() {
-    if (!extBtn) return;
-    extBtn.style.display = extInstalled() ? 'none' : '';
-  }
-  if (extBtn) {
-    syncExtBtn();
-    setTimeout(syncExtBtn, 1200); // the marker may land just after this script
-    extBtn.addEventListener('click', function () {
-      // Download the extension file, then show the install steps inline.
-      var a = document.createElement('a');
-      a.href = '/SaveVideo-Extension-v1.8.zip';
-      a.download = 'SaveVideo-Extension-v1.8.zip';
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      if (extSteps) {
-        extSteps.hidden = false;
-        extSteps.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-      }
-    });
-  }
-  if (extStepsClose && extSteps) {
-    extStepsClose.addEventListener('click', function () { extSteps.hidden = true; });
-  }
 
   // ---- elements ------------------------------------------------------------
   var form = document.getElementById('form');
@@ -79,6 +45,85 @@
   var durationEl = document.getElementById('duration');
   var formatsEl = document.getElementById('formats');
   var noteEl = document.getElementById('platformNote');
+  // ---- modern preview player (Plyr, bundled locally in vendor/plyr) ----
+  // The preview plays through Plyr instead of the browser's bare
+  // controls: modern UI, seek bar, speed, picture-in-picture,
+  // fullscreen. One Plyr instance is created for the page and kept for
+  // its life — a new preview is just a new src on the same element, so
+  // a stale player can never sit under a new search. When Plyr cannot
+  // load, the plain <video controls> stay in place.
+  var previewPlyr = null;      // the one Plyr instance, or null
+  var previewSized = false;    // true once the current video was measured
+  var previewResizeTimer = null;
+
+  // Size the player box from the video's NATURAL ratio so the clip is
+  // shown whole — never cropped, never stretched — whatever its shape:
+  // 9:16 vertical, 16:9 horizontal, 1:1, 4:5. The box is as wide as
+  // the layout allows and at most ~70vh tall on desktop, ~60vh on a
+  // phone; the width follows from the height, so a vertical clip stays
+  // narrow and tall instead of being squeezed into a wide box.
+  function sizePreviewPlayer() {
+    if (!videoEl || !videoEl.videoWidth || !videoEl.videoHeight || !playerWrap) return;
+    var ratio = videoEl.videoWidth / videoEl.videoHeight;
+    var availW = playerWrap.parentElement ? playerWrap.parentElement.clientWidth : 0;
+    var isPhone = window.innerWidth <= 600;
+    var maxH = Math.round(window.innerHeight * (isPhone ? 0.60 : 0.70));
+    var w = Math.min(availW, maxH * ratio);
+    if (!isPhone) w = Math.min(w, availW * 0.55); // keep room for the meta column
+    if (w < 200) w = 200; // Plyr's own minimum width
+    playerWrap.style.width = Math.round(w) + 'px';
+    playerWrap.style.height = Math.round(w / ratio) + 'px';
+    previewSized = true;
+  }
+
+  function setupPreviewPlayer() {
+    if (previewPlyr || !videoEl || typeof Plyr === 'undefined') return;
+    try {
+      previewPlyr = new Plyr(videoEl, {
+        controls: ['play-large', 'play', 'progress', 'current-time', 'mute', 'volume', 'settings', 'pip', 'fullscreen'],
+        settings: ['speed'],
+        speed: { selected: 1, options: [0.5, 0.75, 1, 1.25, 1.5, 2] },
+        ratio: null, // read the clip's own ratio from its metadata
+        // Icons come from the bundled sprite, NOT Plyr's CDN: the
+        // default iconUrl (cdn.plyr.io) fires a cross-origin XHR on
+        // every init, which throws an uncaught error when that CDN is
+        // unreachable — and the task forbids external CDN dependencies.
+        iconUrl: '/vendor/plyr/plyr.svg',
+        fullscreen: { enabled: true, fallback: true, iosNative: true },
+        keyboard: { focused: true, global: false },
+        tooltips: { controls: true, seek: true },
+        seekTime: 10,
+        hideControls: true,
+        clickToPlay: true,
+      });
+    } catch (e) { previewPlyr = null; return; }
+    videoEl.addEventListener('loadedmetadata', sizePreviewPlayer);
+    if (videoEl.readyState >= 1) sizePreviewPlayer();
+  }
+
+  function pausePreviewPlayer() {
+    if (previewPlyr) { try { previewPlyr.pause(); } catch (e) {} }
+  }
+
+  // A new preview must never inherit the old one's size or player box.
+  function resetPreviewPlayer() {
+    pausePreviewPlayer();
+    previewSized = false;
+    if (playerWrap) {
+      playerWrap.style.width = '';
+      playerWrap.style.height = '';
+      playerWrap.classList.remove('no-video');
+    }
+  }
+
+  // Re-size when the window changes (rotate the phone, resize desktop).
+  window.addEventListener('resize', function () {
+    if (previewResizeTimer) clearTimeout(previewResizeTimer);
+    previewResizeTimer = setTimeout(function () {
+      if (previewSized) sizePreviewPlayer();
+    }, 150);
+  });
+
   if (!form || !urlInput) return;
 
   var PLATFORMS = [
@@ -95,6 +140,16 @@
     ['x.com', 'X (Twitter)'],
     ['reddit.com', 'Reddit'],
     ['vimeo.com', 'Vimeo'],
+    ['streamable.com', 'Streamable'],
+    ['soundcloud.com', 'SoundCloud'],
+    ['mixcloud.com', 'Mixcloud'],
+    ['odysee.com', 'Odysee'],
+    ['bitchute.com', 'BitChute'],
+    ['framatube.org', 'PeerTube'],
+    ['vk.com', 'VK'],
+    ['vkvideo.ru', 'VK'],
+    ['ok.ru', 'OK.ru'],
+    ['kick.com', 'Kick'],
     ['dailymotion.com', 'Dailymotion'],
     ['dai.ly', 'Dailymotion'],
     ['bsky.app', 'Bluesky'],
@@ -112,7 +167,7 @@
     ['v.qq.com', 'Tencent Video'],
     ['kuaishou.com', 'Kuaishou'],
     ['v.kuaishou.com', 'Kuaishou'],
-    ['kwai.com', 'Kuaishou'],
+    ['kwai.com', 'Kwai'],
     ['haokan.baidu.com', 'Haokan'],
     ['pearvideo.com', 'Pear Video'],
     ['zhihu.com', 'Zhihu'],
@@ -154,6 +209,7 @@
   // Clear the previous result card entirely (title, formats, preview
   // video) so a stale video never sits under a new error message.
   function clearResult() {
+    resetPreviewPlayer();
     result.hidden = true;
     titleEl.textContent = '';
     uploaderEl.textContent = '';
@@ -196,20 +252,44 @@
     return s + '.' + (ext || 'mp4');
   }
 
-  // Download a file straight from the video CDN in this browser: fetch it
-  // (TikTok / Facebook / Instagram CDNs allow cross-origin reads) and save
-  // the blob with a proper name. The server never sees the bytes — it only
-  // keeps the website live. Returns false when the direct fetch fails, so
-  // the caller can fall back to the server save. YouTube's CDN does not
-  // allow cross-origin reads, so YouTube qualities keep the server path.
-  async function downloadDirect(url, filename) {
+  // Save a file straight to this device: fetch it and save the blob with
+  // a proper name. Returns false when the direct fetch fails, so the
+  // caller can fall back to the server save.
+  async function downloadDirect(url, filename, onProgress) {
     try {
-      // No Referer: some CDNs (video.twimg.com) 403 when the request
-      // carries another site's Referer, even though the file itself is
-      // public. Sending no Referer makes the same URL answer 206.
+      // No Referer: some file hosts refuse a request that carries
+      // another site's Referer, even though the file itself is public.
+      // Sending no Referer makes the same URL answer.
       var r = await fetch(url, { referrerPolicy: 'no-referrer' });
-      if (!r.ok) return false;
-      var blob = await r.blob();
+      if (!r.ok || !r.body) return false;
+      // Stream it (instead of one r.blob()) so the button can show real
+      // MB/s + % while it downloads. Content-Length is a CORS-safelisted
+      // header, so the total is readable cross-origin; without it the
+      // progress shows MB downloaded + speed only.
+      var total = 0;
+      try { total = parseInt(r.headers.get('content-length') || '0', 10) || 0; } catch (e) {}
+      var ctype = '';
+      try { ctype = r.headers.get('content-type') || ''; } catch (e) {}
+      var reader = r.body.getReader();
+      var parts = [];
+      var got = 0;
+      var started = Date.now(), lastReport = 0;
+      for (;;) {
+        var read = await reader.read();
+        if (read.done) break;
+        if (read.value) {
+          parts.push(read.value);
+          got += read.value.byteLength;
+          var now = Date.now();
+          if (onProgress && now - lastReport >= 200) {
+            lastReport = now;
+            onProgress(got, total, (got * 1000) / Math.max(1, now - started));
+          }
+        }
+      }
+      if (!got) return false;
+      if (total && got !== total) return false; // short read: never save a broken file
+      var blob = new Blob(parts, ctype ? { type: ctype } : undefined);
       if (!blob || !blob.size) return false;
       var a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
@@ -223,41 +303,210 @@
     }
   }
 
-  // TikTok straight from the visitor's browser: tikwm's public API allows
-  // cross-origin calls, so the browser itself asks tikwm for the video's
-  // direct links — no server involved at all. Returns the same shape
-  // renderResult expects, or null when tikwm cannot be reached (then the
-  // server flow below runs instead). The timeout is generous (20s) on
-  // purpose: tikwm's answers swing from ~3s to ~15s, and this call runs
-  // concurrently with the server stages, so waiting longer costs nothing
-  // when tikwm is fast — but an 8s timeout threw away slow answers that
-  // would have rendered.
-  async function fetchTikwmBrowser(url) {
-    var ctrl = new AbortController();
-    var timer = setTimeout(function () { ctrl.abort(); }, 20000);
+  // ---- fast download (start) -------------------------------------------
+  // Maximum-speed download for direct CDN links: split the file into
+  // parallel Range requests (4–6 connections), show real MB/s + % while
+  // it downloads, then save one Blob. Bytes still go CDN → this browser
+  // only, never through our server — the server stream (/api/save) is
+  // untouched. Every step is probe-gated: if the CDN does not allow
+  // cross-origin ranged reads, or anything at all fails, the caller
+  // falls back to the old flow (single fetch, then open-in-tab / server
+  // save) — a failed fast path never breaks a working download.
+  // Measured 2026-11-24: X and Facebook allow cross-origin Range
+  // (206 + preflight allows the Range header); the Series CDN answers
+  // Range only to its own site, so Series always takes the fallback.
+  // Speed rule (measured, not guessed): on the test network a single
+  // connection was FASTER than parallel for 5–15 MB files (X 3.8s vs
+  // 10.5s, FB 3.5s vs 6.9s — the shared egress proxy is the bottleneck,
+  // so extra connections only add contention), while on a server that
+  // throttles each connection to 400 KB/s parallel was 6.2x faster
+  // (73s → 12s for 24 MB). So parallel engages only at 20 MB and up —
+  // where per-connection throttling dominates and the probe overhead is
+  // negligible — and smaller files take the single fetch, which also
+  // shows live speed now (see downloadDirect). One constant below
+  // (FAST_MIN_PARALLEL_BYTES) moves that line.
+  var FAST_MAX_BYTES = 500 * 1024 * 1024;       // parallel only up to 500 MB
+  var FAST_MAX_BYTES_LOWMEM = 100 * 1024 * 1024; // low-memory phones: 100 MB
+  var FAST_PROBE_TIMEOUT_MS = 5000;
+  var FAST_MIN_PARALLEL_BYTES = 20 * 1024 * 1024; // parallel only at 20 MB and up (measured rule above)
+
+  function fastMaxBytes() {
     try {
-      var r = await fetch('https://www.tikwm.com/api/?url=' + encodeURIComponent(url) + '&hd=1', { signal: ctrl.signal });
-      var j = await r.json();
-      if (!j || j.code !== 0 || !j.data || !j.data.play) return null;
-      var d = j.data;
-      var formats = [];
-      if (d.hdplay) formats.push({ id: 'tt-hd', label: 'HD', ext: 'mp4', hasAudio: true, filesize: 0, note: 'Best quality', url: d.hdplay });
-      formats.push({ id: 'tt-sd', label: 'SD', ext: 'mp4', hasAudio: true, filesize: 0, note: '', url: d.play });
-      if (d.music) formats.push({ id: 'tt-audio', label: 'Audio only', ext: 'mp3', hasAudio: true, filesize: 0, note: 'Sound only', url: d.music });
-      return {
-        title: d.title || 'TikTok video',
-        uploader: (d.author && d.author.nickname) || '',
-        duration: d.duration || 0,
-        thumbnail: d.cover || '',
-        previewUrl: d.hdplay || d.play || '',
-        formats: formats,
-      };
+      if (navigator.deviceMemory && navigator.deviceMemory <= 2) return FAST_MAX_BYTES_LOWMEM;
+    } catch (e) {}
+    return FAST_MAX_BYTES;
+  }
+
+  function fmtSpeed(bps) {
+    if (!bps || bps <= 0) return '';
+    var mb = bps / (1024 * 1024);
+    return (mb >= 100 ? Math.round(mb) : mb.toFixed(1)) + ' MB/s';
+  }
+
+  function mimeForExt(ext) {
+    ext = String(ext || 'mp4').toLowerCase();
+    if (ext === 'mp3') return 'audio/mpeg';
+    if (ext === 'm4a') return 'audio/mp4';
+    if (ext === 'webm') return 'video/webm';
+    return 'video/mp4';
+  }
+
+  // Button text during a download: "45% · 12.4 MB/s" when the total is
+  // known, "3.2 MB · 1.8 MB/s" when it is not.
+  function progressText(done, total, bps) {
+    if (total > 0) return Math.round((done / total) * 100) + '% · ' + fmtSpeed(bps);
+    var mb = done / (1024 * 1024);
+    return (mb >= 100 ? Math.round(mb) : mb.toFixed(1)) + ' MB · ' + fmtSpeed(bps);
+  }
+
+  // Probe one URL: HEAD (total via Content-Length — a CORS-safelisted
+  // header) + ranged GET bytes=0-0 (206 proves Range works). Content-
+  // Range is NOT exposed by these CDNs, so the total must come from
+  // HEAD. Resolves { url, total, ttfbMs } or null on ANY failure
+  // (CORS block, no 206, no length, timeout, HEAD refused).
+  function probeFastUrl(url) {
+    var start = Date.now();
+    var ctrl = new AbortController();
+    var timer = setTimeout(function () { ctrl.abort(); }, FAST_PROBE_TIMEOUT_MS);
+    try {
+      var headP = fetch(url, { method: 'HEAD', referrerPolicy: 'no-referrer', signal: ctrl.signal })
+        .then(function (r) {
+          var n = r.headers.get('content-length');
+          return n ? parseInt(n, 10) || 0 : 0;
+        })
+        .catch(function () { return 0; });
+      var rangeP = fetch(url, { headers: { Range: 'bytes=0-0' }, referrerPolicy: 'no-referrer', signal: ctrl.signal })
+        .then(function (r) { return r.status === 206; })
+        .catch(function () { return false; });
+      return Promise.all([headP, rangeP]).then(function (both) {
+        clearTimeout(timer);
+        var total = both[0], ranged = both[1];
+        if (!ranged || !total || total <= 0) return null;
+        return { url: url, total: total, ttfbMs: Date.now() - start };
+      }).catch(function () { clearTimeout(timer); return null; });
     } catch (e) {
-      return null;
-    } finally {
       clearTimeout(timer);
+      return Promise.resolve(null);
     }
   }
+
+  // First success wins: race the probes and return the fastest URL that
+  // allows ranged reads. Resolves null only when every candidate fails.
+  function raceFastUrls(urls) {
+    return new Promise(function (resolve) {
+      var pending = urls.length, failed = 0;
+      if (!pending) { resolve(null); return; }
+      urls.forEach(function (u) {
+        probeFastUrl(u).then(function (v) {
+          if (v) resolve(v);
+          else { failed++; if (failed === pending) resolve(null); }
+        });
+      });
+    });
+  }
+
+  function chunkCountFor(total) {
+    return total < 8 * 1024 * 1024 ? 4 : 6;
+  }
+
+  // Fetch one byte-range with a streaming reader so progress + speed
+  // update while it downloads. Resolves an ArrayBuffer; throws on any
+  // failure (non-206, short read, network error, abort) so the caller
+  // falls back instead of saving a broken file.
+  async function fetchChunk(url, start, end, signal, onBytes) {
+    var r = await fetch(url, { headers: { Range: 'bytes=' + start + '-' + end }, referrerPolicy: 'no-referrer', signal: signal });
+    if (r.status !== 206 || !r.body) throw new Error('chunk failed');
+    var reader = r.body.getReader();
+    var parts = [];
+    var got = 0;
+    for (;;) {
+      var read = await reader.read();
+      if (read.done) break;
+      if (read.value) { parts.push(read.value); got += read.value.byteLength; if (onBytes) onBytes(read.value.byteLength); }
+    }
+    if (got !== end - start + 1) throw new Error('chunk short');
+    var buf = new Uint8Array(got);
+    var off = 0;
+    parts.forEach(function (p) { buf.set(p, off); off += p.byteLength; });
+    return buf.buffer;
+  }
+
+  // Parallel chunked download. onProgress(done, total, bytesPerSec) is
+  // called as bytes arrive (throttled to ~5/sec). Resolves the assembled
+  // Blob, or throws on ANY failure — the caller must fall back, never
+  // show an error for a fast-path failure. A shared AbortController
+  // stops the other chunks the moment one fails.
+  async function downloadParallel(url, total, mime, onProgress) {
+    var n = chunkCountFor(total);
+    var size = Math.ceil(total / n);
+    var ctrl = new AbortController();
+    var started = Date.now();
+    var done = 0, lastReport = 0;
+    function report() {
+      var now = Date.now();
+      if (now - lastReport < 200 && done < total) return;
+      lastReport = now;
+      if (onProgress) onProgress(done, total, (done * 1000) / Math.max(1, now - started));
+    }
+    var jobs = [];
+    for (var i = 0; i < n; i++) {
+      (function (i) {
+        var start = i * size, end = Math.min(total - 1, (i + 1) * size - 1);
+        jobs.push(fetchChunk(url, start, end, ctrl.signal, function (b) { done += b; report(); }));
+      })(i);
+    }
+    var bufs;
+    try {
+      bufs = await Promise.all(jobs);
+    } catch (e) {
+      try { ctrl.abort(); } catch (e2) {}
+      throw e;
+    }
+    report();
+    return new Blob(bufs, { type: mime });
+  }
+
+  function saveBlob(blob, filename) {
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 10000);
+  }
+
+  // Fast path for a direct format: race the candidate URLs (same quality
+  // from another source, if any — a format's own `urls` array, or a
+  // sibling format with the same label + extension), probe for ranged
+  // reads, then download in parallel with live speed. Resolves 'saved'
+  // on success, 'toobig' when the file is over the parallel cap (the
+  // caller must NOT fetch it whole — open-in-tab / server save instead),
+  // or null when the fast path is unavailable or failed (caller runs the
+  // old flow unchanged). Never throws, never shows an error itself.
+  async function tryFastDownload(format, formats, filename, btn) {
+    try {
+      var urls = [];
+      if (format.url) urls.push(format.url);
+      if (Array.isArray(format.urls)) format.urls.forEach(function (u) { if (u && urls.indexOf(u) === -1) urls.push(u); });
+      (formats || []).forEach(function (g) {
+        if (g !== format && g.url && g.label === format.label && g.ext === format.ext && urls.indexOf(g.url) === -1) urls.push(g.url);
+      });
+      if (!urls.length) return null;
+      var best = await raceFastUrls(urls);
+      if (!best) return null;
+      if (best.total > fastMaxBytes()) return 'toobig';
+      if (best.total < FAST_MIN_PARALLEL_BYTES) return null; // small file: one fetch is faster (measured)
+      var blob = await downloadParallel(best.url, best.total, mimeForExt(format.ext), function (done, total, bps) {
+        if (btn) btn.textContent = progressText(done, total, bps);
+      });
+      if (!blob || !blob.size) return null;
+      saveBlob(blob, filename);
+      return 'saved';
+    } catch (e) {
+      return null;
+    }
+  }
+  // ---- fast download (end) ---------------------------------------------
 
   function setBusy(busy) {
     goBtn.disabled = busy;
@@ -339,7 +588,6 @@
     if (maxOrigins) list = list.slice(0, maxOrigins);
     var lastErr = null;
     var geoFails = 0;
-    var noStreamFails = 0;
     var answered = 0;
     for (var i = 0; i < list.length; i++) {
       var ctrl = new AbortController();
@@ -351,7 +599,6 @@
         if (!r.ok) {
           answered++;
           if (data.geoBlocked) geoFails++;
-          if (data.noStream) noStreamFails++;
           lastErr = new Error(data.error || 'Something went wrong.');
           if (r.status >= 400 && r.status < 500) lastErr._terminal = true;
           if (lastErr._terminal) throw lastErr;
@@ -370,10 +617,6 @@
     // instead of a generic "try again". (A 502 is retried, never
     // terminal, so a single geo failure alone never sets this.)
     if (answered && geoFails === answered && lastErr) lastErr.geoBlocked = true;
-    // No public stream: same rule — every origin that answered agreed
-    // the video has no download link at all. (A 502 is retried, never
-    // terminal, so a single noStream failure alone never sets this.)
-    if (answered && noStreamFails === answered && lastErr) lastErr.noStream = true;
     throw lastErr || new Error('Something went wrong.');
   }
 
@@ -388,7 +631,17 @@
     'Instagram': { meta: 2, info: 8, max: 30 },
     'X (Twitter)': { meta: 1, info: 10, max: 30 },
     'Reddit': { meta: 1, info: 10, max: 30 },
-    'Vimeo': { meta: 1, info: 8, max: 30 },
+    'Vimeo': { meta: 1, info: 12, max: 30 },
+    'Streamable': { meta: 1, info: 8, max: 30 },
+    'Kwai': { meta: 1, info: 8, max: 30 },
+    'SoundCloud': { meta: 1, info: 15, max: 30 },
+    'Mixcloud': { meta: 1, info: 12, max: 30 },
+    'Odysee': { meta: 1, info: 10, max: 30 },
+    'BitChute': { meta: 1, info: 8, max: 30 },
+    'PeerTube': { meta: 1, info: 10, max: 30 },
+    'VK': { meta: 1, info: 13, max: 30 },
+    'OK.ru': { meta: 1, info: 10, max: 30 },
+    'Kick': { meta: 1, info: 8, max: 30 },
     'Dailymotion': { meta: 2, info: 8, max: 30 },
     'Bluesky': { meta: 2, info: 8, max: 30 },
     'Tumblr': { meta: 1, info: 8, max: 30 },
@@ -435,6 +688,7 @@
   }
 
   function renderPreview(data) {
+    resetPreviewPlayer();
     currentTitle = data.title || 'video';
     titleEl.textContent = currentTitle;
     uploaderEl.textContent = data.uploader ? 'By ' + data.uploader : '';
@@ -456,34 +710,17 @@
     var reqId = ++latestReq;
     var renderedForReq = false; // anything at all shown (preview or full result)
     var resultRendered = false; // the FULL result (qualities) shown — a meta
-    // preview must not block the browser tikwm result from rendering its
+    // preview must not block the full result from rendering its
     // qualities: renderPreview only shows title/thumbnail + "Finding
-    // qualities…", so discarding the tikwm answer after a preview left
+    // qualities…", so discarding the full answer after a preview left
     // the user stuck on "Could not load qualities" even though the
-    // browser already had the whole quality list.
+    // full quality list had already arrived.
     var platform = detectPlatform(url) || 'Video';
     var timing = startTimer(platform);
     setBusy(true);
     msg.textContent = '';
     result.hidden = true;
     formatsEl.innerHTML = '';
-    // TikTok: the browser itself asks tikwm (public, cross-origin) at
-    // the SAME time as the server stages below — it used to be awaited
-    // first, which held the whole flow up to 8s when tikwm was slow.
-    // Whichever answers first renders; the server result replaces it
-    // when it lands.
-    var ttRendered = false;
-    if (platform === 'TikTok') {
-      fetchTikwmBrowser(url).then(function (tt) {
-        if (tt && reqId === latestReq && !resultRendered) {
-          renderedForReq = true;
-          resultRendered = true;
-          ttRendered = true;
-          renderResult(tt);
-          timerDone((Date.now() - timerStart) / 1000);
-        }
-      }).catch(function () {});
-    }
     // Stage 1 — fast preview (title + thumbnail) in about a second.
     // At most 2 origins (own + 1 backup): a 404 means "no preview for
     // this link" on every region, so trying more only burns time.
@@ -543,15 +780,8 @@
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url: url }),
-          // TikTok gets 20s per origin, not 10s: its three lanes need
-          // it — tikwm up to 6s, SSSTik up to ~8s, then the yt-dlp
-          // rounds — and a no-stream verdict only exists once all three
-          // have answered. 10s cuts the server off before it can
-          // conclude, so the visitor would only ever see the timeout
-          // message. The 45s global budget above still bounds the
-          // stage, and other platforms keep their 10s.
-        }, platform === 'TikTok' ? 20000 : 10000, 3, { regionDiverse: true }),
-
+        }, 10000, 3, { regionDiverse: true }),
+        infoBudget,
       ]);
       if (reqId !== latestReq) return;
       currentInfoOrigin = res.origin;
@@ -579,14 +809,6 @@
         var geoMsg = 'This video is blocked in every region we can reach (US, Europe and Asia). It is only available in the country where the uploader allowed it.';
         if (!renderedForReq) { clearResult(); msg.textContent = geoMsg; }
         else if (!resultRendered) formatsEl.innerHTML = '<li class="loading">' + geoMsg + '</li>';
-      } else if (err && err.noStream) {
-        // No public stream: the video is not slow — TikTok publishes
-        // no download link for it (e.g. a Series episode), so retrying
-        // the same link will not help. Use the server's own words
-        // (err.message carries them) with a plain fallback.
-        var noStreamMsg = err.message || 'This video has no public download link — TikTok doesn\u2019t publish one for it.';
-        if (!renderedForReq) { clearResult(); msg.textContent = noStreamMsg; }
-        else if (!resultRendered) formatsEl.innerHTML = '<li class="loading">' + noStreamMsg + '</li>';
       } else if (err && err.name === 'AbortError') {
         if (!renderedForReq) { clearResult(); msg.textContent = platform + ' is taking too long right now. Please try again.'; }
         else if (!resultRendered) formatsEl.innerHTML = '<li class="loading">Taking too long — please try again.</li>';
@@ -617,18 +839,27 @@
     var hasVideo = !!(data.previewUrl && videoEl);
     if (videoEl) {
       if (hasVideo) {
+        resetPreviewPlayer();
         videoEl.referrerPolicy = 'no-referrer';
         videoEl.src = data.previewUrl;
         videoEl.poster = data.thumbnail || '';
         videoEl.style.display = '';
         thumbImg.style.display = 'none';
         videoEl.load();
+        setupPreviewPlayer();
         videoEl.onerror = function () {
+          // The stream cannot play: hide the whole player box (the
+          // Plyr frame would otherwise sit there empty) and fall back
+          // to the still image, exactly like the old player did.
+          pausePreviewPlayer();
           videoEl.style.display = 'none';
+          if (playerWrap) playerWrap.classList.add('no-video');
           if (data.thumbnail) { thumbImg.src = data.thumbnail; thumbImg.style.display = ''; }
         };
       } else {
+        resetPreviewPlayer();
         videoEl.style.display = 'none';
+        if (playerWrap) playerWrap.classList.add('no-video');
         if (data.thumbnail) { thumbImg.src = data.thumbnail; thumbImg.style.display = ''; }
         else thumbImg.style.display = 'none';
       }
@@ -660,35 +891,47 @@
             '&t=' + encodeURIComponent(currentTitle);
           reset();
         };
+        // Open the file in a new tab with NO Referer (same reason as
+        // downloadDirect). Used for files too big to hold in memory,
+        // and when the file host refuses cross-origin reads.
+        var openTab = function () {
+          var a = document.createElement('a');
+          a.href = f.url;
+          a.target = '_blank';
+          a.rel = 'noopener';
+          a.referrerPolicy = 'no-referrer';
+          a.download = safeFileName(currentTitle, f.ext);
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          btn.textContent = 'Saving…';
+          reset();
+        };
         // Direct download when this quality carries its own link: the
-        // browser fetches the file straight from the video CDN. Falls
-        // back to the server save when the direct fetch fails — except
-        // on client-side-only platforms, where there IS no server save:
-        // the browser then opens the file itself in a new tab, and the
-        // file still comes straight from the video CDN to this device,
-        // never through our server. (Some CDNs refuse cross-origin
-        // reads, so the open-in-tab step is how those files arrive.)
-        if (f.url) {
-          downloadDirect(f.url, safeFileName(currentTitle, f.ext)).then(function (ok) {
+        // browser fetches the file itself. Falls back to the server
+        // save when the direct fetch fails — except on client-side-only
+        // platforms, where there IS no server save: the browser then
+        // opens the file itself in a new tab.
+        var legacy = function () {
+          downloadDirect(f.url, safeFileName(currentTitle, f.ext), function (done, total, bps) {
+            btn.textContent = progressText(done, total, bps);
+          }).then(function (ok) {
             if (ok) { btn.textContent = 'Saved ✓'; reset(); }
-            else if (currentClientSide) {
-              // Open the file in a new tab with NO Referer (same reason
-              // as downloadDirect: video.twimg.com 403s a request that
-              // carries this site's Referer). The file still comes
-              // straight from the video CDN to this device.
-              var a = document.createElement('a');
-              a.href = f.url;
-              a.target = '_blank';
-              a.rel = 'noopener';
-              a.referrerPolicy = 'no-referrer';
-              a.download = safeFileName(currentTitle, f.ext);
-              document.body.appendChild(a);
-              a.click();
-              a.remove();
-              btn.textContent = 'Opened ↗';
-              reset();
-            }
+            else if (currentClientSide) openTab();
             else serverSave();
+          });
+        };
+        if (f.url) {
+          // Fast path first: parallel chunked download with live speed
+          // (only when the CDN allows it). Any fast-path failure falls
+          // through to the old flow below — nothing about it can break
+          // a download that used to work. A file over the parallel cap
+          // never goes through a whole-file fetch: it opens in a tab
+          // (client-side-only) or takes the server stream instead.
+          tryFastDownload(f, data.formats, safeFileName(currentTitle, f.ext), btn).then(function (res) {
+            if (res === 'saved') { btn.textContent = 'Saved ✓'; reset(); }
+            else if (res === 'toobig') { if (currentClientSide) openTab(); else serverSave(); }
+            else legacy();
           });
           return;
         }

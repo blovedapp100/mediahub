@@ -3,7 +3,6 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <title>Save Video | YouTube, TikTok, Facebook &amp; Instagram Video Downloader</title>
 <meta name="description" content="Save Video is a free YouTube video downloader, TikTok video downloader, Facebook video downloader and Instagram video downloader. Paste any video link, preview it, and save it in 1080p, 720p or as audio — no account needed. Also works with Douyin, X, Bluesky, Tumblr, Twitch clips, Pinterest, Moj, ShareChat, LinkedIn, Snapchat and Tencent Video.">
 <meta property="og:type" content="website">
@@ -19,21 +18,18 @@
 {"@type":"Question","name":"Does it work on my phone?","acceptedAnswer":{"@type":"Answer","text":"Yes. Save Video works in any modern browser on Android, iPhone, tablet and PC."}}
 ]}
 </script>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/fonts.css">
+<link rel="stylesheet" href="/vendor/plyr/plyr.css">
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
 <header class="top">
   <div class="brand"><a href="/">Save Video</a></div>
-  <button type="button" id="extInstallBtn" class="ext-install" style="display:none">Install Extension</button>
   <button type="button" id="themeToggle" class="theme-toggle" aria-label="Switch colour theme">☾ Dark</button>
 </header>
 
 <main class="wrap">
   <section class="hero">
-    <h1>All Social Media <span class="grad">In One Place</span></h1>
     <form id="form" class="url-form">
       <label class="visually-hidden" for="url">Paste a video link</label>
       <input id="url" type="url" data-example="https://www.youtube.com/watch?v=2ptQ0Z1deuA" placeholder="Paste a video link here…" autocomplete="off" spellcheck="false" required>
@@ -44,18 +40,6 @@
     <div id="progress" class="progress" aria-hidden="true"><div class="bar"><i></i></div><p>Finding the clip and its qualities…</p></div>
     <div id="timer" class="timer" aria-live="polite"></div>
     <div id="msg" class="msg" role="status" aria-live="polite"></div>
-    <div id="extSteps" class="card ext-steps" hidden>
-      <h3>Install the Save Video extension</h3>
-      <p><strong>What it does:</strong> the Save Video extension saves any video playing in your browser with one click — no need to copy and paste links. Open a video on TikTok, Facebook, Instagram and more, click the Save Video button, and it saves the best-quality video straight to your device.</p>
-      <p><strong>Note:</strong> this works on desktop Chrome (PC or Mac) — Chrome on phones cannot install extensions.</p>
-      <ol>
-        <li>The extension file just downloaded — unzip it to a folder.</li>
-        <li>In Chrome, open <code>chrome://extensions</code> and switch on <strong>Developer mode</strong> (top right).</li>
-        <li>Click <strong>Load unpacked</strong> and choose the unzipped folder.</li>
-      </ol>
-      <p>Once it is installed, the Install button disappears on its own — the site can tell the extension is there. It never sends your logins anywhere.</p>
-      <button type="button" id="extStepsClose" class="secondary">Close</button>
-    </div>
     <nav class="chips" aria-label="Platforms">
       <a class="chip" href="/tiktok">TikTok</a>
       <a class="chip" href="/douyin">Douyin</a>
@@ -66,6 +50,17 @@
       <a class="chip" href="/bluesky">Bluesky</a>
       <a class="chip" href="/tumblr">Tumblr</a>
       <a class="chip" href="/twitch">Twitch</a>
+      <a class="chip" href="/vimeo">Vimeo</a>
+      <a class="chip" href="/streamable">Streamable</a>
+      <a class="chip" href="/kwai">Kwai</a>
+      <a class="chip" href="/soundcloud">SoundCloud</a>
+      <a class="chip" href="/mixcloud">Mixcloud</a>
+      <a class="chip" href="/odysee">Odysee</a>
+      <a class="chip" href="/bitchute">BitChute</a>
+      <a class="chip" href="/peertube">PeerTube</a>
+      <a class="chip" href="/vk">VK</a>
+      <a class="chip" href="/ok">OK.ru</a>
+      <a class="chip" href="/kick">Kick</a>
       <a class="chip" href="/pinterest">Pinterest</a>
       <a class="chip" href="/moj">Moj</a>
       <a class="chip" href="/sharechat">ShareChat</a>
@@ -129,12 +124,13 @@
 </main>
 
 <footer class="foot">
-  <nav class="legal" aria-label="Legal">
-    <a href="/privacy.html">Privacy Policy</a> · <a href="/terms.html">Terms of Service</a> · <a href="/about.html">About Us</a> · <a href="/contact.html">Contact Us</a> · <a href="/disclaimer.html">Disclaimer</a> · <a href="/cookie-policy.html">Cookie Policy</a>
+  <nav aria-label="Platforms">
+    <a href="/youtube">YouTube</a> · <a href="/tiktok">TikTok</a> · <a href="/douyin">Douyin</a> · <a href="/facebook">Facebook</a> · <a href="/instagram">Instagram</a> · <a href="/twitter">X (Twitter)</a> · <a href="/bluesky">Bluesky</a> · <a href="/tumblr">Tumblr</a> · <a href="/twitch">Twitch</a> · <a href="/vimeo">Vimeo</a> · <a href="/streamable">Streamable</a> · <a href="/kwai">Kwai</a> · <a href="/soundcloud">SoundCloud</a> · <a href="/mixcloud">Mixcloud</a> · <a href="/odysee">Odysee</a> · <a href="/bitchute">BitChute</a> · <a href="/peertube">PeerTube</a> · <a href="/vk">VK</a> · <a href="/ok">OK.ru</a> · <a href="/kick">Kick</a> · <a href="/pinterest">Pinterest</a> · <a href="/moj">Moj</a> · <a href="/sharechat">ShareChat</a> · <a href="/linkedin">LinkedIn</a> · <a href="/snapchat">Snapchat</a> · <a href="/tencent">Tencent Video</a>
   </nav>
   <p>Save Video — watch &amp; keep your favourite clips.</p>
   <p class="fine">Only save clips you have the right to keep. Save Video does not store your links or your files.</p>
 </footer>
+<script src="/vendor/plyr/plyr.min.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>
