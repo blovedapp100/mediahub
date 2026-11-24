@@ -2022,7 +2022,7 @@ const landingTemplate = fs.readFileSync(path.join(__dirname, 'public', 'landing.
 
 function renderLanding(platform, req) {
   const p = PLATFORMS[platform];
-  const base = req.protocol + '://' + req.get('host');
+  const host = req.get('host') || ''; const base = (host.endsWith('.onrender.com') ? 'https://' : req.protocol + '://') + host;
   const url = base + '/' + platform;
   const faqHtml = p.faq.map(([q, a]) =>
     '<details><summary>' + q + '</summary><p>' + a + '</p></details>').join('\n');
@@ -2084,12 +2084,12 @@ app.post('/api/cookies', rateLimit(10, 60000), (req, res) => {
 });
 
 app.get('/robots.txt', (req, res) => {
-  const base = req.protocol + '://' + req.get('host');
+  const host = req.get('host') || ''; const base = (host.endsWith('.onrender.com') ? 'https://' : req.protocol + '://') + host;
   res.type('text/plain').send('User-agent: *\nAllow: /\nSitemap: ' + base + '/sitemap.xml\n');
 });
 
 app.get('/sitemap.xml', (req, res) => {
-  const base = req.protocol + '://' + req.get('host');
+  const host = req.get('host') || ''; const base = (host.endsWith('.onrender.com') ? 'https://' : req.protocol + '://') + host;
   const legal = ['privacy.html', 'terms.html', 'about.html', 'contact.html', 'disclaimer.html', 'cookie-policy.html'];
   const urls = ['', ...Object.keys(PLATFORMS), ...legal].map((p) =>
     '  <url><loc>' + base + '/' + p + '</loc><changefreq>weekly</changefreq><priority>' + (p === '' ? '1.0' : (legal.indexOf(p) >= 0 ? '0.5' : '0.8')) + '</priority></url>');
