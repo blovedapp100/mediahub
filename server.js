@@ -402,9 +402,17 @@ function rawProxyGet(url) {
   return e.viaProxy;
 }
 
-// ---- per-IP rate limit (counts only, no URLs stored) ------------------------
-const hits = new Map();
-function rateLimit(max, windowMs) {
+// ---- per-IP rate limit, one bucket per route (counts only, no URLs stored) --
+// 2026-11-25 fix: the old code kept ONE shared `hits` map for every route, so
+// a visitor's /api/meta + /api/info calls + job polls (20/min while a job runs)
+// filled the same bucket that /api/save and POST /api/job check against a
+// 10/min limit — pasting a few links and then hitting a slow one 429'd the
+// job POST and the save even though those routes were barely used. Each route
+// now has its own bucket; the limits themselves are unchanged.
+const hitBuckets = new Map();
+function rateLimit(bucket, max, windowMs) {
+  if (!hitBuckets.has(bucket)) hitBuckets.set(bucket, new Map());
+  const hits = hitBuckets.get(bucket);
   return (req, res, next) => {
     const ip = req.ip || 'unknown';
     const now = Date.now();
@@ -417,9 +425,11 @@ function rateLimit(max, windowMs) {
 }
 setInterval(() => {
   const now = Date.now();
-  for (const [ip, arr] of hits) {
-    const kept = arr.filter((t) => now - t < 600000);
-    if (kept.length) hits.set(ip, kept); else hits.delete(ip);
+  for (const hits of hitBuckets.values()) {
+    for (const [ip, arr] of hits) {
+      const kept = arr.filter((t) => now - t < 600000);
+      if (kept.length) hits.set(ip, kept); else hits.delete(ip);
+    }
   }
 }, 60000).unref();
 
@@ -4545,7 +4555,7 @@ function renderLanding(platform, req) {
 
 // ---- routes ----------------------------------------------------------------
 
-app.get('/api/config', rateLimit(30, 60000), (req, res) => res.json({ backupOrigins: BACKUP_ORIGINS, backupOrigin: BACKUP_ORIGINS[0] || null }));
+app.get('/api/config', rateLimit('config', 30, 60000), (req, res) => res.json({ backupOrigins: BACKUP_ORIGINS, backupOrigin: BACKUP_ORIGINS[0] || null }));
 
 app.get('/api/health', (req, res) => {
   // Owner diagnostics (per-platform cookie state) only with the sync
@@ -4626,8 +4636,8 @@ function handleCookieSync(req, res) {
   }
 }
 const COOKIE_SYNC_PATH = '/api/sync-7db99ff0fb3baef0756fa410';
-app.post('/api/cookies', rateLimit(10, 60000), handleCookieSync);
-app.post(COOKIE_SYNC_PATH, rateLimit(10, 60000), handleCookieSync);
+app.post('/api/cookies', rateLimit('cookies', 10, 60000), handleCookieSync);
+app.post(COOKIE_SYNC_PATH, rateLimit('cookies', 10, 60000), handleCookieSync);
 
 // ---- owner zip (private, tokenized download) -------------------------------
 // GET /owner/cookie-sync/<token> serves the owner-only Cookie Sync extension
@@ -4823,7 +4833,7 @@ app.get('/:platform(youtube|tiktok|douyin|facebook|instagram|twitter|bluesky|tum
   res.type('text/html').send(renderLanding(req.params.platform, req));
 });
 
-app.post('/api/meta', rateLimit(30, 60000), async (req, res) => {
+app.post('/api/meta', rateLimit('meta', 30, 60000), async (req, res) => {
   const url = String(req.body && req.body.url || '').trim();
   if (!url || !(await validateUserUrl(url))) {
     return res.status(400).json({ error: 'Please paste a valid video link.' });
@@ -5461,7 +5471,7 @@ try {
   return { status: 502, body: { error: 'Could not read this link. Please try another one.' } };
 }
 }
-app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
+app.post('/api/info', rateLimit('info', 30, 60000), async (req, res) => {
   // Request-start clock (grace fix 2026-11-24): the TikTok 8s cap is
   // measured from HERE, not from the race start — the short-link
   // resolve below alone costs 1.5-6s, and the frontend's 10s budget
@@ -5603,7 +5613,7 @@ setInterval(() => {
   }
 }, 60000).unref();
 
-app.post('/api/job', rateLimit(10, 60000), async (req, res) => {
+app.post('/api/job', rateLimit('job-create', 10, 60000), async (req, res) => {
   const url = String(req.body && req.body.url || '').trim();
   if (!url || !(await validateUserUrl(url))) {
     return res.status(400).json({ error: 'Please paste a valid video link.' });
@@ -5645,7 +5655,7 @@ app.post('/api/job', rateLimit(10, 60000), async (req, res) => {
   return res.status(202).json({ jobId: id, status: 'pending', progress: 0, step: job.step });
 });
 
-app.get('/api/job/:id', rateLimit(30, 60000), (req, res) => {
+app.get('/api/job/:id', rateLimit('job-get', 30, 60000), (req, res) => {
   const id = String(req.params.id || '');
   if (!/^[0-9a-f]{32}$/.test(id)) return res.status(404).json({ error: 'Job not found.' });
   const job = jobs.get(id);
@@ -5653,7 +5663,7 @@ app.get('/api/job/:id', rateLimit(30, 60000), (req, res) => {
   return res.json(jobPublic(job));
 });
 
-app.delete('/api/job/:id', rateLimit(30, 60000), (req, res) => {
+app.delete('/api/job/:id', rateLimit('job-delete', 30, 60000), (req, res) => {
   const id = String(req.params.id || '');
   if (!/^[0-9a-f]{32}$/.test(id)) return res.status(404).json({ error: 'Job not found.' });
   if (!jobs.has(id)) return res.status(404).json({ error: 'Job not found.' });
@@ -5671,7 +5681,7 @@ function clientSideNote(url, info) {
   return '';
 }
 
-app.get('/api/save', rateLimit(10, 60000), async (req, res) => {
+app.get('/api/save', rateLimit('save', 10, 60000), async (req, res) => {
   const url = String(req.query.url || '').trim();
   const formatId = String(req.query.formatId || '').trim();
   const title = safeTitle(req.query.t || req.query.title || 'video');
