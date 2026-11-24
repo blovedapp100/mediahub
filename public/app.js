@@ -289,6 +289,33 @@
     }
     return originsPromise;
   }
+  // Region of an origin, from its subdomain: -eu is Frankfurt (EU),
+  // -sg is Singapore (Asia), everything else is the US (Oregon/Ohio/
+  // Virginia, including the main link and the -mo6m backup). Used only
+  // to spread retries across regions — a geo-block is decided by the
+  // region, so trying three US origins in a row would never help.
+  function regionOf(origin) {
+    var o = String(origin || '');
+    if (/-eu\d*\./.test(o)) return 'EU';
+    if (/-sg\d*\./.test(o)) return 'ASIA';
+    return 'US';
+  }
+  // Reorder origins so the first three cover one region each (US, EU,
+  // Asia), keeping the original order inside each region. A plain
+  // retry list can be three US origins in a row — useless for a
+  // geo-block, and it burns the 3-origin cap before Asia is tried.
+  function orderOriginsByRegion(list) {
+    var first = {};
+    var rest = [];
+    list.forEach(function (o) {
+      var r = regionOf(o);
+      if (!first[r]) first[r] = o;
+      else rest.push(o);
+    });
+    var out = [];
+    ['US', 'EU', 'ASIA'].forEach(function (r) { if (first[r]) out.push(first[r]); });
+    return out.concat(rest);
+  }
   // Try each origin in order until one answers with ok JSON.
   // Returns { data, origin }. Throws the last error when all fail.
   // 4xx answers are terminal: they are decided by the LINK (not the
@@ -299,10 +326,13 @@
   // 2 and /api/info at 3, so a row of sleeping backup regions cannot
   // stretch the wait to minutes — each origin already burns its full
   // per-origin timeout while a free Render service wakes (~50s).
-  async function tryOrigins(path, options, timeoutMs, maxOrigins) {
+  async function tryOrigins(path, options, timeoutMs, maxOrigins, opts) {
     var list = await getOrigins();
+    if (opts && opts.regionDiverse) list = orderOriginsByRegion(list);
     if (maxOrigins) list = list.slice(0, maxOrigins);
     var lastErr = null;
+    var geoFails = 0;
+    var answered = 0;
     for (var i = 0; i < list.length; i++) {
       var ctrl = new AbortController();
       var timer = setTimeout(function () { ctrl.abort(); }, timeoutMs);
@@ -311,6 +341,8 @@
         var data = await r.json().catch(function () { return null; });
         if (!data) { lastErr = new Error('Something went wrong.'); continue; }
         if (!r.ok) {
+          answered++;
+          if (data.geoBlocked) geoFails++;
           lastErr = new Error(data.error || 'Something went wrong.');
           if (r.status >= 400 && r.status < 500) lastErr._terminal = true;
           if (lastErr._terminal) throw lastErr;
@@ -324,6 +356,11 @@
         clearTimeout(timer);
       }
     }
+    // Geo-block: every origin that answered said the video is blocked
+    // in its region — carry the flag so the caller can say so plainly
+    // instead of a generic "try again". (A 502 is retried, never
+    // terminal, so a single geo failure alone never sets this.)
+    if (answered && geoFails === answered && lastErr) lastErr.geoBlocked = true;
     throw lastErr || new Error('Something went wrong.');
   }
 
@@ -479,7 +516,7 @@
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url: url }),
-        }, 10000, 3),
+        }, 10000, 3, { regionDiverse: true }),
         infoBudget,
       ]);
       if (reqId !== latestReq) return;
@@ -494,7 +531,14 @@
       // Nothing rendered for this request: clear the old card so no
       // stale video sits under the error. When the preview did render,
       // keep it and show the failure inside the quality list instead.
-      if (err && err.name === 'AbortError') {
+      // Geo-block on every region tried: the video is public, but the
+      // uploader restricted it to countries none of our regions is in.
+      // Say so plainly — retrying the same link will not help.
+      if (err && err.geoBlocked) {
+        var geoMsg = 'This video is blocked in every region we can reach (US, Europe and Asia). It is only available in the country where the uploader allowed it.';
+        if (!renderedForReq) { clearResult(); msg.textContent = geoMsg; }
+        else if (!ttRendered) formatsEl.innerHTML = '<li class="loading">' + geoMsg + '</li>';
+      } else if (err && err.name === 'AbortError') {
         if (!renderedForReq) { clearResult(); msg.textContent = platform + ' is taking too long right now. Please try again.'; }
         else if (!ttRendered) formatsEl.innerHTML = '<li class="loading">Taking too long — please try again.</li>';
       } else if (!renderedForReq) {
