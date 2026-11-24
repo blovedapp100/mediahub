@@ -83,6 +83,9 @@
 
   var PLATFORMS = [
     ['tiktok.com', 'TikTok'],
+    ['douyin.com', 'Douyin'],
+    ['v.douyin.com', 'Douyin'],
+    ['iesdouyin.com', 'Douyin'],
     ['facebook.com', 'Facebook'],
     ['fb.watch', 'Facebook'],
     ['instagram.com', 'Instagram'],
@@ -101,12 +104,12 @@
     ['clips.twitch.tv', 'Twitch'],
     ['pinterest.com', 'Pinterest'],
     ['pin.it', 'Pinterest'],
-    ['vk.com', 'VK'],
     ['linkedin.com', 'LinkedIn'],
     ['mojapp.in', 'Moj'],
     ['sharechat.com', 'ShareChat'],
     ['snapchat.com', 'Snapchat'],
     ['t.snapchat.com', 'Snapchat'],
+    ['v.qq.com', 'Tencent Video'],
   ];
 
   var currentUrl = '';
@@ -134,10 +137,29 @@
     } else if (/^https?:\/\//i.test(v)) {
       detect.className = 'detect show bad';
       detect.textContent = 'That link is not from a supported site yet.';
+      clearResult();
     } else {
       detect.className = 'detect';
       detect.textContent = '';
     }
+  }
+
+  // Clear the previous result card entirely (title, formats, preview
+  // video) so a stale video never sits under a new error message.
+  function clearResult() {
+    result.hidden = true;
+    titleEl.textContent = '';
+    uploaderEl.textContent = '';
+    durationEl.textContent = '';
+    formatsEl.innerHTML = '';
+    if (noteEl) noteEl.hidden = true;
+    if (videoEl) {
+      try { videoEl.pause(); } catch (e) {}
+      videoEl.removeAttribute('src');
+      videoEl.style.display = 'none';
+    }
+    if (thumbImg) thumbImg.style.display = 'none';
+    if (playerWrap) playerWrap.style.display = 'none';
   }
 
   function highlightChip(name) {
@@ -175,7 +197,10 @@
   // allow cross-origin reads, so YouTube qualities keep the server path.
   async function downloadDirect(url, filename) {
     try {
-      var r = await fetch(url);
+      // No Referer: some CDNs (video.twimg.com) 403 when the request
+      // carries another site's Referer, even though the file itself is
+      // public. Sending no Referer makes the same URL answer 206.
+      var r = await fetch(url, { referrerPolicy: 'no-referrer' });
       if (!r.ok) return false;
       var blob = await r.blob();
       if (!blob || !blob.size) return false;
@@ -259,8 +284,13 @@
   }
   // Try each origin in order until one answers with ok JSON.
   // Returns { data, origin }. Throws the last error when all fail.
-  async function tryOrigins(path, options, timeoutMs) {
+  // maxOrigins caps how many origins are tried: /api/info is capped at
+  // 4 (own + 3 backups) so a row of sleeping backup regions cannot
+  // stretch the wait to minutes — each origin already burns its full
+  // per-origin timeout while a free Render service wakes (~50s).
+  async function tryOrigins(path, options, timeoutMs, maxOrigins) {
     var list = await getOrigins();
+    if (maxOrigins) list = list.slice(0, maxOrigins);
     var lastErr = null;
     for (var i = 0; i < list.length; i++) {
       var ctrl = new AbortController();
@@ -285,6 +315,7 @@
   var PLATFORM_TIME = {
     'YouTube': { meta: 2, info: 8, max: 30 },
     'TikTok': { meta: 2, info: 6, max: 30 },
+    'Douyin': { meta: 4, info: 10, max: 30 },
     'Facebook': { meta: 3, info: 12, max: 35 },
     'Instagram': { meta: 3, info: 8, max: 30 },
     'X (Twitter)': { meta: 4, info: 10, max: 30 },
@@ -295,11 +326,11 @@
     'Tumblr': { meta: 3, info: 8, max: 30 },
     'Twitch': { meta: 4, info: 12, max: 35 },
     'Pinterest': { meta: 4, info: 10, max: 30 },
-    'VK': { meta: 4, info: 10, max: 30 },
     'LinkedIn': { meta: 4, info: 10, max: 30 },
     'Moj': { meta: 3, info: 8, max: 30 },
     'ShareChat': { meta: 3, info: 8, max: 30 },
     'Snapchat': { meta: 3, info: 8, max: 30 },
+    'Tencent Video': { meta: 4, info: 10, max: 30 },
   };
   var timerEl = document.getElementById('timer');
   var timerInt = null;
@@ -355,6 +386,7 @@
   async function fetchInfo(url) {
     currentUrl = url;
     var reqId = ++latestReq;
+    var renderedForReq = false;
     var platform = detectPlatform(url) || 'Video';
     var timing = startTimer(platform);
     setBusy(true);
@@ -366,6 +398,7 @@
     if (platform === 'TikTok') {
       var tt = await fetchTikwmBrowser(url);
       if (tt && reqId === latestReq) {
+        renderedForReq = true;
         renderResult(tt);
         timerDone((Date.now() - timerStart) / 1000);
         return;
@@ -381,29 +414,51 @@
       .then(function (res) {
         var data = res && res.data;
         if (reqId !== latestReq || !data || !data.title) return;
+        renderedForReq = true;
         renderPreview(data);
         timerShown((Date.now() - timerStart) / 1000);
       })
       .catch(function () {});
     // Stage 2 — full quality list (takes a few seconds longer).
     // Tries the backup region too when this region cannot read the link.
+    // Bounded: at most 4 origins at 12s each, and a 45s global budget
+    // for the whole stage — after that the error below is shown instead
+    // of "Finding qualities…" hanging forever. (/api/meta above is
+    // unchanged at 8s per origin: it is only the fast preview.)
+    // Note: timing.max is no longer used for /api/info; the table keeps
+    // its measured per-platform figures for the on-screen estimate.
     try {
-      var res = await tryOrigins('/api/info', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url }),
-      }, timing.max * 1000);
+      var infoBudget = new Promise(function (resolve, reject) {
+        setTimeout(function () {
+          var err = new Error(platform + ' is taking too long right now. Please try again.');
+          err.name = 'AbortError';
+          reject(err);
+        }, 45000);
+      });
+      var res = await Promise.race([
+        tryOrigins('/api/info', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: url }),
+        }, 12000, 4),
+        infoBudget,
+      ]);
       if (reqId !== latestReq) return;
       currentInfoOrigin = res.origin;
+      renderedForReq = true;
       renderResult(res.data);
       timerDone((Date.now() - timerStart) / 1000);
     } catch (err) {
       if (reqId !== latestReq) return;
       stopTimer();
+      // Nothing rendered for this request: clear the old card so no
+      // stale video sits under the error. When the preview did render,
+      // keep it and show the failure inside the quality list instead.
       if (err && err.name === 'AbortError') {
-        if (result.hidden) msg.textContent = platform + ' is taking too long right now. Please try again.';
+        if (!renderedForReq) { clearResult(); msg.textContent = platform + ' is taking too long right now. Please try again.'; }
         else formatsEl.innerHTML = '<li class="loading">Taking too long — please try again.</li>';
-      } else if (result.hidden) {
+      } else if (!renderedForReq) {
+        clearResult();
         msg.textContent = err.message || 'Something went wrong. Please try another link.';
       } else {
         formatsEl.innerHTML = '<li class="loading">Could not load qualities — please try again.</li>';
@@ -429,6 +484,7 @@
     var hasVideo = !!(data.previewUrl && videoEl);
     if (videoEl) {
       if (hasVideo) {
+        videoEl.referrerPolicy = 'no-referrer';
         videoEl.src = data.previewUrl;
         videoEl.poster = data.thumbnail || '';
         videoEl.style.display = '';
@@ -483,7 +539,19 @@
           downloadDirect(f.url, safeFileName(currentTitle, f.ext)).then(function (ok) {
             if (ok) { btn.textContent = 'Saved ✓'; reset(); }
             else if (currentClientSide) {
-              window.open(f.url, '_blank', 'noopener');
+              // Open the file in a new tab with NO Referer (same reason
+              // as downloadDirect: video.twimg.com 403s a request that
+              // carries this site's Referer). The file still comes
+              // straight from the video CDN to this device.
+              var a = document.createElement('a');
+              a.href = f.url;
+              a.target = '_blank';
+              a.rel = 'noopener';
+              a.referrerPolicy = 'no-referrer';
+              a.download = safeFileName(currentTitle, f.ext);
+              document.body.appendChild(a);
+              a.click();
+              a.remove();
               btn.textContent = 'Opened ↗';
               reset();
             }
@@ -508,6 +576,7 @@
   urlInput.addEventListener('input', showDetect);
   urlInput.addEventListener('paste', function () {
     setTimeout(function () {
+      clearResult();
       showDetect();
       var v = urlInput.value.trim();
       if (detectPlatform(v)) fetchInfo(v); // instant: valid paste starts fetching right away
@@ -520,6 +589,7 @@
         var text = await navigator.clipboard.readText();
         if (text) {
           urlInput.value = text.trim();
+          clearResult();
           showDetect();
           if (detectPlatform(urlInput.value.trim())) fetchInfo(urlInput.value.trim());
           return;
