@@ -54,14 +54,15 @@ a:hover { text-decoration: underline; }
 /* Header — sticky frosted glass, deep premium gradient */
 .top {
   background: linear-gradient(120deg, rgba(9, 45, 44, .92), rgba(15, 118, 110, .92) 48%, rgba(20, 184, 166, .92));
+  background-size: 200% 100%;
   -webkit-backdrop-filter: blur(14px) saturate(1.3); backdrop-filter: blur(14px) saturate(1.3);
   color: #fff;
-  padding: 16px 20px;
-  display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+  padding: 8px 20px;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
   position: sticky; top: 0; z-index: 50;
   border-bottom: 1px solid rgba(255, 255, 255, .18);
   box-shadow: 0 6px 24px rgba(9, 45, 44, .22);
-  animation: dropIn .5s cubic-bezier(.22, .61, .36, 1) both;
+  animation: dropIn .5s cubic-bezier(.22, .61, .36, 1) both, headerSheen 14s ease-in-out infinite alternate;
 }
 .brand { font-size: 26px; font-weight: 900; letter-spacing: -.01em; }
 .brand a { color: #fff; }
@@ -86,6 +87,11 @@ a:hover { text-decoration: underline; }
 }
 .ext-install:hover { background: #e6f4f2; transform: translateY(-1px); }
 @media (max-width: 700px) { .ext-install { display: none !important; } }
+
+/* Slim header on phones: a slim bar, not a tall band. */
+@media (max-width: 700px) {
+  .top { padding: 7px 12px; gap: 8px; }
+}
 
 /* Extension install steps (shown inline after clicking Install) */
 .ext-steps { text-align: left; margin: 16px auto 0; max-width: 620px; }
@@ -116,7 +122,7 @@ form.url-form {
   background: var(--surface); border: 1px solid var(--border); border-radius: 999px;
   padding: 6px; box-shadow: var(--shadow);
   transition: border-color .2s ease, box-shadow .2s ease, transform .25s ease;
-  animation: fadeUp .6s .16s cubic-bezier(.22, .61, .36, 1) both;
+  animation: springUp .65s cubic-bezier(.22, .61, .36, 1) .16s backwards;
 }
 form.url-form:focus-within { border-color: var(--accent-2); box-shadow: 0 0 0 4px var(--accent-soft), var(--shadow-lg); transform: translateY(-1px); }
 input[type="url"] {
@@ -161,19 +167,24 @@ button.secondary:hover:not(:disabled) { box-shadow: none; background: var(--bord
 .progress .bar i {
   display: block; height: 100%; width: 40%; border-radius: 999px;
   background: linear-gradient(90deg, var(--accent), var(--accent-2), var(--accent-3));
+  background-size: 200% 100%;
   box-shadow: 0 0 12px rgba(20, 184, 166, .55);
-  animation: slide 1.1s ease-in-out infinite;
+  animation: slide 1.1s ease-in-out infinite, barFlow 2s linear infinite;
 }
 .progress p { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
 .timer { color: var(--muted); font-size: 13px; margin-top: 8px; min-height: 18px; font-variant-numeric: tabular-nums; }
 .timer b { color: var(--text); }
 @keyframes slide { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
-@keyframes pop { from { transform: scale(.94); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+@keyframes pop { 0% { transform: scale(.88); opacity: 0; } 60% { transform: scale(1.05); opacity: 1; } 100% { transform: scale(1); opacity: 1; } }
 @keyframes fadeUp { from { transform: translateY(12px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
 @keyframes dropIn { from { transform: translateY(-100%); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
 @keyframes gradientShift { 0%, 100% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } }
 @keyframes shimmer { 0% { background-position: -400px 0; } 100% { background-position: 400px 0; } }
 @keyframes glowPulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(20, 184, 166, .35); } 50% { box-shadow: 0 0 0 6px rgba(20, 184, 166, 0); } }
+@keyframes springUp { 0% { transform: translateY(14px) scale(.985); opacity: 0; } 60% { transform: translateY(-2px) scale(1.004); opacity: 1; } 100% { transform: translateY(0) scale(1); opacity: 1; } }
+@keyframes scaleIn { from { transform: scale(.965); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+@keyframes headerSheen { from { background-position: 0% 50%; } to { background-position: 100% 50%; } }
+@keyframes barFlow { from { background-position: 0% 0; } to { background-position: -200% 0; } }
 
 /* Platform chips — staggered entrance */
 .chips { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin: 20px 0 4px; }
@@ -181,7 +192,7 @@ button.secondary:hover:not(:disabled) { box-shadow: none; background: var(--bord
   border: 1px solid var(--border); background: var(--surface); color: var(--text);
   border-radius: 999px; padding: 7px 16px; font-size: 14px; font-weight: 600;
   transition: transform .18s ease, border-color .2s ease, background .2s ease, box-shadow .2s ease;
-  animation: fadeUp .5s cubic-bezier(.22, .61, .36, 1) both;
+  animation: springUp .55s cubic-bezier(.22, .61, .36, 1) backwards;
 }
 .chip:nth-child(1) { animation-delay: .22s; } .chip:nth-child(2) { animation-delay: .27s; }
 .chip:nth-child(3) { animation-delay: .32s; } .chip:nth-child(4) { animation-delay: .37s; }
@@ -193,8 +204,12 @@ button.secondary:hover:not(:disabled) { box-shadow: none; background: var(--bord
 .card {
   background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
   padding: 22px; margin: 18px 0; box-shadow: var(--shadow);
-  animation: fadeUp .45s cubic-bezier(.22, .61, .36, 1) both;
+  transition: transform .25s ease, box-shadow .25s ease;
+  animation: scaleIn .4s cubic-bezier(.22, .61, .36, 1) backwards;
 }
+.card:hover { transform: translateY(-2px); box-shadow: var(--shadow-lg); }
+/* scrollIntoView targets: keep them clear of the sticky header (~64px). */
+#result, #extSteps { scroll-margin-top: 84px; }
 .card h2 { font-size: 19px; margin: 0 0 12px; letter-spacing: -.01em; }
 .card h3 { font-size: 16px; margin: 20px 0 12px; }
 
@@ -220,7 +235,7 @@ button.secondary:hover:not(:disabled) { box-shadow: none; background: var(--bord
   border: 1.5px solid var(--border); border-radius: 14px; padding: 16px 14px;
   display: flex; flex-direction: column; gap: 4px; background: var(--surface);
   transition: transform .2s cubic-bezier(.22, .61, .36, 1), border-color .2s ease, box-shadow .25s ease;
-  animation: fadeUp .45s cubic-bezier(.22, .61, .36, 1) both;
+  animation: springUp .5s cubic-bezier(.22, .61, .36, 1) backwards;
 }
 .quality-grid li:nth-child(1) { animation-delay: .02s; } .quality-grid li:nth-child(2) { animation-delay: .07s; }
 .quality-grid li:nth-child(3) { animation-delay: .12s; } .quality-grid li:nth-child(4) { animation-delay: .17s; }
@@ -237,7 +252,7 @@ button.secondary:hover:not(:disabled) { box-shadow: none; background: var(--bord
 .quality-grid li.best {
   border-color: var(--accent-2); background: var(--accent-soft);
   box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow);
-  animation: fadeUp .45s cubic-bezier(.22, .61, .36, 1) both, glowPulse 2.4s ease-in-out 1s infinite;
+  animation: springUp .5s cubic-bezier(.22, .61, .36, 1) backwards, glowPulse 2.4s ease-in-out 1s infinite;
 }
 .quality-grid .q { font-size: 22px; font-weight: 800; letter-spacing: -.01em; }
 .quality-grid .tag {
