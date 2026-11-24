@@ -574,6 +574,25 @@ function cookieStatus() {
 
 // ---- yt-dlp ----------------------------------------------------------------
 
+// Geo-block detection: yt-dlp raises GeoRestrictedError for a video
+// the uploader restricted by country, and YoutubeDL renders it to
+// stderr as "The uploader has not made this video available in your
+// country" + "This video is available in <countries>." + a VPN/proxy
+// hint. ytdlpJson only keeps the LAST 2 stderr lines, so the countries
+// line and the VPN hint are what survive — match those, plus the
+// first-line phrasings other extractors use. A geo-blocked video is
+// PUBLIC, just not in this region: it is not private, login-only or
+// deleted, so another region may still read it.
+function isGeoBlocked(text) {
+  const t = String(text || '');
+  return /not available in your country/i.test(t)
+    || /uploader has not made this video available/i.test(t)
+    || /this video is available in [A-Z]/i.test(t)
+    || /you might want to use a vpn or a proxy/i.test(t)
+    || /geo[- ]?restricted/i.test(t)
+    || /blocked in your country/i.test(t);
+}
+
 function ytdlpJson(url, timeoutMs = 60000, extraArgs = [], allowProxy = true) {
   return (async () => {
     const pargs = await proxyArgs(url, allowProxy);
@@ -637,7 +656,11 @@ function withTimeout(promise, ms, msg) {
 async function ytdlpInfoWithFallbacks(url) {
   const wrapErr = (e) => {
     const err = new Error('Could not read this link. The video may be private, removed, or the site is blocking us.');
-    err.detail = (e && e.errors && e.errors.map((x) => x && x.detail).filter(Boolean).join(' | ')) || '';
+    err.detail = (e && e.errors && e.errors.map((x) => x && x.detail).filter(Boolean).join(' | ')) || (e && e.detail) || '';
+    if (isGeoBlocked(err.detail)) {
+      err.message = 'This video is blocked in this region.';
+      err.geoBlocked = true;
+    }
     return err;
   };
   const tag = (p, args) => p.then((info) => ({ info, clientArgs: args }));
@@ -667,9 +690,21 @@ async function ytdlpInfoWithFallbacks(url) {
         return best;
       }
       lastDetail = settled.filter((r) => r.status === 'rejected').map((r) => r.reason && r.reason.detail).filter(Boolean).join(' | ');
+      // Geo-block: no other client, mirror or proxy round in THIS region
+      // can read the video — the restriction is the region itself. Stop
+      // here (fast, inside the frontend's 10s per-origin budget) so the
+      // frontend can retry another region instead of burning the WARP
+      // round and timing out on a generic error.
+      if (isGeoBlocked(lastDetail)) {
+        const gerr = new Error('This video is blocked in this region.');
+        gerr.detail = lastDetail;
+        gerr.geoBlocked = true;
+        throw gerr;
+      }
     }
     const err = new Error('Could not read this link. The video may be private, removed, or the site is blocking us.');
     err.detail = lastDetail;
+    if (isGeoBlocked(lastDetail)) err.geoBlocked = true;
     throw err;
   }
   const attempts = isTikTok(url)
@@ -700,6 +735,11 @@ async function ytdlpInfoWithFallbacks(url) {
       return res;
     } catch (e) {
       lastErr = e;
+      // Geo-block: the WARP round cannot help — the restriction is the
+      // region, not the IP. Fail fast so the frontend can try another
+      // region inside its per-origin budget.
+      const d = (e && e.errors && e.errors.map((x) => x && x.detail).filter(Boolean).join(' | ')) || (e && e.detail) || '';
+      if (isGeoBlocked(d)) throw wrapErr(e);
     }
   }
   throw wrapErr(lastErr);
@@ -2073,6 +2113,12 @@ app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
         rawProxySet(url, res.viaProxy);
       } catch (e) {
         info = null;
+        // Geo-block: keep the signal — the outer catch turns it into a
+        // geoBlocked 502 the frontend can retry on another region.
+        if (e.geoBlocked || isGeoBlocked(e.detail)) {
+          e.geoBlocked = true;
+          throw e;
+        }
         console.error('info failed:', platformOf(url), scrub(e.detail || e.message));
       }
       if (!info) throw new Error('Could not read this link. The video may be private, removed, or the site is blocking us.');
@@ -2118,6 +2164,10 @@ app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
     cacheSet(url, result);
     return { status: 200, body: result };
   } catch (e) {
+    if (e.geoBlocked) {
+      console.error('info geo-blocked:', platformOf(url), scrub(e.detail || ''));
+      return { status: 502, body: { error: 'This video is blocked in this region.', geoBlocked: true } };
+    }
     console.error('info failed:', scrub(e.message));
     return { status: 502, body: { error: e.message || 'Could not read this link. Please try another one.' } };
   }
