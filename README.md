@@ -1,9 +1,12 @@
 # Save Video — paste a link, preview the clip, pick a quality, save it.
 
 Save Video is a small, fast web app: paste a video link from TikTok,
-Facebook, Instagram, YouTube, X, Reddit, Vimeo or Dailymotion, see a
+Facebook, Instagram, YouTube, X, Bluesky, Tumblr, Twitch clips,
+Pinterest, VK, Moj, ShareChat, LinkedIn or Snapchat, see a
 preview with every available quality, and save the clip in the quality
-you choose.
+you choose. The video file itself is always downloaded by the visitor's
+own browser, straight from the video CDN — the server only reads a
+link's info (title, formats, direct links) and never touches the file.
 
 ## How it works
 

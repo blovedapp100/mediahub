@@ -4,6 +4,7 @@
 const express = require('express');
 const { execFile, spawn } = require('child_process');
 const crypto = require('crypto');
+const dns = require('dns').promises;
 const fs = require('fs');
 const net = require('net');
 const os = require('os');
@@ -62,6 +63,19 @@ const ALLOWED_HOSTS = [
   'reddit.com', 'www.reddit.com', 'old.reddit.com',
   'vimeo.com', 'www.vimeo.com', 'player.vimeo.com',
   'dailymotion.com', 'www.dailymotion.com', 'dai.ly', 'www.dai.ly',
+  // New client-side platforms (added 2026-11-24): the server only ever
+  // reads these links' INFO — the video file itself is downloaded by the
+  // visitor's own browser, from the video CDN, on their own IP.
+  'bsky.app', 'www.bsky.app',
+  'tumblr.com', 'www.tumblr.com', 'tmblr.co', 'www.tmblr.co', 'at.tumblr.com',
+  'twitch.tv', 'www.twitch.tv', 'clips.twitch.tv', 'www.clips.twitch.tv',
+  'm.twitch.tv',
+  'pinterest.com', 'www.pinterest.com', 'pin.it', 'www.pin.it',
+  'vk.com', 'www.vk.com',
+  'linkedin.com', 'www.linkedin.com',
+  'mojapp.in', 'www.mojapp.in',
+  'sharechat.com', 'www.sharechat.com',
+  'snapchat.com', 'www.snapchat.com', 't.snapchat.com', 'story.snapchat.com',
 ];
 
 function hostAllowed(u) {
@@ -69,6 +83,70 @@ function hostAllowed(u) {
     const h = new URL(u).hostname.toLowerCase();
     return ALLOWED_HOSTS.includes(h) || ALLOWED_HOSTS.some((d) => h.endsWith('.' + d));
   } catch { return false; }
+}
+
+// Only the ranges that make SSRF dangerous are blocked: loopback
+// (127/8, ::1), RFC1918 private networks (10/8, 172.16/12, 192.168/16,
+// fc00::/7), link-local (169.254/16 — including the cloud metadata
+// address 169.254.169.254 — and fe80::/10), and 0/8. Deliberately NOT
+// blocked: CGNAT (100.64/10) and benchmarking space (198.18/15) —
+// proxied environments (and this sandbox's own resolver) answer public
+// hostnames with those addresses, so blocking them would reject every
+// legitimate link. The allowlist above is the primary gate; this check
+// only stops a listed hostname ever pointing at an internal address.
+function isPrivateIP(ip) {
+  if (!ip) return true;
+  const v = String(ip).toLowerCase();
+  // IPv4-mapped IPv6 (::ffff:10.0.0.1) — judge the embedded IPv4 part.
+  const mapped = v.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  const ip4 = mapped ? mapped[1] : v;
+  if (net.isIP(ip4) === 4) {
+    const [a, b] = ip4.split('.').map(Number);
+    if (a === 10) return true; // 10/8
+    if (a === 127) return true; // 127/8 loopback
+    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16/12
+    if (a === 192 && b === 168) return true; // 192.168/16
+    if (a === 169 && b === 254) return true; // 169.254/16 link-local + cloud metadata
+    if (a === 0) return true; // 0/8
+    if (a >= 224) return true; // 224/4 multicast + 240/4 reserved
+    return false;
+  }
+  if (net.isIP(v) === 6) {
+    if (v === '::1' || v === '::') return true;
+    if (v.startsWith('fe8') || v.startsWith('fe9') || v.startsWith('fea') || v.startsWith('feb')) return true; // fe80::/10
+    if (v.startsWith('fc') || v.startsWith('fd')) return true; // fc00::/7 unique-local
+    if (v.startsWith('2001:db8')) return true; // documentation
+    return false;
+  }
+  return true; // unparseable: treat as unsafe
+}
+const dnsVerdict = new Map(); // hostname -> { at, ok }
+async function hostResolvesPublic(hostname) {
+  const h = String(hostname || '').toLowerCase();
+  const cached = dnsVerdict.get(h);
+  if (cached && Date.now() - cached.at < 5 * 60 * 1000) return cached.ok;
+  let ok = true; // resolver error: allow — yt-dlp fails on unresolvable names anyway
+  try {
+    const addrs = await dns.lookup(h, { all: true, verbatim: true });
+    if (!addrs.length) ok = false;
+    else ok = addrs.every((a) => !isPrivateIP(a.address));
+  } catch { ok = true; }
+  if (dnsVerdict.size >= 200) {
+    const first = dnsVerdict.keys().next().value;
+    if (first) dnsVerdict.delete(first);
+  }
+  dnsVerdict.set(h, { at: Date.now(), ok });
+  return ok;
+}
+// Full check for a user-pasted link: http(s) only, no embedded
+// credentials, hostname on the allowlist, and (DNS) publicly resolvable.
+async function validateUserUrl(u) {
+  if (!u || !/^https?:\/\//i.test(u)) return false;
+  let parsed;
+  try { parsed = new URL(u); } catch { return false; }
+  if (parsed.username || parsed.password) return false;
+  if (!hostAllowed(u)) return false;
+  return hostResolvesPublic(parsed.hostname);
 }
 
 function isTikTok(u) {
@@ -87,6 +165,37 @@ function platformOf(u) {
   if (isTikTok(u)) return 'tiktok';
   try { return new URL(u).hostname.replace(/^www\./, ''); } catch { return 'unknown'; }
 }
+
+// ---- client-side-only platforms (added 2026-11-24) -------------------------
+// HARD RULE: downloading NEVER happens on any server. The video bytes come
+// from the VISITOR'S OWN BROWSER, on their own IP and internet — the server
+// only reads a link's INFO (title, formats, direct CDN links) and never
+// touches the file itself. These platforms therefore get NO server-side
+// save: /api/save refuses them, and /api/info only offers direct single
+// files (see buildDirectFormats) that the browser fetches itself.
+// Platforms whose videos have NO direct single file (HLS/DASH playlists
+// only, or unplayable segments) are NOT listed at all — see the report.
+const CLIENT_SIDE_ONLY = new Set([
+  'x', 'twitter', 'bluesky', 'tumblr', 'twitch', 'pinterest', 'vk',
+  'linkedin', 'moj', 'sharechat', 'snapchat',
+]);
+function clientSideKey(url) {
+  try {
+    const h = new URL(url).hostname.toLowerCase();
+    if (h === 'x.com' || h.endsWith('.x.com') || h === 'twitter.com' || h.endsWith('.twitter.com')) return 'x';
+    if (h === 'bsky.app' || h.endsWith('.bsky.app')) return 'bluesky';
+    if (h === 'tumblr.com' || h.endsWith('.tumblr.com') || h === 'tmblr.co' || h.endsWith('.tmblr.co')) return 'tumblr';
+    if (h === 'twitch.tv' || h.endsWith('.twitch.tv')) return 'twitch';
+    if (h === 'pinterest.com' || h.endsWith('.pinterest.com') || h === 'pin.it' || h.endsWith('.pin.it')) return 'pinterest';
+    if (h === 'vk.com' || h.endsWith('.vk.com')) return 'vk';
+    if (h === 'linkedin.com' || h.endsWith('.linkedin.com')) return 'linkedin';
+    if (h === 'mojapp.in' || h.endsWith('.mojapp.in')) return 'moj';
+    if (h === 'sharechat.com' || h.endsWith('.sharechat.com')) return 'sharechat';
+    if (h === 'snapchat.com' || h.endsWith('.snapchat.com')) return 'snapchat';
+  } catch {}
+  return null;
+}
+function isClientSideOnly(url) { return CLIENT_SIDE_ONLY.has(clientSideKey(url)); }
 
 // Extra yt-dlp args per host. YouTube bot-checks datacenter IPs on its web
 // player, so try the Android client first, then iOS, then the default web
@@ -804,17 +913,188 @@ function codecRank(vcodec) {
   return 3;
 }
 
-// Best playable stream for the in-page preview player: prefer a
-// progressive (video+audio) format, highest first; else any video stream.
+// Is this format URL a direct single file the browser can fetch itself?
+// HLS/DASH playlists (.m3u8/.mpd) are NOT files — a browser cannot save
+// one as a video — so they are excluded. IP-literal and localhost media
+// hosts are rejected too (string check; the pasted-host DNS check above
+// is the main SSRF layer).
+function isDirectFileUrl(u) {
+  try {
+    const p = new URL(u);
+    if (p.protocol !== 'http:' && p.protocol !== 'https:') return false;
+    if (p.username || p.password) return false;
+    const path = p.pathname.toLowerCase();
+    if (path.endsWith('.m3u8') || path.endsWith('.mpd')) return false;
+    const h = p.hostname.toLowerCase();
+    if (h === 'localhost' || h.endsWith('.localhost')) return false;
+    if (net.isIP(h)) return false;
+    return true;
+  } catch { return false; }
+}
+function isManifestFormat(f) {
+  const proto = String((f && f.protocol) || '').toLowerCase();
+  if (proto.includes('m3u8') || proto.includes('dash')) return true;
+  const u = String((f && f.url) || '').split('?')[0].toLowerCase();
+  return u.endsWith('.m3u8') || u.endsWith('.mpd');
+}
+// Height from the file URL itself (LinkedIn reports no height, but its
+// URLs carry mp4-720p-30fp-crf28). Used only when the format has none.
+function heightFromUrl(u) {
+  const m = String(u || '').match(/[-_](\d{3,4})p[-_.]/);
+  return m ? parseInt(m[1], 10) : 0;
+}
+
+// Best playable stream for the in-page preview player. Direct single
+// files come FIRST: an HLS playlist URL cannot play in a normal <video>
+// tag, while a direct mp4 can — so X / LinkedIn / VK previews play their
+// direct file instead of failing on a playlist. The old order (any
+// progressive, then any video) is kept as the fallback for platforms
+// whose only streams are playlists (YouTube etc.).
 function previewUrl(info) {
   const list = Array.isArray(info.formats) ? info.formats : [];
+  // Effective height: some extractors report none but the file URL
+  // carries it (LinkedIn mp4-720p-30fp) — without this the sort is a
+  // coin toss and the preview can pick the smaller file.
+  const effH = (f) => (f.height || heightFromUrl(f.url) || 0);
+  // Twitch clips ship a portrait crop and the landscape original at
+  // the same height — the original (landscape) is the preview.
+  const isPortrait = (f) => String(f.format_id || '').toLowerCase().startsWith('portrait') ? 1 : 0;
+  const byH = (a, b) => isPortrait(a) - isPortrait(b) || effH(b) - effH(a);
+  const directProg = list
+    .filter((f) => f && f.url && isDirectFileUrl(f.url) && !isManifestFormat(f) && f.vcodec && f.vcodec !== 'none' && f.acodec && f.acodec !== 'none')
+    .sort(byH)[0];
+  if (directProg) return directProg.url;
+  const directVid = list
+    .filter((f) => f && f.url && isDirectFileUrl(f.url) && !isManifestFormat(f) && f.vcodec && f.vcodec !== 'none')
+    .sort(byH)[0];
+  if (directVid) return directVid.url;
+  // Direct files with no codec info at all (Twitch clips, Tumblr,
+  // LinkedIn, Bluesky blob): the source's own ready file — it plays.
+  const directUnknown = list
+    .filter((f) => f && f.url && isDirectFileUrl(f.url) && !isManifestFormat(f) &&
+      (!f.vcodec || f.vcodec === 'none') && (!f.acodec || f.acodec === 'none') &&
+      (String(f.ext || '').toLowerCase() === 'mp4' || String(f.ext || '').toLowerCase() === 'webm'))
+    .sort(byH)[0];
+  if (directUnknown) return directUnknown.url;
   const prog = list
     .filter((f) => f && f.url && f.vcodec && f.vcodec !== 'none' && f.acodec && f.acodec !== 'none')
-    .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+    .sort(byH)[0];
   if (prog) return prog.url;
   const any = list.filter((f) => f && f.url && f.vcodec && f.vcodec !== 'none')
-    .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+    .sort(byH)[0];
   return any ? any.url : '';
+}
+
+// Direct-file formats ONLY, for client-side-only platforms: every offered
+// quality is a single file the visitor's browser downloads straight from
+// the video CDN (fetch+blob when the CDN allows cross-origin reads, else
+// the browser opens the file itself). Merged video+audio pairs are never
+// built here — a merged download would need the server to join them, which
+// the no-server-download rule forbids. So a platform offers:
+//   - progressive (video+audio) files when they exist,
+//   - video-only files and audio-only files as separate downloads when
+//     they are the only direct files (e.g. X: video-only mp4s, no audio
+//     file exists at all — the note says so plainly).
+// Returns [] when the video has no direct file at all (HLS-only etc.) —
+// the caller then answers 404 instead of listing a platform that cannot
+// actually save anything.
+function buildDirectFormats(info) {
+  const list = Array.isArray(info.formats) ? info.formats : [];
+  const prog = new Map(); // height -> best progressive direct file
+  const vidOnly = new Map(); // height -> best video-only direct file
+  const audioOnly = new Map(); // ext -> best audio-only direct file
+  for (const f of list) {
+    if (!f || f.ext === 'mhtml' || !f.url) continue;
+    if (isManifestFormat(f) || !isDirectFileUrl(f.url)) continue;
+    const ext = String(f.ext || 'mp4').toLowerCase();
+    if (!['mp4', 'm4a', 'webm', 'mp3'].includes(ext)) continue;
+    const h = f.height || heightFromUrl(f.url) || 0;
+    const v = f.vcodec && f.vcodec !== 'none';
+    const a = f.acodec && f.acodec !== 'none';
+    const size = f.filesize || f.filesize_approx || 0;
+    if (v && a) {
+      const portrait = String(f.format_id || '').toLowerCase().startsWith('portrait');
+      const rank = codecRank(f.vcodec);
+      // Prefer the landscape (original) variant over a portrait crop at
+      // the same height (Twitch clips ship both), then better codec,
+      // then larger file.
+      const key = (portrait ? 0 : 1) * 1e15 + (3 - rank) * 1e12 + size;
+      const cur = prog.get(h);
+      if (!cur || key > cur._key) {
+        prog.set(h, { ...f, height: h, filesize: size, _key: key });
+      }
+    } else if (v && !a) {
+      const portrait = String(f.format_id || '').toLowerCase().startsWith('portrait');
+      const rank = codecRank(f.vcodec);
+      const key = (portrait ? 0 : 1) * 1e15 + (3 - rank) * 1e12 + size;
+      const cur = vidOnly.get(h);
+      if (!cur || key > cur._key) vidOnly.set(h, { ...f, height: h, filesize: size, _key: key });
+    } else if (!v && a) {
+      // One audio row only: the best sound file — m4a first (it plays
+      // everywhere), then mp3, then webm; within one container the
+      // highest bitrate, then the largest file. Never a row per container.
+      const extRank = ext === 'm4a' ? 0 : ext === 'mp3' ? 1 : 2;
+      const cur = audioOnly.get('best');
+      const better = !cur ||
+        extRank < cur._extRank ||
+        (extRank === cur._extRank && ((f.abr || 0) > (cur.abr || 0) ||
+          ((f.abr || 0) === (cur.abr || 0) && size > (cur.filesize || 0))));
+      if (better) audioOnly.set('best', { ...f, filesize: size, _extRank: extRank });
+    } else if (!v && !a && (ext === 'mp4' || ext === 'webm')) {
+      // No codec info at all (Twitch clips, LinkedIn, Bluesky blob):
+      // the source's own ready file — treat it as progressive, like the
+      // unknown-codec branch of buildFormats. Only when no real
+      // progressive file exists at this height (its _key is -1, so any
+      // real format replaces it).
+      const cur = prog.get(h);
+      if (!cur || (cur._key !== undefined && cur._key < 0)) {
+        prog.set(h, { ...f, height: h, filesize: size, _key: -1 });
+      }
+    }
+  }
+  const out = [];
+  const heights = [...prog.keys()].sort((a, b) => b - a);
+  for (const h of heights) {
+    const f = prog.get(h);
+    out.push({
+      id: String(f.format_id),
+      label: h ? h + 'p' : 'Best quality',
+      ext: f.ext || 'mp4',
+      hasAudio: true,
+      url: f.url || '',
+      filesize: f.filesize || 0,
+      note: 'With sound',
+      kind: 'progressive',
+    });
+  }
+  const vHeights = [...vidOnly.keys()].sort((a, b) => b - a);
+  for (const h of vHeights) {
+    if (prog.has(h)) continue; // a with-sound file at this height beats a silent one
+    const f = vidOnly.get(h);
+    out.push({
+      id: String(f.format_id),
+      label: (h ? h + 'p' : 'Best quality') + ' · Video only',
+      ext: f.ext || 'mp4',
+      hasAudio: false,
+      url: f.url || '',
+      filesize: f.filesize || 0,
+      note: 'No sound — picture only',
+      kind: 'video-only',
+    });
+  }
+  for (const f of [...audioOnly.values()].sort((a, b) => (b.abr || 0) - (a.abr || 0))) {
+    out.push({
+      id: String(f.format_id),
+      label: 'Audio only',
+      ext: f.ext || 'm4a',
+      hasAudio: true,
+      url: f.url || '',
+      filesize: f.filesize || 0,
+      note: 'Sound only',
+      kind: 'audio-only',
+    });
+  }
+  return out;
 }
 
 function buildFormats(info, opts) {
@@ -941,6 +1221,102 @@ function buildFormats(info, opts) {
   return out;
 }
 
+// ---- Direct-file pages: Pinterest / Moj / ShareChat / Snapchat ----------
+// These four have no usable yt-dlp path to a direct file (Pinterest and
+// Snapchat: HLS playlists only through yt-dlp; Moj/ShareChat: no extractor
+// at all), but their own pages embed the direct mp4 — so the server
+// fetches the PAGE HTML only (never the video file) and returns the file's
+// URL for the visitor's browser to download. Pages are capped (~3 MB) and
+// the fetch times out in 8s; a page that embeds no usable file returns
+// null and the caller answers 404.
+async function fetchPageHtml(url, timeoutMs = 8000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, {
+      signal: ctrl.signal, redirect: 'follow',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+    });
+    if (!r.ok) return null;
+    const len = Number(r.headers.get('content-length') || 0);
+    if (len > 3 * 1024 * 1024) return null;
+    const text = await r.text();
+    return text.length > 3 * 1024 * 1024 ? null : text;
+  } catch { return null; } finally { clearTimeout(timer); }
+}
+function decodeHtmlEntities(s) {
+  return String(s || '').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+}
+function pageMp4s(html) {
+  const found = new Set();
+  const re = /https?:\/\/[^"'\s<>\\]+\.mp4[^"'\s<>\\]*/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) found.add(decodeHtmlEntities(m[0]));
+  return [...found];
+}
+function directFormat(url, label) {
+  return {
+    id: 'direct', label: label || 'Best quality', ext: 'mp4', hasAudio: true,
+    url, filesize: 0, note: 'With sound', kind: 'progressive',
+  };
+}
+async function scrapeDirectInfo(url) {
+  const key = clientSideKey(url);
+  const html = await fetchPageHtml(url);
+  if (!html) return null;
+  const title = decodeEntities(ogTag(html, 'og:title'));
+  const thumb = ogTag(html, 'og:image');
+  if (key === 'pinterest') {
+    // The pin page embeds exactly one direct mp4 (v1.pinimg.com) — the
+    // same video yt-dlp only offers as an HLS playlist.
+    const mp4s = pageMp4s(html).filter((u) => u.includes('v1.pinimg.com/videos/'));
+    if (!mp4s.length) return null;
+    mp4s.sort((a, b) => {
+      const wa = parseInt((a.match(/_(\d+)w\.mp4/) || [0, 0])[1], 10) || 0;
+      const wb = parseInt((b.match(/_(\d+)w\.mp4/) || [0, 0])[1], 10) || 0;
+      return wb - wa;
+    });
+    return { source: 'pinterest', title: title || 'Pinterest video', thumbnail: thumb, duration: 0, uploader: '', previewUrl: mp4s[0], formats: [directFormat(mp4s[0])] };
+  }
+  if (key === 'moj') {
+    // og:video IS the requested video's direct mp4.
+    const video = decodeHtmlEntities(ogTag(html, 'og:video'));
+    if (!video || !video.includes('.mp4')) return null;
+    return { source: 'moj', title: title || 'Moj video', thumbnail: thumb, duration: 0, uploader: '', previewUrl: video, formats: [directFormat(video)] };
+  }
+  if (key === 'sharechat') {
+    // og:video is just the page URL — useless. But og:image carries the
+    // video's internal id (sc_<digits>); the page embeds several mp4s
+    // for it — pick the h264 'compressed' one (plays everywhere), then
+    // 'attributed', then anything but an h265 variant.
+    const img = ogTag(html, 'og:image');
+    const cid = (img.match(/(sc_\d+)/) || [])[1] || '';
+    if (!cid) return null;
+    const mine = pageMp4s(html).filter((u) => u.includes(cid));
+    if (!mine.length) return null;
+    const pick = (re) => mine.find((u) => re.test(u));
+    const video = pick(/\/compressed\//) || pick(/\/attributed\//) ||
+      mine.find((u) => !/h265/i.test(u)) || mine[0];
+    return { source: 'sharechat', title: title || 'ShareChat video', thumbnail: thumb, duration: 0, uploader: '', previewUrl: video, formats: [directFormat(video)] };
+  }
+  if (key === 'snapchat') {
+    // og:video is the direct file on Snapchat's CDN (yt-dlp's extractor
+    // cannot read the page's Next.js data, so the scrape is the route).
+    // og:title is engagement text ("47.5K likes…"), so the title comes
+    // from <title> and the uploader from the @handle in og:title.
+    const video = decodeHtmlEntities(ogTag(html, 'og:video'));
+    if (!video || !video.includes('sc-cdn.net')) return null;
+    const titleTag = (html.match(/<title>([^<]+)<\/title>/i) || [])[1] || '';
+    const cleanTitle = decodeEntities(titleTag).split(' | ')[0].trim() || 'Snapchat video';
+    const handle = (title.match(/@([A-Za-z0-9_.]+)/) || [])[1] || '';
+    return { source: 'snapchat', title: cleanTitle, thumbnail: thumb, duration: 0, uploader: handle, previewUrl: video, formats: [directFormat(video)] };
+  }
+  return null;
+}
+
 // ---- SEO: per-platform landing pages --------------------------------------
 // Visible brand stays neutral ("Save Video"). Keywords live in the <title>,
 // meta description, URL slug, intro text and FAQ — never in the logo or
@@ -1017,13 +1393,157 @@ const PLATFORMS = {
     description: 'Twitter video downloader: paste an X (Twitter) video link, preview it and save it in HD with sound. Free, no account, works on phone and PC.',
     h1: 'X videos in every quality',
     intro: 'A free Twitter video downloader for X videos: paste the post link, preview the clip, and save it in HD with sound. No account needed.',
-    example: 'https://x.com/',
+    example: 'https://x.com/Eminem/status/943590594491772928',
     faq: [
       ['Is the Twitter video downloader free?', 'Yes — free, with no account and nothing to install.'],
-      ['What qualities are available?', 'X videos are usually offered in HD and lower qualities with sound, plus an audio-only option.'],
+      ['What qualities are available?', 'X videos are offered as direct files, usually 720p, 360p and 180p, with sound.'],
       ['Do I need an X account?', 'No. Only the public post link is needed.'],
       ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
       ['Can I save private X videos?', 'No. Only public posts can be read.'],
+    ],
+  },
+  bluesky: {
+    name: 'Bluesky',
+    keyword: 'Bluesky video downloader',
+    title: 'Bluesky Video Downloader — Save Bluesky Videos in HD | Save Video',
+    description: 'Bluesky video downloader: paste a Bluesky post link, preview the video and save the original file with sound. Free, no account, works on phone and PC.',
+    h1: 'Bluesky videos in every quality',
+    intro: 'A free Bluesky video downloader: paste the post link, preview the clip, and save the original video file with sound. No account, no app to install.',
+    example: 'https://bsky.app/profile/livvywivvyy.bsky.social/post/3myw2cqwb2k22',
+    faq: [
+      ['Is the Bluesky video downloader free?', 'Yes — free, with no account and nothing to install.'],
+      ['What qualities are available?', 'Bluesky serves the original video file as posted, with sound. You get the file exactly as the author uploaded it.'],
+      ['Do I need a Bluesky account?', 'No. Only the public post link is needed.'],
+      ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+      ['Can I save private Bluesky posts?', 'No. Only public posts can be read.'],
+    ],
+  },
+  tumblr: {
+    name: 'Tumblr',
+    keyword: 'Tumblr video downloader',
+    title: 'Tumblr Video Downloader — Save Tumblr Videos as MP4 | Save Video',
+    description: 'Tumblr video downloader: paste a Tumblr video post link, preview it and save the original MP4 with sound. Free, no account, works on phone and PC.',
+    h1: 'Tumblr videos in every quality',
+    intro: 'A free Tumblr video downloader: paste the post link, preview the clip, and save the original MP4 with sound. Works with native video posts uploaded to Tumblr.',
+    example: 'https://high-quality-tiktoks.tumblr.com/post/698923599747235841/she-accidentally-turned-off-her-game-and-politely',
+    faq: [
+      ['Is the Tumblr video downloader free?', 'Yes — free, with no account and nothing to install.'],
+      ['Which Tumblr posts work?', 'Only posts with a video uploaded to Tumblr itself. GIF posts are images, not videos, and YouTube or Vimeo players embedded in a post belong to those sites, not Tumblr.'],
+      ['What qualities are available?', 'Tumblr serves the original MP4 as uploaded, with sound — usually 720p or 1080p.'],
+      ['Do I need a Tumblr account?', 'No. Only the public post link is needed.'],
+      ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+    ],
+  },
+  twitch: {
+    name: 'Twitch',
+    keyword: 'Twitch clip downloader',
+    title: 'Twitch Clip Downloader — Save Twitch Clips as MP4 | Save Video',
+    description: 'Twitch clip downloader: paste a Twitch clip link, preview it and save the clip as MP4 with sound. Free, no account, works on phone and PC.',
+    h1: 'Twitch clips in every quality',
+    intro: 'A free Twitch clip downloader: paste the clip link, preview it, and save the clip as MP4 with sound. Works with public clips from clips.twitch.tv or twitch.tv.',
+    example: 'https://clips.twitch.tv/CharmingRudeStorkPhilosoraptor-LfhoaF0fD2wwl-hr',
+    faq: [
+      ['Is the Twitch clip downloader free?', 'Yes — free, with no account and nothing to install.'],
+      ['Can I save full Twitch broadcasts (VODs)?', 'No. Full broadcasts stream only and have no single file to save — only short clips can be saved as MP4. Very long videos cannot be downloaded as one file.'],
+      ['What qualities are available?', 'Clips are offered up to 1080p with sound, exactly as Twitch serves them.'],
+      ['Do I need a Twitch account?', 'No. Only the public clip link is needed.'],
+      ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+    ],
+  },
+  pinterest: {
+    name: 'Pinterest',
+    keyword: 'Pinterest video downloader',
+    title: 'Pinterest Video Downloader — Save Pinterest Videos as MP4 | Save Video',
+    description: 'Pinterest video downloader: paste a Pinterest pin link, preview the video and save it as MP4 with sound. Free, no account, works on phone and PC.',
+    h1: 'Pinterest videos in every quality',
+    intro: 'A free Pinterest video downloader: paste the pin link, preview the video, and save it as MP4 with sound. Works with public video pins.',
+    example: 'https://www.pinterest.com/pin/aao-milo-chalein--874683558918923586/',
+    faq: [
+      ['Is the Pinterest video downloader free?', 'Yes — free, with no account and nothing to install.'],
+      ['What qualities are available?', 'Pinterest serves the pin video as an MP4 with sound, in the quality the pin was uploaded.'],
+      ['Do I need a Pinterest account?', 'No. Only the public pin link is needed.'],
+      ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+      ['Can I save private Pinterest pins?', 'No. Only public pins can be read.'],
+    ],
+  },
+  vk: {
+    name: 'VK',
+    keyword: 'VK video downloader',
+    title: 'VK Video Downloader — Save VK Videos in HD | Save Video',
+    description: 'VK video downloader: paste a VK video link, preview it and save the video and audio files. Free, no account, works on phone and PC.',
+    h1: 'VK videos in every quality',
+    intro: 'A free VK video downloader: paste the video link, preview it, and save the video file and the sound file. VK keeps picture and sound as separate files, so you get both to keep together.',
+    example: 'https://vk.com/video-31480508_456239018',
+    faq: [
+      ['Is the VK video downloader free?', 'Yes — free, with no account and nothing to install.'],
+      ['Why are there separate video and audio files?', 'VK stores the picture and the sound as separate files. Save both: the video file for the picture and the audio file for the sound.'],
+      ['What qualities are available?', 'Public VK videos are usually offered up to 720p, plus the sound file.'],
+      ['Do I need a VK account?', 'No. Only the public video link is needed.'],
+      ['Can I save private VK videos?', 'No. Only public videos can be read.'],
+    ],
+  },
+  moj: {
+    name: 'Moj',
+    keyword: 'Moj video downloader',
+    title: 'Moj Video Downloader — Save Moj Videos as MP4 | Save Video',
+    description: 'Moj video downloader: paste a Moj video link, preview it and save it as MP4 with sound. Free, no account, works on phone and PC.',
+    h1: 'Moj videos in every quality',
+    intro: 'A free Moj video downloader: paste the video link, preview it, and save it as MP4 with sound. Works with public Moj videos.',
+    example: 'https://mojapp.in/@kamyabi/video/4002006172',
+    faq: [
+      ['Is the Moj video downloader free?', 'Yes — free, with no account and nothing to install.'],
+      ['What qualities are available?', 'Moj serves the video as an MP4 with sound, in the quality it was uploaded.'],
+      ['Do I need a Moj account?', 'No. Only the public video link is needed.'],
+      ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+      ['Can I save private Moj videos?', 'No. Only public videos can be read.'],
+    ],
+  },
+  sharechat: {
+    name: 'ShareChat',
+    keyword: 'ShareChat video downloader',
+    title: 'ShareChat Video Downloader — Save ShareChat Videos as MP4 | Save Video',
+    description: 'ShareChat video downloader: paste a ShareChat video link, preview it and save it as MP4 with sound. Free, no account, works on phone and PC.',
+    h1: 'ShareChat videos in every quality',
+    intro: 'A free ShareChat video downloader: paste the video link, preview it, and save it as MP4 with sound. Works with public ShareChat videos.',
+    example: 'https://sharechat.com/video/8r89QKxa',
+    faq: [
+      ['Is the ShareChat video downloader free?', 'Yes — free, with no account and nothing to install.'],
+      ['What qualities are available?', 'ShareChat serves the video as an MP4 with sound, in the quality it was uploaded.'],
+      ['Do I need a ShareChat account?', 'No. Only the public video link is needed.'],
+      ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+      ['Can I save private ShareChat videos?', 'No. Only public videos can be read.'],
+    ],
+  },
+  linkedin: {
+    name: 'LinkedIn',
+    keyword: 'LinkedIn video downloader',
+    title: 'LinkedIn Video Downloader — Save LinkedIn Videos as MP4 | Save Video',
+    description: 'LinkedIn video downloader: paste a LinkedIn post link, preview the video and save it as MP4 with sound. Free, no account, works on phone and PC.',
+    h1: 'LinkedIn videos in every quality',
+    intro: 'A free LinkedIn video downloader: paste the post link, preview the video, and save it as MP4 with sound. Works with public LinkedIn posts that carry a video.',
+    example: 'https://www.linkedin.com/posts/andreban_webmcp-agenticweb-ai-activity-7500591659466960897-sKKi',
+    faq: [
+      ['Is the LinkedIn video downloader free?', 'Yes — free, with no account and nothing to install.'],
+      ['What qualities are available?', 'LinkedIn serves its videos as MP4 files, usually 720p and 640p with sound.'],
+      ['Do I need a LinkedIn account?', 'No. Only the public post link is needed.'],
+      ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+      ['Can I save private LinkedIn posts?', 'No. Only public posts can be read.'],
+    ],
+  },
+  snapchat: {
+    name: 'Snapchat',
+    keyword: 'Snapchat video downloader',
+    title: 'Snapchat Video Downloader — Save Snapchat Spotlight Videos | Save Video',
+    description: 'Snapchat video downloader: paste a Snapchat Spotlight link, preview the video and save it as MP4 with sound. Free, no account, works on phone and PC.',
+    h1: 'Snapchat Spotlight videos in every quality',
+    intro: 'A free Snapchat video downloader for Spotlight videos: paste the Spotlight link, preview it, and save it as MP4 with sound. Works with public Spotlight videos.',
+    example: 'https://www.snapchat.com/spotlight/W7_EDlXWTBiXAEEniNoMPwAAYZ2xobHJkZ3FqAZSt3AdfAZSt3AdOAAAAAQ',
+    faq: [
+      ['Is the Snapchat video downloader free?', 'Yes — free, with no account and nothing to install.'],
+      ['Which Snapchat links work?', 'Spotlight video links (snapchat.com/spotlight/…) work. Stories only last 24 hours, so an expired story is gone.'],
+      ['What qualities are available?', 'Spotlight videos are served as MP4 files with sound, in the quality they were uploaded.'],
+      ['Do I need a Snapchat account?', 'No. Only the public Spotlight link is needed.'],
+      ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
     ],
   },
 };
@@ -1119,13 +1639,13 @@ app.get('/sitemap.xml', (req, res) => {
     urls.join('\n') + '\n</urlset>');
 });
 
-app.get('/:platform(youtube|tiktok|facebook|instagram|twitter)', (req, res) => {
+app.get('/:platform(youtube|tiktok|facebook|instagram|twitter|bluesky|tumblr|twitch|pinterest|vk|moj|sharechat|linkedin|snapchat)', (req, res) => {
   res.type('text/html').send(renderLanding(req.params.platform, req));
 });
 
 app.post('/api/meta', rateLimit(30, 60000), async (req, res) => {
   const url = String(req.body && req.body.url || '').trim();
-  if (!url || !/^https?:\/\//i.test(url) || !hostAllowed(url)) {
+  if (!url || !(await validateUserUrl(url))) {
     return res.status(400).json({ error: 'Please paste a valid video link.' });
   }
   const meta = await fastMeta(url);
@@ -1135,8 +1655,8 @@ app.post('/api/meta', rateLimit(30, 60000), async (req, res) => {
 
 app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
   const url = String(req.body && req.body.url || '').trim();
-  if (!url || !/^https?:\/\//i.test(url) || !hostAllowed(url)) {
-    return res.status(400).json({ error: 'Please paste a valid video link from TikTok, Facebook, Instagram, YouTube, X, Reddit, Vimeo or Dailymotion.' });
+  if (!url || !(await validateUserUrl(url))) {
+    return res.status(400).json({ error: 'Please paste a valid video link from TikTok, Facebook, Instagram, YouTube, X, Bluesky, Tumblr, Twitch, Pinterest, VK, Moj, ShareChat, LinkedIn or Snapchat.' });
   }
   const cached = cacheGet(url);
   if (cached) return res.json(cached);
@@ -1147,6 +1667,16 @@ app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
       // fall through to yt-dlp when tikwm has nothing
     }
     if (!result) {
+      // Pinterest / Moj / ShareChat / Snapchat: the direct file is read
+      // off the page itself (see scrapeDirectInfo) — no yt-dlp involved.
+      const scrapeKey = clientSideKey(url);
+      if (scrapeKey === 'pinterest' || scrapeKey === 'moj' || scrapeKey === 'sharechat' || scrapeKey === 'snapchat') {
+        result = await scrapeDirectInfo(url);
+        if (!result) throw new Error('Could not find a video file on this page. The video may be private, removed, or an image post.');
+        result.clientSide = true;
+        cacheSet(url, result);
+        return res.json(result);
+      }
       let info = null;
       try {
         const res = await ytdlpInfoWithFallbacks(url);
@@ -1158,18 +1688,44 @@ app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
         console.error('info failed:', platformOf(url), scrub(e.detail || e.message));
       }
       if (!info) throw new Error('Could not read this link. The video may be private, removed, or the site is blocking us.');
+      // Twitch VOD guard: full broadcasts are hours long and stream-only
+      // (HLS playlists, no single file) — only short clips can be saved.
+      // Refuse them plainly instead of offering a download that cannot
+      // ever complete as one file.
+      if (scrapeKey === 'twitch' && (info.duration || 0) > 7200) {
+        return res.status(404).json({ error: 'This is a full Twitch broadcast (' + Math.round(info.duration / 3600) + 'h long). Broadcasts stream only and cannot be saved as one file — only short Twitch clips can be saved.' });
+      }
       rawCacheSet(url, info);
-      const formats = buildFormats(info, { noSeparateAudio: isTikTok(url) });
-      if (!formats.length) return res.status(404).json({ error: 'No playable versions were found for this link.' });
-      result = {
-        source: 'generic',
-        title: info.title || 'Video',
-        thumbnail: info.thumbnail || '',
-        duration: info.duration || 0,
-        uploader: info.uploader || info.channel || '',
-        previewUrl: previewUrl(info),
-        formats,
-      };
+      if (isClientSideOnly(url)) {
+        // Direct files only — the visitor's browser downloads them itself.
+        // No merged pairs, no server save: a video with no direct file
+        // is reported as such instead of being listed.
+        const formats = buildDirectFormats(info);
+        if (!formats.length) return res.status(404).json({ error: 'This video has no direct file to save. It only streams, so the browser cannot download it as one file.' });
+        result = {
+          source: 'generic',
+          title: info.title || 'Video',
+          thumbnail: info.thumbnail || '',
+          duration: info.duration || 0,
+          uploader: info.uploader || info.channel || '',
+          previewUrl: previewUrl(info),
+          formats,
+          clientSide: true,
+          note: clientSideNote(url, info),
+        };
+      } else {
+        const formats = buildFormats(info, { noSeparateAudio: isTikTok(url) });
+        if (!formats.length) return res.status(404).json({ error: 'No playable versions were found for this link.' });
+        result = {
+          source: 'generic',
+          title: info.title || 'Video',
+          thumbnail: info.thumbnail || '',
+          duration: info.duration || 0,
+          uploader: info.uploader || info.channel || '',
+          previewUrl: previewUrl(info),
+          formats,
+        };
+      }
     }
     cacheSet(url, result);
     return res.json(result);
@@ -1179,12 +1735,28 @@ app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
   }
 });
 
+// Short honest note shown under a client-side-only platform's qualities:
+// VK keeps sound apart from the picture; Twitch only saves clips.
+function clientSideNote(url, info) {
+  const key = clientSideKey(url);
+  if (key === 'vk') return 'VK keeps the picture and the sound as separate files — save both the video file and the audio file.';
+  if (key === 'twitch') return 'Twitch clips only — full broadcasts stream only and cannot be saved as one file.';
+  if (key === 'tumblr') return 'Only posts with a video uploaded to Tumblr work — GIFs and embedded YouTube/Vimeo players have no Tumblr file.';
+  return '';
+}
+
 app.get('/api/save', rateLimit(10, 60000), async (req, res) => {
   const url = String(req.query.url || '').trim();
   const formatId = String(req.query.formatId || '').trim();
   const title = safeTitle(req.query.t || req.query.title || 'video');
-  if (!url || !/^https?:\/\//i.test(url) || !hostAllowed(url)) {
+  if (!url || !(await validateUserUrl(url))) {
     return res.status(400).json({ error: 'Invalid link.' });
+  }
+  // Client-side-only platforms never download through the server: their
+  // files are fetched by the visitor's own browser. A save request for
+  // one is refused here so no code path can silently stream it.
+  if (isClientSideOnly(url)) {
+    return res.status(400).json({ error: 'This video saves straight from your browser — use the Save button on the page.' });
   }
   if (!formatId || !/^[A-Za-z0-9+._-]{1,64}$/.test(formatId)) {
     return res.status(400).json({ error: 'Invalid quality choice.' });
