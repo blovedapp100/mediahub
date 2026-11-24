@@ -464,8 +464,9 @@ async function resolveTikTokShort(url) {
 // all ("Url parsing is failed" — no video data behind it), null means
 // tikwm never answered (network error / timeout / non-JSON reply).
 // NOTE on timing: tikwm's -1 answers take 13-20s (measured 2026-11-24),
-// while /api/info caps the tikwm call at 6s — so in the live server flow
-// a no-stream video usually shows up as code null (aborted), not -1.
+// while the /api/info race caps the tikwm call at 8s — so in the live
+// server flow a no-stream video usually shows up as code null
+// (aborted), not -1.
 // The -1 is still recorded (and logged) as the definitive form; the
 // no-stream verdict below does NOT require it, because the yt-dlp leg
 // ("No video formats found") is what makes the verdict safe — see the
@@ -3622,9 +3623,11 @@ function ssstikDuration(s) {
   return (m[1] ? parseInt(m[1], 10) * 3600 : 0) + parseInt(m[2], 10) * 60 + parseInt(m[3], 10);
 }
 async function ssstikInfo(url, timeoutMs = 15000) {
-  // SSSTik resolves any public TikTok URL — Series or normal — so this
-  // lane only runs after tikwm has already failed for the URL (see
-  // /api/info), keeping normal videos on the faster tikwm path.
+  // SSSTik resolves any public TikTok URL — Series or normal — and
+  // races alongside own extraction + tikwm in /api/info (speed fix
+  // 2026-11-24); it is the only route that reads Series videos, so
+  // for those it usually wins the race. Normal videos prefer tikwm
+  // when tikwm answers first (3 formats vs SSSTik's single best).
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
@@ -4900,67 +4903,91 @@ app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
     let ytdlpNoFormats = false;
     // OWN FIRST (standing rule 2026-11-24): our own extraction runs
     // before any third-party resolver. TikTok order is yt-dlp, then
-    // tikwm, then freeapi, then SSSTik (Series only, last). The own attempt is
-    // bounded to 13s: measured yt-dlp TikTok timings on this VM are
-    // 4.4-12.2s (warm ~4.5s, cold ~12s), so 13s catches a cold start
-    // while still leaving room for the fallbacks inside the 25s outer
-    // cap (13s own + 5s tikwm + 5s SSSTik = 23s; freeapi runs
-    // only on leftover budget, see below). NOTE: on a blocked
-    // IP this makes TikTok ~13s slower than the old tikwm-first order
-    // — the price of own-first until the site runs on a clean IP
-    // (see REPORT.md). The 25s cap still holds.
+    // tikwm, then freeapi, then SSSTik (Series only, last) — but all
+    // three race in PARALLEL and the first success wins (speed fix
+    // 2026-11-24, see the TikTok branch below): awaiting own first
+    // cost 11-13s on a blocked IP and pushed every TikTok answer past
+    // the frontend's 10s per-origin budget. Own still wins whenever
+    // it answers first. The own attempt is bounded to 13s: measured
+    // yt-dlp TikTok timings on this VM are 4.4-12.2s (warm ~4.5s,
+    // cold ~12s), so 13s catches a cold start. The 25s cap holds.
     let tiktokOwn = null;
     let tiktokOwnAttempted = false;
     if (isTikTok(url)) {
       tiktokOwnAttempted = true;
-      try {
-        const r = await withTimeout(ytdlpInfoWithFallbacks(url), 13000, 'own TikTok extraction timed out');
-        tiktokOwn = r;
-      } catch (e) {
-        // Own route failed (blocked IP, private/removed video, or
-        // Series — yt-dlp finds no formats for Series). Record the
-        // no-formats verdict for the no-stream branch below (the
-        // generic block would have recorded it had it run).
-        if (isNoFormats(e.detail)) ytdlpNoFormats = true;
-        tiktokOwn = null;
-      }
-      if (!tiktokOwn) {
-        // Third-party fallbacks, only after own extraction failed:
-        // start tikwm and SSSTik TOGETHER and await tikwm first
-        // (merged-deploy pattern — the two are independent, and
-        // running them in series wastes the 25s budget). tikwm keeps
-        // preference when it answers; SSSTik is only awaited when
-        // tikwm has nothing (its promise never rejects, so leaving it
-        // un-awaited on the tikwm-success path is safe).
-        const twP = tikwmInfoDetailed(url, 5000);
-        const ssP = ssstikInfo(url, 5000);
-        const tw = await twP;
-        tikwmCode = tw.code;
-        result = tw.info;
-        tikwmNoInfo = !result;
-        // TikTok Series videos: tikwm returns -1 and yt-dlp finds no
-        // formats (TikTok's own page serves an empty playAddr for them).
-        // SSSTik is the last resort and the only route that reads
-        // Series — it runs only after own extraction, tikwm AND freeapi
-        // fail. Normal videos reach here only when yt-dlp, tikwm and
-        // freeapi are all down, and SSSTik resolves those too.
-        if (!result) {
-          // freeapi.pro — second TikTok fallback (verified 2026-11-24,
-          // PROBE.md in social-fallbacks/: the same file as tikwm play,
-          // md5-identical, 10.8s resolve). Runs only when the remaining
-          // budget leaves a full 5s for SSSTik afterwards — SSSTik is the
-          // only Series route and is never starved for it. (ssP was
-          // already started alongside tikwm, so awaiting it after
-          // freeapi costs nothing extra.)
-          const faBudget = Math.min(11000, budgetLeft() - 5000);
-          if (faBudget >= 3000) result = await freeapiInfo(url, faBudget);
-          if (!result) result = await ssP;
-          if (result) return { status: 200, body: result }; // no cache: signed token URL
-        }
+      // SPEED FIX (2026-11-24): start tikwm + SSSTik ALONGSIDE own
+      // extraction and take the FIRST success. Own TikTok takes
+      // 11-13s to FAIL on a blocked IP (yt-dlp hangs, or prints "No
+      // video formats found" at ~11s for a streamless video), so
+      // awaiting it first pushed every TikTok answer past the
+      // frontend's 10s per-origin budget (live: 16.7s normal, 20.1s
+      // Series; this VM: 10-21s). The resolvers answer in ~5s. Own
+      // still wins whenever it answers first (clean IP: warm ~4.5s),
+      // so own-first holds in practice; on a blocked IP own never
+      // answers at all. All three promises resolve, never reject, so
+      // the race settles when the first non-null answer arrives — or
+      // when all three are null. Losers keep running in the
+      // background and are killed by their own timeouts (same as the
+      // YouTube geo race's yt-dlp client).
+      // Timeout notes (measured 2026-11-24, this VM): tikwm's own
+      // processed_time is ~5.5s, so its old 5s cap aborted a working
+      // resolver (one baseline run fell through to SSSTik at 18.6s
+      // for that reason) — the race cap is 8s, still inside the 10s
+      // budget when it is the only answer. SSSTik's token fetch is
+      // ~1.4s cold (~0s warm, 10-min cache) + ~3s POST, so 7s.
+      const ownP = withTimeout(ytdlpInfoWithFallbacks(url), 13000, 'own TikTok extraction timed out')
+        .then((r) => ({ kind: 'own', value: r }))
+        .catch((e) => {
+          // Own route failed (blocked IP, private/removed video, or
+          // Series — yt-dlp finds no formats for Series). Record the
+          // no-formats verdict for the no-stream branch below (the
+          // generic block would have recorded it had it run).
+          if (isNoFormats(e.detail)) ytdlpNoFormats = true;
+          return { kind: 'own', value: null };
+        });
+      const twP = tikwmInfoDetailed(url, 8000)
+        .then((tw) => { tikwmCode = tw.code; return { kind: 'tw', value: tw.info }; });
+      const ssP = ssstikInfo(url, 7000)
+        .then((info) => ({ kind: 'ss', value: info }));
+      let firstResolve;
+      const firstP = new Promise((r) => { firstResolve = r; });
+      let settledCount = 0;
+      const consider = (cand) => {
+        settledCount++;
+        if (cand && cand.value) firstResolve(cand);
+        else if (settledCount === 3) firstResolve(null);
+      };
+      ownP.then(consider);
+      twP.then(consider);
+      ssP.then(consider);
+      const winner = await firstP;
+      if (winner && winner.kind === 'own') {
+        tiktokOwn = winner.value;
+      } else if (winner && winner.kind === 'tw') {
+        // tikwm answered first — same result as the old tikwm path:
+        // fall through to the generic build + cache below.
+        tikwmNoInfo = false;
+        result = winner.value;
+      } else if (winner && winner.kind === 'ss') {
+        // SSSTik answered first (usually Series) — signed token URL,
+        // never cached: return directly as the old ssP path did.
+        return { status: 200, body: winner.value }; // no cache: signed token URL
+      } else {
+        // All three failed: tikwm definitively returned no info and
+        // own's no-formats verdict (if any) is recorded, so the
+        // no-stream branch below can fire. freeapi is the last route
+        // (it needs ~10.8s, so it only helps when the race failed
+        // fast); SSSTik already ran and failed in the race, so there
+        // is nothing left to await from it.
+        tikwmNoInfo = true;
+        const faBudget = Math.min(11000, budgetLeft());
+        if (faBudget >= 3000) result = await freeapiInfo(url, faBudget);
+        if (result) return { status: 200, body: result }; // no cache: signed token URL
       }
       // Fall through to the generic yt-dlp build below when own
-      // extraction succeeded (tiktokOwn) — it reuses that result
-      // instead of running yt-dlp a second time.
+      // extraction won the race (tiktokOwn) — it reuses that result
+      // instead of running yt-dlp a second time. When a resolver won,
+      // `result` is already set and the generic block is skipped.
     }
     if (!result && isDouyin) {
       // Douyin embed-player lane (no login): the server calls Douyin's
