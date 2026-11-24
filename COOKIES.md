@@ -1,4 +1,4 @@
-# MediaHub — Background sessions (cookies)
+# Save Video — Background sessions (cookies)
 
 The site's screen stays just the downloader. Sessions run in the
 background on the server only: the owner's own logged-in cookies for
@@ -17,7 +17,7 @@ over no cookies at all. Sessions always come from the owner.
    Store) and export the cookies for that site. It downloads a
    `cookies.txt` file (Netscape format — tab-separated lines starting
    with `# Netscape HTTP Cookie File`).
-3. In the Render dashboard, open the mediahub service → **Environment**
+3. In the Render dashboard, open the savevideo service → **Environment**
    → add a variable and paste the whole file contents as its value:
    - `COOKIES_YOUTUBE` — your YouTube cookies
    - `COOKIES_TIKTOK` — your TikTok cookies
@@ -25,7 +25,7 @@ over no cookies at all. Sessions always come from the owner.
    - `COOKIES_INSTAGRAM` — your Instagram cookies
    - or one combined file as `COOKIES_TXT` (used for every platform)
 4. Save — Render redeploys automatically. Check
-   `https://mediahub-shwe.onrender.com/api/health` — it reports
+   `https://savevideo.onrender.com/api/health` — it reports
    `cookies: { youtube: true, ... }` (true/false only, never contents).
 
 Local dev: put the file next to `server.js` as `cookies-youtube.txt`

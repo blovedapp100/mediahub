@@ -1,4 +1,4 @@
-// MediaHub server — paste a link, preview the clip, pick a quality, save it.
+// Save Video server — paste a link, preview the clip, pick a quality, save it.
 // No visitor data is stored. URLs are never written to logs.
 // Info responses are cached in memory (10 min, keyed by a hash of the link).
 const express = require('express');
@@ -942,14 +942,14 @@ function buildFormats(info, opts) {
 }
 
 // ---- SEO: per-platform landing pages --------------------------------------
-// Visible brand stays neutral ("MediaHub"). Keywords live in the <title>,
+// Visible brand stays neutral ("Save Video"). Keywords live in the <title>,
 // meta description, URL slug, intro text and FAQ — never in the logo or
 // the hero heading.
 const PLATFORMS = {
   youtube: {
     name: 'YouTube',
     keyword: 'YouTube video downloader',
-    title: 'YouTube Video Downloader — Save YouTube Videos in HD | MediaHub',
+    title: 'YouTube Video Downloader — Save YouTube Videos in HD | Save Video',
     description: 'YouTube video downloader: paste a YouTube link, preview the video and save it in 1080p, 720p, 480p or 360p with sound, or as audio only. Free, no account, works on phone and PC.',
     h1: 'YouTube videos in every quality',
     intro: 'A free YouTube video downloader that keeps it simple: paste a YouTube link, see the video preview with every available quality, and save the one you want. No account, no software to install, and it works on your phone, tablet and PC.',
@@ -965,7 +965,7 @@ const PLATFORMS = {
   tiktok: {
     name: 'TikTok',
     keyword: 'TikTok video downloader',
-    title: 'TikTok Video Downloader — Save TikTok Videos Without Watermark | MediaHub',
+    title: 'TikTok Video Downloader — Save TikTok Videos Without Watermark | Save Video',
     description: 'TikTok video downloader: paste a TikTok link and save the video without watermark in HD, plus the audio as MP3. Free, no account, works on phone and PC.',
     h1: 'TikTok videos in every quality',
     intro: 'A free TikTok video downloader: paste a TikTok link, preview the clip, and save it without watermark in HD — or save just the sound. No account, no app to install.',
@@ -981,7 +981,7 @@ const PLATFORMS = {
   facebook: {
     name: 'Facebook',
     keyword: 'Facebook video downloader',
-    title: 'Facebook Video Downloader — Save Facebook Videos & Reels in HD | MediaHub',
+    title: 'Facebook Video Downloader — Save Facebook Videos & Reels in HD | Save Video',
     description: 'Facebook video downloader: paste a Facebook video or reel link, preview it and save it in HD or SD with sound. Free, no account, works on phone and PC.',
     h1: 'Facebook videos & reels in every quality',
     intro: 'A free Facebook video downloader for videos and reels: paste the link, preview the clip, and save it in HD or SD with sound. No account needed.',
@@ -997,7 +997,7 @@ const PLATFORMS = {
   instagram: {
     name: 'Instagram',
     keyword: 'Instagram video downloader',
-    title: 'Instagram Video Downloader — Save Instagram Reels & Videos in HD | MediaHub',
+    title: 'Instagram Video Downloader — Save Instagram Reels & Videos in HD | Save Video',
     description: 'Instagram video downloader: paste an Instagram reel or video link, preview it and save it in HD with sound. Free, no account, works on phone and PC.',
     h1: 'Instagram reels & videos in every quality',
     intro: 'A free Instagram video downloader for reels and videos: paste the link, preview the clip, and save it in HD with sound. No account, no app to install.',
@@ -1013,7 +1013,7 @@ const PLATFORMS = {
   twitter: {
     name: 'X (Twitter)',
     keyword: 'Twitter video downloader',
-    title: 'Twitter Video Downloader — Save X Videos in HD | MediaHub',
+    title: 'Twitter Video Downloader — Save X Videos in HD | Save Video',
     description: 'Twitter video downloader: paste an X (Twitter) video link, preview it and save it in HD with sound. Free, no account, works on phone and PC.',
     h1: 'X videos in every quality',
     intro: 'A free Twitter video downloader for X videos: paste the post link, preview the clip, and save it in HD with sound. No account needed.',
@@ -1076,7 +1076,7 @@ app.get('/api/health', (req, res) => res.json({ ok: true, cookies: cookieStatus(
 // on every region). Without the secret the endpoint is disabled; the
 // secret and all cookie contents are never logged and never returned.
 // The extension runs only in the owner's browser and only ever talks to
-// the MediaHub origins — visitors' cookies are never involved.
+// the Save Video origins — visitors' cookies are never involved.
 app.post('/api/cookies', rateLimit(10, 60000), (req, res) => {
   const secret = process.env.COOKIE_SYNC_SECRET;
   if (!secret) return res.status(503).json({ error: 'Cookie sync is not configured on this server.' });
@@ -1350,4 +1350,4 @@ app.get('/api/save', rateLimit(10, 60000), async (req, res) => {
 
 app.use((req, res) => res.status(404).sendFile(path.join(__dirname, 'public', 'index.html')));
 
-app.listen(PORT, () => console.log('MediaHub listening on port ' + PORT));
+app.listen(PORT, () => console.log('Save Video listening on port ' + PORT));

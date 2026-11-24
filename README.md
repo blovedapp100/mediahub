@@ -1,6 +1,6 @@
-# MediaHub — paste a link, preview the clip, pick a quality, save it.
+# Save Video — paste a link, preview the clip, pick a quality, save it.
 
-MediaHub is a small, fast web app: paste a video link from TikTok,
+Save Video is a small, fast web app: paste a video link from TikTok,
 Facebook, Instagram, YouTube, X, Reddit, Vimeo or Dailymotion, see a
 preview with every available quality, and save the clip in the quality
 you choose.
