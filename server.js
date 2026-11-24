@@ -1802,6 +1802,106 @@ async function douyinInfo(url, timeoutMs = 10000) {
   } catch { return null; } finally { clearTimeout(timer); }
 }
 
+// ---- TikTok Series lane (added 2026-11-24) ------------------------------
+// TikTok Series videos (drama episodes like @sy_shortdrama24) cannot be
+// read by tikwm (code -1 "Url parsing is failed") or yt-dlp ("No video
+// formats found") — TikTok's own web page for them carries an EMPTY
+// playAddr/downloadAddr, so no public TikTok API returns a stream URL.
+// Verified 2026-11-24: video 7708982980349267208 ("Episode 1 The Seventh
+// Time or the Eighth", 124 s) has playAddr "" on TikTok's own page, while
+// a normal TikTok video resolves fine through tikwm the same hour.
+//
+// OWN direct routes tried first and PROVABLY dead from server egress:
+// TikTok's app aweme/detail API (api16-normal-c-*.tiktokv.com) and web
+// item/detail API both answer HTTP 200 with an EMPTY body — even with a
+// valid signature (tiktok-forge app signing x-argus/x-gorgon/x-ladon and
+// web signing from TikTok's own webmssdk.js bundle, X-Bogus produced) —
+// for the Series video AND for a normal control video. The empty body is
+// an IP-level refusal of TikTok's API endpoints from datacenter IPs, not
+// a bad signature, so no own-route signing can fix it from this server.
+//
+// What works: SSSTik's public no-login resolver (ssstik.io). The server
+// POSTs the TikTok URL to its /abc?url=dl endpoint (the same call its own
+// web page makes; the tt token is read off its homepage) and gets back an
+// HTML result with the video's title/author/poster and a download link on
+// SSSTik's own CDN (tikcdn.io). The visitor's browser then downloads the
+// file straight from tikcdn.io — bytes never pass through our server.
+// HONEST LIMIT: this lane depends on SSSTik's backend staying up and
+// reachable. If SSSTik goes down or changes its API, Series videos fail
+// again — there is no own-route fallback. The download opens in a new
+// tab because tikcdn.io only allows cross-origin reads from ssstik.io
+// (ACAO: https://ssstik.io), so the browser cannot fetch+blob it; a
+// plain navigation downloads it fine (verified: browser UA, our site's
+// Referer, 206; non-browser UAs get 204).
+const SSSTIK_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+let ssstikTt = { value: '', at: 0 };
+const SSSTIK_TT_TTL_MS = 10 * 60 * 1000;
+async function ssstikToken() {
+  const now = Date.now();
+  if (ssstikTt.value && now - ssstikTt.at < SSSTIK_TT_TTL_MS) return ssstikTt.value;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 5000);
+  try {
+    const r = await fetch('https://ssstik.io/', { signal: ctrl.signal, headers: { 'User-Agent': SSSTIK_UA } });
+    if (!r.ok) return ssstikTt.value || '';
+    const html = await r.text();
+    const m = html.match(/s_tt\s*=\s*'([^']+)'/);
+    if (m) { ssstikTt = { value: m[1], at: now }; return m[1]; }
+    return ssstikTt.value || '';
+  } catch { return ssstikTt.value || ''; } finally { clearTimeout(timer); }
+}
+function ssstikDuration(s) {
+  const m = String(s || '').trim().match(/^(?:(\d+):)?(\d{1,2}):(\d{2})$/);
+  if (!m) return 0;
+  return (m[1] ? parseInt(m[1], 10) * 3600 : 0) + parseInt(m[2], 10) * 60 + parseInt(m[3], 10);
+}
+async function ssstikInfo(url, timeoutMs = 15000) {
+  // SSSTik resolves any public TikTok URL — Series or normal — so this
+  // lane only runs after tikwm has already failed for the URL (see
+  // /api/info), keeping normal videos on the faster tikwm path.
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    let tt = await ssstikToken();
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (!tt) return null;
+      const body = new URLSearchParams({ id: url, locale: 'en', tt });
+      const r = await fetch('https://ssstik.io/abc?url=dl', {
+        method: 'POST', signal: ctrl.signal,
+        headers: { 'User-Agent': SSSTIK_UA, 'Referer': 'https://ssstik.io/', 'HX-Request': 'true', 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: body.toString(),
+      });
+      if (!r.ok) return null;
+      const html = await r.text();
+      const link = html.match(/href="(https:\/\/tikcdn\.io\/ssstik\/\d+\?st=[^"&]+&e=\d+)"/);
+      if (link) {
+        const titleM = html.match(/<p class="ssr-caption">([\s\S]*?)<\/p>/);
+        const authorM = html.match(/<div class="ssr-author">\s*<h2>([^<]+)<\/h2>/);
+        const durM = html.match(/<span class="ssr-dur">([^<]+)<\/span>/);
+        const posterM = html.match(/url\('(https:\/\/tikcdn\.io\/ssstik\/p\/[^']+)'\)/);
+        const title = titleM ? titleM[1].replace(/<[^>]+>/g, '').trim() : '';
+        const videoId = (url.match(/\/video\/(\d+)/) || [])[1] || '';
+        return {
+          source: 'tiktok-series',
+          title: title || ('TikTok video' + (videoId ? ' ' + videoId : '')),
+          thumbnail: posterM ? posterM[1] : '',
+          duration: ssstikDuration(durM && durM[1]),
+          uploader: authorM ? authorM[1].trim() : '',
+          previewUrl: link[1],
+          formats: [{ id: 'ssstik-best', label: 'Best quality', ext: 'mp4', hasAudio: true, filesize: 0, note: 'Opens in a new tab', url: link[1] }],
+          clientSide: true,
+          note: 'This video opens in a new tab to save — TikTok Series episodes are only served inside TikTok’s own app.',
+        };
+      }
+      // No download link: the tt token may have rotated — refresh it
+      // once and retry; otherwise give up (fail fast, no fake button).
+      ssstikTt = { value: '', at: 0 };
+      tt = await ssstikToken();
+    }
+    return null;
+  } catch { return null; } finally { clearTimeout(timer); }
+}
+
 // ---- Chinese no-login lanes (added 2026-11-24) ---------------------------
 // Kuaishou, Haokan, Pear Video and Zhihu, each through its own public
 // no-login route, verified from this VM on 2026-11-24 with real videos
@@ -2678,7 +2778,18 @@ app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
     let result = null;
     if (isTikTok(url)) {
       result = await tikwmInfo(url, 6000);
-      // fall through to yt-dlp when tikwm has nothing
+      // TikTok Series videos: tikwm returns -1 and yt-dlp finds no
+      // formats (TikTok's own page serves an empty playAddr for them).
+      // Try the SSSTik resolver before the yt-dlp rounds — yt-dlp can
+      // never read a Series video, and the resolver answers in ~2s.
+      // Normal videos reach here only when tikwm is down, and SSSTik
+      // resolves those too. 8s cap here so the yt-dlp rounds still get
+      // time inside the 25s outer cap.
+      if (!result) {
+        result = await ssstikInfo(url, 8000);
+        if (result) return { status: 200, body: result }; // no cache: signed token URL
+      }
+      // fall through to yt-dlp when tikwm AND the resolver have nothing
     }
     if (!result && isDouyin) {
       // Douyin embed-player lane (no login): the server calls Douyin's
@@ -2862,6 +2973,11 @@ app.get('/api/save', rateLimit(10, 60000), async (req, res) => {
   // files are fetched by the visitor's own browser. A save request for
   // one is refused here so no code path can silently stream it.
   if (isClientSideOnly(url)) {
+    return res.status(400).json({ error: 'This video saves straight from your browser — use the Save button on the page.' });
+  }
+  // TikTok Series files (ssstik-*) never download through the server
+  // either: the visitor's browser opens the file in a new tab instead.
+  if (formatId.startsWith('ssstik-')) {
     return res.status(400).json({ error: 'This video saves straight from your browser — use the Save button on the page.' });
   }
   if (!formatId || !/^[A-Za-z0-9+._-]{1,64}$/.test(formatId)) {
