@@ -116,8 +116,6 @@
     ['haokan.baidu.com', 'Haokan'],
     ['pearvideo.com', 'Pear Video'],
     ['zhihu.com', 'Zhihu'],
-    ['weibo.com', 'Weibo'],
-    ['m.weibo.cn', 'Weibo'],
     ['tv.sohu.com', 'Sohu'],
   ];
 
@@ -341,6 +339,7 @@
     if (maxOrigins) list = list.slice(0, maxOrigins);
     var lastErr = null;
     var geoFails = 0;
+    var noStreamFails = 0;
     var answered = 0;
     for (var i = 0; i < list.length; i++) {
       var ctrl = new AbortController();
@@ -352,6 +351,7 @@
         if (!r.ok) {
           answered++;
           if (data.geoBlocked) geoFails++;
+          if (data.noStream) noStreamFails++;
           lastErr = new Error(data.error || 'Something went wrong.');
           if (r.status >= 400 && r.status < 500) lastErr._terminal = true;
           if (lastErr._terminal) throw lastErr;
@@ -370,6 +370,10 @@
     // instead of a generic "try again". (A 502 is retried, never
     // terminal, so a single geo failure alone never sets this.)
     if (answered && geoFails === answered && lastErr) lastErr.geoBlocked = true;
+    // No public stream: same rule — every origin that answered agreed
+    // the video has no download link at all. (A 502 is retried, never
+    // terminal, so a single noStream failure alone never sets this.)
+    if (answered && noStreamFails === answered && lastErr) lastErr.noStream = true;
     throw lastErr || new Error('Something went wrong.');
   }
 
@@ -539,8 +543,15 @@
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url: url }),
-        }, 10000, 3, { regionDiverse: true }),
-        infoBudget,
+          // TikTok gets 20s per origin, not 10s: its three lanes need
+          // it — tikwm up to 6s, SSSTik up to ~8s, then the yt-dlp
+          // rounds — and a no-stream verdict only exists once all three
+          // have answered. 10s cuts the server off before it can
+          // conclude, so the visitor would only ever see the timeout
+          // message. The 45s global budget above still bounds the
+          // stage, and other platforms keep their 10s.
+        }, platform === 'TikTok' ? 20000 : 10000, 3, { regionDiverse: true }),
+
       ]);
       if (reqId !== latestReq) return;
       currentInfoOrigin = res.origin;
@@ -568,6 +579,14 @@
         var geoMsg = 'This video is blocked in every region we can reach (US, Europe and Asia). It is only available in the country where the uploader allowed it.';
         if (!renderedForReq) { clearResult(); msg.textContent = geoMsg; }
         else if (!resultRendered) formatsEl.innerHTML = '<li class="loading">' + geoMsg + '</li>';
+      } else if (err && err.noStream) {
+        // No public stream: the video is not slow — TikTok publishes
+        // no download link for it (e.g. a Series episode), so retrying
+        // the same link will not help. Use the server's own words
+        // (err.message carries them) with a plain fallback.
+        var noStreamMsg = err.message || 'This video has no public download link — TikTok doesn\u2019t publish one for it.';
+        if (!renderedForReq) { clearResult(); msg.textContent = noStreamMsg; }
+        else if (!resultRendered) formatsEl.innerHTML = '<li class="loading">' + noStreamMsg + '</li>';
       } else if (err && err.name === 'AbortError') {
         if (!renderedForReq) { clearResult(); msg.textContent = platform + ' is taking too long right now. Please try again.'; }
         else if (!resultRendered) formatsEl.innerHTML = '<li class="loading">Taking too long — please try again.</li>';
