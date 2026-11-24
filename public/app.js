@@ -776,7 +776,8 @@
     // its measured per-platform figures for the on-screen estimate.
     // ---- Background jobs (slow videos) ---------------------------------
     // Some videos can never finish inside /api/info's 25s cap: long
-    // YouTube videos, Douyin/Kuaishou, Moj/ShareChat, Zhihu. For those
+    // YouTube videos, TikTok (flaky sync race on Render — see
+    // isSlowJobLink), Douyin/Kuaishou, Moj/ShareChat, Zhihu. For those
     // the server runs the same lookup in the background (POST /api/job)
     // and this code polls it. The fast path above is untouched: a video
     // that answers in time never starts a job. A job starts only when
@@ -788,7 +789,14 @@
     var jobOrigin = '';
     var jobPollTimer = null;
     function isSlowJobLink() {
-      if (platform === 'Douyin' || platform === 'Kuaishou' ||
+      // TikTok (2026-11-24, live evidence): the sync race is flaky on
+      // Render — the 8s cap fires on the main origin (502) and the
+      // backup can be slow too, so a TikTok link can sit on "Finding
+      // qualities…" for 30s+ while Stage 2 cycles origins. Start the
+      // job at 12s instead of 25s: the job resolves TikTok in <5s
+      // live, and if Stage 2 wins first jobStop() cancels the job —
+      // fast links are unaffected.
+      if (platform === 'TikTok' || platform === 'Douyin' || platform === 'Kuaishou' ||
           platform === 'Moj' || platform === 'ShareChat' || platform === 'Zhihu') return true;
       if (platform === 'YouTube' && metaDuration >= 240) return true;
       return false;
@@ -822,21 +830,34 @@
     async function startJobFlow() {
       if (jobStarted || reqId !== latestReq || resultRendered) return;
       jobStarted = true;
+      // Show the progress row NOW, before the job POST: if the POST
+      // itself is slow (waking service), the visitor already sees the
+      // job working instead of a frozen "Finding qualities…".
+      jobShowProgress(0, 'Getting it ready…');
       var origins;
       try { origins = await getOrigins(); } catch (e) { origins = [location.origin]; }
       origins = orderOriginsByRegion(origins.slice());
       var started = null;
       for (var i = 0; i < Math.min(3, origins.length); i++) {
+        // Bounded (2026-11-24): a POST to a stalled origin (just-deployed
+        // / waking service) used to hang forever with no timeout — the
+        // whole job start stalled and the UI sat on "Finding
+        // qualities…" with no progress and no error. 10s per origin,
+        // then try the next one.
+        var postCtrl = new AbortController();
+        var postTimer = setTimeout(function () { postCtrl.abort(); }, 10000);
         try {
           var r = await fetch(origins[i] + '/api/job', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ url: url }),
+            signal: postCtrl.signal,
           });
           var d = await r.json().catch(function () { return null; });
           if (r.ok && d && d.jobId) { started = { origin: origins[i], jobId: d.jobId }; break; }
           if (r.status === 429 || r.status === 400) break; // decided: do not burn other origins
-        } catch (e) { /* next origin */ }
+        } catch (e) { /* next origin (timeout or network error) */ }
+        finally { clearTimeout(postTimer); }
         if (reqId !== latestReq || jobStopped) return;
       }
       if (!started) { jobShowError(platform + ' is taking too long right now. Please try again.'); return; }
@@ -847,10 +868,15 @@
         if (reqId !== latestReq || jobStopped) return;
         if (Date.now() - jobStart > 320000) { jobShowError(platform + ' is taking too long right now. Please try again.'); return; }
         var pr, pd;
+        // Bounded like the job POST above: a hung poll must not freeze
+        // the progress loop — abort at 10s and retry on the 3s timer.
+        var pollCtrl = new AbortController();
+        var pollTimer = setTimeout(function () { pollCtrl.abort(); }, 10000);
         try {
-          pr = await fetch(jobOrigin + '/api/job/' + jobId);
+          pr = await fetch(jobOrigin + '/api/job/' + jobId, { signal: pollCtrl.signal });
           pd = await pr.json().catch(function () { return null; });
         } catch (e) { pd = null; }
+        finally { clearTimeout(pollTimer); }
         if (reqId !== latestReq || jobStopped) return;
         if (!pd) { jobPollTimer = setTimeout(poll, 3000); return; }
         if (pd.status === 'ready' && pd.formats && pd.formats.length) {
