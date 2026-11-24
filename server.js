@@ -593,6 +593,22 @@ function isGeoBlocked(text) {
     || /blocked in your country/i.test(t);
 }
 
+// Geo text in the watch page's own player status — YouTube puts the geo
+// reason in playabilityStatus.errorScreen ("The uploader has not made
+// this video available in your country"), and the plain page fetch
+// answers in ~2s. Only the playabilityStatus slice is checked: the rest
+// of the page carries descriptions and comments that could mention
+// geo-blocking without THIS video being blocked. A playable video's
+// slice says PLAYABLE (no geo text) and a private video's says "This
+// video is private" — both return false, so the probe is inconclusive
+// and the normal rounds decide. No playabilityStatus at all (consent
+// page, /sorry redirect) is also inconclusive.
+function geoBlockedInPlayer(html) {
+  const i = String(html || '').indexOf('playabilityStatus');
+  if (i < 0) return false;
+  return isGeoBlocked(String(html).slice(i, i + 3000));
+}
+
 function ytdlpJson(url, timeoutMs = 60000, extraArgs = [], allowProxy = true) {
   return (async () => {
     const pargs = await proxyArgs(url, allowProxy);
@@ -671,15 +687,59 @@ async function ytdlpInfoWithFallbacks(url) {
       ['--extractor-args', 'youtube:player_client=tv_embedded'],
     ];
     let lastDetail = '';
-    for (const round of [{ allowProxy: false, timeout: 8000 }, { allowProxy: true, timeout: 12000 }]) {
+    // Fast geo probe — resolves true (geo) or false (inconclusive)
+    // within ~4s of starting. A yt-dlp probe CANNOT work: a single
+    // android client takes 7.5–9.5s to surface the geo error (its player
+    // requests get 429'd and retried), and 4 concurrent clients take
+    // 13–19s — measured 2026-11-24. The watch-page fetch in
+    // geoBlockedInPlayer answers in ~2s instead. It runs alongside
+    // round 1 (a plain fetch, not a process, so a normal video costs
+    // nothing) and is checked the moment round 1 ends without a
+    // success. It must be checked AFTER round 1, not raced against it:
+    // when YouTube 429-kills the clients they fail FAST (~1–2s), so a
+    // race would let round 1 settle before the probe's fetch lands and
+    // the geo answer would be discarded. The probe's own 4s fetch cap
+    // bounds the wait — round 1 settling at 2s + at most ~2s for the
+    // probe is still inside the frontend's 10s per-origin budget.
+    const probeGeo = (async () => {
+      try {
+        const html = await fetchPageHtml(url, 4000);
+        return Boolean(html && geoBlockedInPlayer(html));
+      } catch { return false; }
+    })();
+    const rounds = [{ allowProxy: false, timeout: 8000 }, { allowProxy: true, timeout: 12000 }];
+    for (let ri = 0; ri < rounds.length; ri++) {
+      const round = rounds[ri];
       const mirror = withTimeout(mirrorInfo(url).then((info) => {
         if (!info) throw new Error('mirror empty');
         return { info, clientArgs: null };
       }), round.timeout, 'mirror timeout');
-      const settled = await Promise.allSettled([
+      const roundSettled = Promise.allSettled([
         ...clients.map((args) => tag(ytdlpJson(url, round.timeout, args, round.allowProxy), args)),
         mirror,
       ]);
+      let settled;
+      if (ri === 0) {
+        // Race the probe against round 1 as well: when the mirror hangs,
+        // round 1 takes the full 8s, and the probe's ~2s answer would
+        // otherwise wait until 8s — inside the 10s budget but with only
+        // ~1.7s of margin (measured 8.3s without the race). The race
+        // returns GEO at ~2s in that case. The post-round check below
+        // stays as the backstop for the opposite case (round 1 settles
+        // fast, before the probe lands).
+        const raced = await Promise.race([
+          probeGeo.then((hit) => (hit ? 'GEO' : new Promise(() => {}))),
+          roundSettled,
+        ]);
+        if (raced === 'GEO') {
+          const gerr = new Error('This video is blocked in this region.');
+          gerr.geoBlocked = true;
+          throw gerr;
+        }
+        settled = raced;
+      } else {
+        settled = await roundSettled;
+      }
       const ok = settled.filter((r) => r.status === 'fulfilled').map((r) => r.value);
       if (ok.length) {
         let best = ok[0];
@@ -694,7 +754,15 @@ async function ytdlpInfoWithFallbacks(url) {
       // can read the video — the restriction is the region itself. Stop
       // here (fast, inside the frontend's 10s per-origin budget) so the
       // frontend can retry another region instead of burning the WARP
-      // round and timing out on a generic error.
+      // round and timing out on a generic error. The probe is checked
+      // first: it answers in ~2s, while the clients' geo text often
+      // never surfaces at all (429-killed with empty stderr).
+      if (ri === 0 && await probeGeo) {
+        const gerr = new Error('This video is blocked in this region.');
+        gerr.detail = lastDetail;
+        gerr.geoBlocked = true;
+        throw gerr;
+      }
       if (isGeoBlocked(lastDetail)) {
         const gerr = new Error('This video is blocked in this region.');
         gerr.detail = lastDetail;
@@ -2100,10 +2168,14 @@ app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
           cacheSet(url, result);
           return { status: 200, body: result };
         }
-        // Tumblr and X fall through to yt-dlp when the scrape finds
-        // nothing (Tumblr: image post or unreadable post; X: the page
-        // carried no video file) instead of failing outright.
-        if (scrapeKey !== 'tumblr' && scrapeKey !== 'x') throw new Error('Could not find a video file on this page. The video may be private, removed, or an image post.');
+        // Tumblr falls through to yt-dlp when the scrape finds nothing
+        // (image post or unreadable post). X does NOT: its yt-dlp
+        // extractor needs the GraphQL API, which blocks datacenter IPs,
+        // so the fall-through can never succeed on Render — it only
+        // burns 20s and trips the 25s outer cap, which is exactly the
+        // live "Finding qualities…" hang. Fail fast with a clear error
+        // instead; the frontend retries the next region.
+        if (scrapeKey !== 'tumblr') throw new Error('Could not find a video file on this page. The video may be private, removed, or an image post.');
       }
       let info = null;
       try {
