@@ -671,11 +671,19 @@ async function ytdlpInfoWithFallbacks(url) {
   throw wrapErr(lastErr);
 }
 
-// ---- fast preview metadata (~1-2s) -----------------------------------------
+// ---- fast preview metadata (~1s when warm) ----------------------------------
 // Title / thumbnail / author without waiting for the full format extraction.
-// YouTube: public oEmbed endpoint. TikTok: tikwm API. Anything else: the
-// page's og: tags. Returns null fast when nothing answers — the caller then
-// just waits for /api/info.
+// Every source runs IN PARALLEL and the first answer wins, so the worst
+// case is the overall budget (~4s), not the sum of every attempt. The old
+// version ran YouTube oEmbed, then tikwm, then the og scrape one after
+// another (up to ~9s) and still 404'd on Facebook/Instagram, whose pages
+// carry no og: tags behind their login walls.
+// oEmbed (public, no login): YouTube, Vimeo, Reddit. TikTok's oEmbed was
+// tested 2026-11-24 on two videos — it returns NO title and NO
+// thumbnail_url, so TikTok still uses tikwm + the og scrape. Facebook's
+// oEmbed endpoint is deprecated (400) and Instagram has no public oEmbed,
+// so their previews come from /api/info (yt-dlp, ~1s warm) and the
+// frontend shows that result the moment it arrives.
 function decodeEntities(s) {
   return String(s || '')
     .replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
@@ -699,59 +707,83 @@ function ogTag(html, prop) {
   return m ? m[1] : '';
 }
 
+async function oembedMeta(endpoint, timeoutMs) {
+  try {
+    const j = await fetchJsonTimeout(endpoint, timeoutMs);
+    if (!j || !j.title) return null;
+    return {
+      title: decodeEntities(j.title),
+      thumbnail: j.thumbnail_url || '',
+      uploader: j.author_name || '',
+      duration: Number(j.duration) || 0,
+    };
+  } catch { return null; }
+}
+
+async function ogScrapeMeta(url, timeoutMs) {
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    // Tumblr: a blog's own subdomain answers with a JS challenge page
+    // that has no og: tags at all — fetch the canonical www.tumblr.com
+    // page instead (same rewrite the scrape uses), so the fast preview
+    // works for pasted subdomain links too.
+    const metaUrl = clientSideKey(url) === 'tumblr' ? (await tumblrPageUrl(url)) || url : url;
+    const r = await fetch(metaUrl, {
+      signal: ctrl.signal, redirect: 'follow',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+    });
+    clearTimeout(timer);
+    const html = await r.text();
+    // Tumblr's og:title is only "Post by @blog · 1 video" — the real
+    // post text is parsely-title, and the poster frame is
+    // parsely-image-url; prefer those when the page carries them.
+    const title = decodeEntities(
+      metaContent(html, 'name', 'parsely-title').replace(/ – @\S+ on Tumblr$/, '') ||
+      ogTag(html, 'og:title'));
+    const img = metaContent(html, 'name', 'parsely-image-url') || ogTag(html, 'og:image');
+    if (title || img) return { title: title || 'Video', thumbnail: img, uploader: ogTag(html, 'og:site_name') || '', duration: 0 };
+    return null;
+  } catch { return null; }
+}
+
+async function tikwmMeta(url) {
+  try {
+    const t = await tikwmInfo(url, 2500);
+    if (t) return { title: t.title, thumbnail: t.thumbnail, uploader: t.uploader, duration: t.duration || 0 };
+    return null;
+  } catch { return null; }
+}
+
 async function fastMeta(url) {
   const cached = cacheGet('meta:' + url);
   if (cached) return cached;
-  let out = null;
+  const jobs = [];
   if (isYouTube(url)) {
-    try {
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 4000);
-      const r = await fetch('https://www.youtube.com/oembed?url=' + encodeURIComponent(url) + '&format=json',
-        { signal: ctrl.signal, headers: { 'User-Agent': 'Mozilla/5.0' } });
-      clearTimeout(timer);
-      const j = await r.json();
-      if (j && j.title) out = { title: decodeEntities(j.title), thumbnail: j.thumbnail_url || '', uploader: j.author_name || '', duration: 0 };
-    } catch {}
+    jobs.push(oembedMeta('https://www.youtube.com/oembed?url=' + encodeURIComponent(url) + '&format=json', 3000));
   }
-  if (!out && isTikTok(url)) {
-    try {
-      const t = await tikwmInfo(url, 2500);
-      if (t) out = { title: t.title, thumbnail: t.thumbnail, uploader: t.uploader, duration: t.duration || 0 };
-    } catch {}
+  if (isTikTok(url)) jobs.push(tikwmMeta(url));
+  let host = '';
+  try { host = new URL(url).hostname.toLowerCase(); } catch {}
+  if (host === 'vimeo.com' || host.endsWith('.vimeo.com')) {
+    jobs.push(oembedMeta('https://vimeo.com/api/oembed.json?url=' + encodeURIComponent(url), 2500));
   }
-  if (!out) {
-    try {
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 5000);
-      // Tumblr: a blog's own subdomain answers with a JS challenge page
-      // that has no og: tags at all — fetch the canonical www.tumblr.com
-      // page instead (same rewrite the scrape uses), so the fast preview
-      // works for pasted subdomain links too.
-      const metaUrl = clientSideKey(url) === 'tumblr' ? (await tumblrPageUrl(url)) || url : url;
-      const r = await fetch(metaUrl, {
-        signal: ctrl.signal, redirect: 'follow',
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
-          'Accept-Language': 'en-US,en;q=0.9',
-        },
-      });
-      clearTimeout(timer);
-      const html = await r.text();
-      // Tumblr's og:title is only "Post by @blog · 1 video" — the real
-      // post text is parsely-title, and the poster frame is
-      // parsely-image-url; prefer those when the page carries them.
-      const title = decodeEntities(
-        metaContent(html, 'name', 'parsely-title').replace(/ – @\S+ on Tumblr$/, '') ||
-        ogTag(html, 'og:title'));
-      const img = metaContent(html, 'name', 'parsely-image-url') || ogTag(html, 'og:image');
-      if (title || img) out = { title: title || 'Video', thumbnail: img, uploader: ogTag(html, 'og:site_name') || '', duration: 0 };
-    } catch {}
+  if (host === 'reddit.com' || host.endsWith('.reddit.com')) {
+    jobs.push(oembedMeta('https://www.reddit.com/oembed?url=' + encodeURIComponent(url), 2500));
   }
+  jobs.push(ogScrapeMeta(url, 3500));
+  // First non-null answer wins; give up after 4s so /api/meta never
+  // keeps the preview waiting. Every job swallows its own errors.
+  const out = await Promise.race([
+    Promise.any(jobs.map((j) => j.then((v) => { if (!v) throw new Error('no meta'); return v; }))).catch(() => null),
+    new Promise((ok) => setTimeout(() => ok(null), 4000)),
+  ]);
   if (out) cacheSet('meta:' + url, out);
   return out;
 }
-
 // ---- YouTube via public Invidious / Piped mirrors (fallback) ---------------
 // Render's IP is bot-checked by YouTube, so when yt-dlp fails we ask public
 // mirrors that keep their own YouTube access. Each attempt is short (5s) and
