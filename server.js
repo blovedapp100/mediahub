@@ -80,6 +80,20 @@ const ALLOWED_HOSTS = [
   // INFO through Douyin's own embed-player API — the file itself is
   // downloaded by the visitor's own browser, from Douyin's CDN.
   'douyin.com', 'www.douyin.com', 'v.douyin.com', 'www.iesdouyin.com',
+  // Chinese no-login platforms (added 2026-11-24): Kuaishou, Haokan,
+  // Pear Video, Zhihu — same rule as Douyin: the server only ever reads
+  // a link's INFO; the video file is downloaded by the visitor's own
+  // browser, from the video CDN, on their own IP. No login anywhere.
+  'kuaishou.com', 'www.kuaishou.com', 'v.kuaishou.com', 'kwai.com', 'www.kwai.com',
+  'haokan.baidu.com', 'www.haokan.baidu.com',
+  'pearvideo.com', 'www.pearvideo.com',
+  'zhihu.com', 'www.zhihu.com',
+  // Weibo + Sohu (added 2026-11-24): same rule — the server only reads
+  // a link's INFO via yt-dlp's own extractors; the file is downloaded
+  // by the visitor's own browser. No login anywhere (see the /api/info
+  // note on Weibo's anonymous guest token and Sohu's per-video geo rule).
+  'weibo.com', 'www.weibo.com', 'm.weibo.cn',
+  'tv.sohu.com', 'www.tv.sohu.com',
 ];
 
 function hostAllowed(u) {
@@ -182,6 +196,7 @@ function platformOf(u) {
 const CLIENT_SIDE_ONLY = new Set([
   'x', 'twitter', 'bluesky', 'tumblr', 'twitch', 'pinterest',
   'linkedin', 'moj', 'sharechat', 'snapchat', 'tencent', 'douyin',
+  'kuaishou', 'haokan', 'pear', 'zhihu', 'weibo', 'sohu',
 ]);
 function clientSideKey(url) {
   try {
@@ -197,6 +212,12 @@ function clientSideKey(url) {
     if (h === 'snapchat.com' || h.endsWith('.snapchat.com')) return 'snapchat';
     if (h === 'v.qq.com' || h.endsWith('.v.qq.com')) return 'tencent';
     if (h === 'douyin.com' || h.endsWith('.douyin.com') || h === 'iesdouyin.com' || h.endsWith('.iesdouyin.com')) return 'douyin';
+    if (h === 'kuaishou.com' || h.endsWith('.kuaishou.com') || h === 'kwai.com' || h.endsWith('.kwai.com')) return 'kuaishou';
+    if (h === 'haokan.baidu.com' || h.endsWith('.haokan.baidu.com')) return 'haokan';
+    if (h === 'pearvideo.com' || h.endsWith('.pearvideo.com')) return 'pear';
+    if (h === 'zhihu.com' || h.endsWith('.zhihu.com')) return 'zhihu';
+    if (h === 'weibo.com' || h.endsWith('.weibo.com') || h === 'm.weibo.cn' || h.endsWith('.m.weibo.cn')) return 'weibo';
+    if (h === 'tv.sohu.com' || h.endsWith('.tv.sohu.com')) return 'sohu';
   } catch {}
   return null;
 }
@@ -871,11 +892,24 @@ async function ogScrapeMeta(url, timeoutMs) {
     // page instead (same rewrite the scrape uses), so the fast preview
     // works for pasted subdomain links too.
     const metaUrl = clientSideKey(url) === 'tumblr' ? (await tumblrPageUrl(url)) || url : url;
+    // Haokan: a desktop UA gets a JS shell whose <title> is the generic
+    // site name — the iPhone UA gets the server-rendered page with the
+    // real title and poster (same UA the info scrape uses).
+    // Kuaishou: the page only embeds its data (and its real <title>)
+    // with the anonymous cookie set — mint one, as the info scrape does
+    // — and with the same headers the info scrape sends (Chrome UA,
+    // Referer, zh-CN): en-US / no-Referer gets the shell page whose
+    // <title> is the generic site name.
+    const metaKey = clientSideKey(url);
+    const metaUa = metaKey === 'haokan' ? HAOKAN_UA : metaKey === 'kuaishou' ? KUAISHOU_UA : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36';
+    const metaCookies = metaKey === 'kuaishou' ? await kuaishouCookies() : '';
     const r = await fetch(metaUrl, {
       signal: ctrl.signal, redirect: 'follow',
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
-        'Accept-Language': 'en-US,en;q=0.9',
+        'User-Agent': metaUa,
+        'Accept-Language': metaKey === 'kuaishou' ? 'zh-CN,zh;q=0.9' : 'en-US,en;q=0.9',
+        ...(metaKey === 'kuaishou' ? { Referer: 'https://www.kuaishou.com/' } : {}),
+        ...(metaCookies ? { Cookie: metaCookies } : {}),
       },
     });
     clearTimeout(timer);
@@ -883,10 +917,19 @@ async function ogScrapeMeta(url, timeoutMs) {
     // Tumblr's og:title is only "Post by @blog · 1 video" — the real
     // post text is parsely-title, and the poster frame is
     // parsely-image-url; prefer those when the page carries them.
+    // Last resort: the page's own <title> (Kuaishou pages carry no og:
+    // tags at all, only <title> — without this the preview 404s and the
+    // user waits for Stage 2 to see anything).
     const title = decodeEntities(
       metaContent(html, 'name', 'parsely-title').replace(/ – @\S+ on Tumblr$/, '') ||
-      ogTag(html, 'og:title'));
+      ogTag(html, 'og:title') ||
+      ((html.match(/<title[^>]*>([^<]+)<\/title>/i) || [])[1] || ''));
     const img = metaContent(html, 'name', 'parsely-image-url') || ogTag(html, 'og:image');
+    // Kuaishou's shell page (served when the cookie set is missing or
+    // the fetch is slow) carries the generic site <title> "短视频-快手"
+    // — that is not the video's title, so treat it as no preview
+    // rather than flash the wrong name; Stage 2 renders the real one.
+    if (clientSideKey(url) === 'kuaishou' && title === '短视频-快手') return null;
     if (title || img) return { title: title || 'Video', thumbnail: img, uploader: ogTag(html, 'og:site_name') || '', duration: 0 };
     return null;
   } catch { return null; }
@@ -1759,6 +1802,379 @@ async function douyinInfo(url, timeoutMs = 10000) {
   } catch { return null; } finally { clearTimeout(timer); }
 }
 
+// ---- Chinese no-login lanes (added 2026-11-24) ---------------------------
+// Kuaishou, Haokan, Pear Video and Zhihu, each through its own public
+// no-login route, verified from this VM on 2026-11-24 with real videos
+// (real files downloaded + ffprobe-checked). No login, no login cookies,
+// no API keys anywhere — the server only reads the video's INFO and hands
+// the direct mp4 URL to the visitor's browser; bytes never pass through
+// the server. Signed CDN URLs are short-lived, so results are resolved
+// fresh per request (Kuaishou is never cached at all; the other three
+// sit in the 10-min cache, well inside their 1–4 h URL expiry).
+
+// Parse the first JSON object after a marker in a page (Kuaishou's
+// __APOLLO_STATE__ and Haokan's __PRELOADED_STATE__ both carry trailing
+// junk after the object — a script-closing IIFE on Kuaishou — so a
+// naive slice-to-</script> + JSON.parse fails). Brace-matching that
+// respects JSON strings and escapes.
+function extractJsonObject(text, marker) {
+  const s = String(text || '');
+  const i = s.indexOf(marker);
+  if (i < 0) return null;
+  const start = s.indexOf('{', i);
+  if (start < 0) return null;
+  let depth = 0, inStr = false, esc = false;
+  for (let p = start; p < s.length; p++) {
+    const c = s[p];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
+    } else if (c === '"') inStr = true;
+    else if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) {
+        try { return JSON.parse(s.slice(start, p + 1)); } catch { return null; }
+      }
+    }
+  }
+  return null;
+}
+
+const KUAISHOU_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+// ---- Kuaishou -------------------------------------------------------------
+// The video page embeds its data in window.__APOLLO_STATE__ — but ONLY
+// when the request carries the anonymous cookie set the homepage sets on
+// a first visit (kpf/kpn/clientid/did — any fresh browser gets them; a
+// single did= alone gets the shell page, see kuaishouCookies). Plain
+// fetch works — no TLS impersonation needed — the cookie set is the
+// whole trick.
+// The photo's manifest lists direct mp4s (v1.kwaicdn.com, watermark-free,
+// H264 best; H265 second); some videos return HLS (.m3u8) instead and
+// are skipped — a video with no mp4 at all returns null, never a fake
+// button. Verified 2026-11-24: short-video/3x7edaa985qmhqy, 720x1280
+// h264 + AAC, 5,130,563 B, 12.1 s; v1.kwaicdn.com answers ACAO: *.
+function kuaishouPhotoId(u) {
+  try {
+    const m = new URL(u).pathname.match(/\/short-video\/([0-9A-Za-z]+)/);
+    return m ? m[1] : '';
+  } catch { return ''; }
+}
+async function resolveKuaishouShort(url, timeoutMs = 8000) {
+  // v.kuaishou.com/<code> and kuaishou.com/f/<code> 302 to the canonical
+  // short-video URL — follow the redirect, do not fetch the target.
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, { signal: ctrl.signal, redirect: 'manual', headers: { 'User-Agent': KUAISHOU_UA } });
+    const loc = r.headers.get('location') || '';
+    return loc ? kuaishouPhotoId(new URL(loc, url).href) : '';
+  } catch { return ''; } finally { clearTimeout(timer); }
+}
+async function kuaishouCookies(timeoutMs = 8000) {
+  // Mint one fresh anonymous cookie set per request: GET the homepage
+  // (it 302s; the cookies ride on the 302's own Set-Cookie) and keep
+  // ALL of them — not just the did. A single did= cookie alone gets
+  // the shell page (no VisionVideoDetailPhoto); the full set
+  // (kpf/kpn/clientid/did) gets the page with the video data. Never a
+  // login cookie — any fresh browser gets these on its first visit.
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch('https://www.kuaishou.com/', {
+      signal: ctrl.signal, redirect: 'manual',
+      headers: { 'User-Agent': KUAISHOU_UA, 'Accept-Language': 'zh-CN,zh;q=0.9' },
+    });
+    const pairs = [];
+    const list = (typeof r.headers.getSetCookie === 'function' ? r.headers.getSetCookie() : []) || [];
+    for (const c of list) {
+      const m = String(c).match(/^\s*([^=;,]+)=([^;,]*)/);
+      if (m) pairs.push(m[1].trim() + '=' + m[2].trim());
+    }
+    if (!pairs.length) {
+      const sc = r.headers.get('set-cookie') || '';
+      const m = sc.match(/(?:^|,)\s*did=([^;,]+)/);
+      if (m) pairs.push('did=' + m[1]);
+    }
+    return pairs.join('; ');
+  } catch { return ''; } finally { clearTimeout(timer); }
+}
+function resolveApolloRef(v, dc) {
+  let hops = 0;
+  while (v && typeof v === 'object' && v.type === 'id' && typeof v.id === 'string' && hops < 10) {
+    const next = dc[v.id];
+    if (!next || typeof next !== 'object') break;
+    v = next;
+    hops++;
+  }
+  return v;
+}
+async function kuaishouInfo(url, timeoutMs = 12000) {
+  let id = kuaishouPhotoId(url);
+  if (!id) {
+    id = await resolveKuaishouShort(url);
+    if (!id) return null;
+  }
+  // Kuaishou's edge closes connections from datacenter IPs now and then
+  // (SocketError: other side closed) — one retry with a fresh device id
+  // after a short pause covers the transient case. A second failure is
+  // treated as a block, not retried in a loop (retrying only resets the
+  // throttle window).
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt) await new Promise((ok) => setTimeout(ok, 3000));
+    const out = await kuaishouInfoOnce(id, timeoutMs);
+    if (out) return out;
+  }
+  return null;
+}
+async function kuaishouInfoOnce(id, timeoutMs = 12000) {
+  const cookies = await kuaishouCookies();
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  let html = '';
+  try {
+    const r = await fetch('https://www.kuaishou.com/short-video/' + id, {
+      signal: ctrl.signal, redirect: 'follow',
+      headers: {
+        'User-Agent': KUAISHOU_UA, 'Referer': 'https://www.kuaishou.com/',
+        'Accept-Language': 'zh-CN,zh;q=0.9',
+        ...(cookies ? { Cookie: cookies } : {}),
+      },
+    });
+    if (!r.ok) return null;
+    html = await r.text();
+    if (html.length > 3 * 1024 * 1024) return null;
+  } catch { return null; } finally { clearTimeout(timer); }
+  const state = extractJsonObject(html, 'window.__APOLLO_STATE__');
+  const dc = (state && state.defaultClient) || {};
+  const photo = dc['VisionVideoDetailPhoto:' + id] || {};
+  if (!photo || (!photo.manifest && !photo.photoUrl)) return null;
+  const cands = [];
+  const addManifest = (man) => {
+    man = resolveApolloRef(man, dc);
+    if (!man || typeof man !== 'object') return;
+    for (const aset of (man.adaptationSet || [])) {
+      const set = resolveApolloRef(aset, dc);
+      if (!set || typeof set !== 'object') continue;
+      for (const rep of (set.representation || [])) {
+        const r = resolveApolloRef(rep, dc);
+        if (!r || typeof r !== 'object') continue;
+        const urls = [];
+        for (const k of ['url', 'backupUrl']) {
+          const v = r[k];
+          if (v && typeof v === 'object' && Array.isArray(v.json)) urls.push(...v.json.filter((x) => typeof x === 'string'));
+          else if (typeof v === 'string') urls.push(v);
+          if (urls.length && k === 'url') break;
+        }
+        for (const u of urls) {
+          if (!u || /\.m3u8/i.test(u)) continue; // HLS is not a single file
+          const w = Number(r.width) || 0, h = Number(r.height) || 0;
+          cands.push({ q: Math.min(w, h) || h || 0, br: Number(r.avgBitrate) || 0, url: u });
+        }
+      }
+    }
+  };
+  addManifest(photo.manifest);
+  let mh = photo.manifestH265;
+  if (mh && typeof mh === 'object') mh = mh.json || mh;
+  addManifest(mh);
+  for (const k of ['photoUrl', 'photoH265Url']) {
+    if (photo[k] && /\.mp4/i.test(photo[k])) cands.push({ q: 0, br: 0, url: photo[k] });
+  }
+  cands.sort((a, b) => (b.q - a.q) || (b.br - a.br));
+  const best = cands[0];
+  if (!best) return null; // mp4-less video (HLS only, or removed): no fake button
+  let author = '';
+  for (const k of Object.keys(dc)) {
+    if (k.startsWith('VisionVideoDetailAuthor:')) { author = (dc[k] && dc[k].name) || ''; break; }
+  }
+  return {
+    source: 'kuaishou',
+    title: photo.caption || 'Kuaishou video',
+    thumbnail: photo.coverUrl || '',
+    duration: Math.round((Number(photo.duration) || 0) / 1000),
+    uploader: author,
+    previewUrl: best.url,
+    formats: [directFormat(best.url, best.q ? best.q + 'p' : 'Best quality')],
+  };
+}
+
+// ---- Haokan ---------------------------------------------------------------
+// The video page embeds window.__PRELOADED_STATE__.curVideoMeta with the
+// title, duration, poster, playurl and clarityUrl — one direct mp4 per
+// quality (sd/hd/sc/1080p/2k) on *.bdstatic.com, signed with auth_key.
+// The catch is the User-Agent: a desktop UA gets a 17 KB JS shell whose
+// state has NO curVideoMeta; an iPhone UA gets the ~46 KB server-rendered
+// page with it. Videos whose meta is encrypted (encrptedVideoMeta) have
+// no plain curVideoMeta and return null. Verified 2026-11-24:
+// v?vid=12828130032776245970, sd 640x360 h264 + AAC, 6,661,871 B, 136.1 s;
+// bdstatic.com answers ACAO: *.
+const HAOKAN_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
+function haokanVid(u) {
+  try { return new URL(u).searchParams.get('vid') || ''; } catch { return ''; }
+}
+async function haokanInfo(url, timeoutMs = 10000) {
+  const vid = haokanVid(url);
+  if (!vid) return null;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  let html = '';
+  try {
+    const r = await fetch('https://haokan.baidu.com/v?vid=' + encodeURIComponent(vid), {
+      signal: ctrl.signal, redirect: 'follow', headers: { 'User-Agent': HAOKAN_UA },
+    });
+    if (!r.ok) return null;
+    html = await r.text();
+    if (html.length > 3 * 1024 * 1024) return null;
+  } catch { return null; } finally { clearTimeout(timer); }
+  const state = extractJsonObject(html, 'window.__PRELOADED_STATE__');
+  const meta = (state && state.curVideoMeta) || null;
+  if (!meta || !meta.playurl) return null;
+  const rank = { '2k': 4, '1080p': 3, 'sc': 2, 'hd': 1, 'sd': 0 };
+  const label = { '2k': '2K', '1080p': '1080p', 'sc': 'Super clear', 'hd': 'HD', 'sd': 'SD' };
+  const formats = (Array.isArray(meta.clarityUrl) ? meta.clarityUrl : [])
+    .filter((c) => c && c.url && /\.mp4/i.test(c.url))
+    .sort((a, b) => (rank[b.key] ?? -1) - (rank[a.key] ?? -1))
+    .map((c) => ({
+      id: 'direct-' + (c.key || 'sd'), label: label[c.key] || c.key || 'Best quality',
+      ext: 'mp4', hasAudio: true, url: c.url,
+      filesize: Math.round((Number(c.videoSize) || 0) * 1024 * 1024),
+      note: 'With sound', kind: 'progressive',
+    }));
+  if (!formats.length) {
+    if (/\.mp4/i.test(meta.playurl)) formats.push(directFormat(meta.playurl, 'Best quality'));
+    else return null;
+  }
+  return {
+    source: 'haokan',
+    title: meta.title || 'Haokan video',
+    thumbnail: meta.poster || '',
+    duration: Number(meta.duration) || 0,
+    uploader: '',
+    previewUrl: formats[0].url,
+    formats,
+  };
+}
+
+// ---- Pear Video -----------------------------------------------------------
+// The video page itself carries no mp4; the player loads it from
+// videoStatus.jsp — GET .../videoStatus.jsp?contId=<id>&mrd=<random>
+// WITH Referer: the video page. Without the Referer it falsely answers
+// "article offline". The JSON's videoInfo.videos.srcUrl is the single
+// direct mp4 on video.pearvideo.com. That CDN sends NO ACAO header at
+// all, so the browser cannot fetch+blob it — the frontend's open-in-tab
+// fallback (already built for client-side platforms) is how the file
+// arrives; the note under the qualities says so. Verified 2026-11-24:
+// video_1808207, 406x720 h264 + AAC, 929,777 B, 9.5 s.
+function pearContId(u) {
+  try {
+    const m = new URL(u).pathname.match(/\/video_(\d+)/);
+    return m ? m[1] : '';
+  } catch { return ''; }
+}
+async function pearInfo(url, timeoutMs = 10000) {
+  const id = pearContId(url);
+  if (!id) return null;
+  const pageUrl = 'https://www.pearvideo.com/video_' + id;
+  const html = await fetchPageHtml(pageUrl);
+  // Pear pages carry no og:title — the <title> is
+  // "<video title>_一手Video-梨视频官网-Pear Video-梨网站", so the part
+  // before the first underscore is the video's title.
+  const titleTag = html ? ((html.match(/<title[^>]*>([^<]+)<\/title>/i) || [])[1] || '') : '';
+  const title = (html ? decodeEntities(ogTag(html, 'og:title')) : '') || titleTag.split('_')[0].trim();
+  const thumb = html ? ogTag(html, 'og:image') : '';
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const api = 'https://www.pearvideo.com/videoStatus.jsp?contId=' + encodeURIComponent(id) + '&mrd=' + Math.random();
+    const r = await fetch(api, {
+      signal: ctrl.signal, headers: { 'User-Agent': DOUYIN_UA, 'Referer': pageUrl },
+    });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const src = j && j.videoInfo && j.videoInfo.videos && j.videoInfo.videos.srcUrl;
+    if (!src || !/\.mp4/i.test(src)) return null;
+    // Pear's minted srcUrl is a timestamp-prefixed path that 404s —
+    // the real file lives at cont-<contId>-<num>-hd.mp4 (same <num>).
+    // Verified 2026-11-24 on videos 1808207 + 1808211: minted 404,
+    // cont-form 200 with valid mp4. HEAD-check, fail soft (no dead button).
+    const real = src.replace(/\/(\d+)-(\d+-hd\.mp4)$/, '/cont-' + id + '-$2');
+    const cands = real === src ? [real] : [real, src];
+    let okUrl = '';
+    for (const cand of cands) {
+      try {
+        const h = await fetch(cand, { method: 'HEAD', signal: ctrl.signal, headers: { 'User-Agent': DOUYIN_UA, 'Referer': pageUrl } });
+        if (h.ok) { okUrl = cand; break; }
+        // 404/4xx: try the next candidate.
+      } catch { okUrl = cand; break; } // HEAD itself failed (network) — trust the URL.
+    }
+    if (!okUrl) return null;
+    return {
+      source: 'pear',
+      title: title || 'Pear Video',
+      thumbnail: thumb || (j.videoInfo && j.videoInfo.video_image) || '',
+      duration: 0,
+      uploader: '',
+      previewUrl: okUrl,
+      formats: [directFormat(okUrl, 'Best quality')],
+    };
+  } catch { return null; } finally { clearTimeout(timer); }
+}
+
+// ---- Zhihu (zvideo) -------------------------------------------------------
+// GET https://www.zhihu.com/api/v4/zvideos/<id> — plain GET, no login —
+// returns the video JSON; video.playlist is keyed by quality (ld/sd/hd/
+// fhd), each a direct mp4 on vdn3.vzuu.com with width/height/size.
+// ld and sd share one file, so formats are de-duplicated by URL. The
+// CDN echoes the request Origin (ACAO), so fetch+blob works. Verified
+// 2026-11-24: zvideo/1342930761977176064, HD 1280x720 h264 + AAC,
+// 10,656,588 B (exactly the declared size), 146.3 s.
+function zhihuZid(u) {
+  try {
+    const m = new URL(u).pathname.match(/\/zvideo\/(\d+)/);
+    return m ? m[1] : '';
+  } catch { return ''; }
+}
+async function zhihuInfo(url, timeoutMs = 10000) {
+  const id = zhihuZid(url);
+  if (!id) return null;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch('https://www.zhihu.com/api/v4/zvideos/' + encodeURIComponent(id), {
+      signal: ctrl.signal, headers: { 'User-Agent': DOUYIN_UA },
+    });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const v = j && j.video;
+    if (!v || !v.playlist || typeof v.playlist !== 'object') return null;
+    const seen = new Set();
+    const rows = [];
+    for (const [key, p] of Object.entries(v.playlist)) {
+      if (!p || !p.url || !/\.mp4/i.test(p.url) || seen.has(p.url)) continue;
+      seen.add(p.url);
+      rows.push({ key, url: p.url, h: Number(p.height) || 0, size: Number(p.size) || 0 });
+    }
+    rows.sort((a, b) => b.h - a.h);
+    const formats = rows.map((f) => ({
+      id: 'direct-' + f.key, label: f.h ? f.h + 'p' : 'Best quality',
+      ext: 'mp4', hasAudio: true, url: f.url, filesize: f.size,
+      note: 'With sound', kind: 'progressive',
+    }));
+    if (!formats.length) return null;
+    return {
+      source: 'zhihu',
+      title: j.title || 'Zhihu video',
+      thumbnail: (v.cover_url || '') ,
+      duration: Math.round(Number(v.duration) || 0),
+      uploader: (j.author && j.author.name) || '',
+      previewUrl: formats[0].url,
+      formats,
+    };
+  } catch { return null; } finally { clearTimeout(timer); }
+}
+
 // ---- SEO: per-platform landing pages --------------------------------------
 // Visible brand stays neutral ("Save Video"). Keywords live in the <title>,
 // meta description, URL slug, intro text and FAQ — never in the logo or
@@ -2004,6 +2420,102 @@ const PLATFORMS = {
       ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
     ],
   },
+  kuaishou: {
+    name: 'Kuaishou',
+    keyword: 'Kuaishou video downloader',
+    title: 'Kuaishou Video Downloader — Save Kuaishou Videos as MP4 | Save Video',
+    description: 'Kuaishou video downloader: paste a Kuaishou video link, preview the video and save it as MP4 with sound. Free, no account, works on phone and PC.',
+    h1: 'Kuaishou videos in every quality',
+    intro: 'A free Kuaishou video downloader: paste the video link, preview the clip, and save it as MP4 with sound. Works with kuaishou.com short-video links, kwai.com links and v.kuaishou.com short links. No account, no app to install.',
+    example: 'https://www.kuaishou.com/short-video/3x7edaa985qmhqy',
+    faq: [
+      ['Is the Kuaishou video downloader free?', 'Yes — free, with no account and nothing to install.'],
+      ['Which Kuaishou links work?', 'Short-video links (kuaishou.com/short-video/…), kwai.com links and v.kuaishou.com short links work.'],
+      ['What qualities are available?', 'Kuaishou serves its videos as MP4 files with sound, in the quality they were uploaded — usually 720p.'],
+      ['Do I need a Kuaishou account?', 'No. Only the public video link is needed.'],
+      ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+    ],
+  },
+  haokan: {
+    name: 'Haokan',
+    keyword: 'Haokan video downloader',
+    title: 'Haokan Video Downloader — Save Haokan Videos as MP4 | Save Video',
+    description: 'Haokan video downloader: paste a Haokan video link, preview the video and save it in SD, HD, Super clear, 1080p or 2K as MP4 with sound. Free, no account, works on phone and PC.',
+    h1: 'Haokan videos in every quality',
+    intro: 'A free Haokan video downloader: paste the video link, preview the clip, and save it as MP4 with sound in SD, HD, Super clear, 1080p or 2K. No account, no app to install.',
+    example: 'https://haokan.baidu.com/v?vid=12828130032776245970',
+    faq: [
+      ['Is the Haokan video downloader free?', 'Yes — free, with no account and nothing to install.'],
+      ['Which Haokan links work?', 'Video page links (haokan.baidu.com/v?vid=…) work.'],
+      ['What qualities are available?', 'Haokan offers SD, HD, Super clear, 1080p and 2K as MP4 files with sound, depending on the video.'],
+      ['Do I need a Haokan account?', 'No. Only the public video link is needed.'],
+      ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+    ],
+  },
+  pear: {
+    name: 'Pear Video',
+    keyword: 'Pear Video downloader',
+    title: 'Pear Video Downloader — Save Pear Videos as MP4 | Save Video',
+    description: 'Pear Video downloader: paste a Pear Video link, preview the video and save it as MP4 with sound. Free, no account, works on phone and PC.',
+    h1: 'Pear Video videos in every quality',
+    intro: 'A free Pear Video downloader: paste the video link, preview the clip, and save it as MP4 with sound. Works with pearvideo.com video links. No account, no app to install.',
+    example: 'https://www.pearvideo.com/video_1808207',
+    faq: [
+      ['Is the Pear Video downloader free?', 'Yes — free, with no account and nothing to install.'],
+      ['Which Pear Video links work?', 'Video links (pearvideo.com/video_…) work.'],
+      ['What qualities are available?', 'Pear Video serves its videos as MP4 files with sound, in the quality they were uploaded.'],
+      ['Do I need a Pear Video account?', 'No. Only the public video link is needed.'],
+      ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+    ],
+  },
+  zhihu: {
+    name: 'Zhihu',
+    keyword: 'Zhihu video downloader',
+    title: 'Zhihu Video Downloader — Save Zhihu Videos as MP4 | Save Video',
+    description: 'Zhihu video downloader: paste a Zhihu video link, preview the video and save it in 480p, 720p or 1080p as MP4 with sound. Free, no account, works on phone and PC.',
+    h1: 'Zhihu videos in every quality',
+    intro: 'A free Zhihu video downloader: paste the video link, preview the clip, and save it as MP4 with sound in 480p, 720p or 1080p. Works with zhihu.com/zvideo/… links. No account, no app to install.',
+    example: 'https://www.zhihu.com/zvideo/1342930761977176064',
+    faq: [
+      ['Is the Zhihu video downloader free?', 'Yes — free, with no account and nothing to install.'],
+      ['Which Zhihu links work?', 'Video links (zhihu.com/zvideo/…) work.'],
+      ['What qualities are available?', 'Zhihu offers 480p, 720p and 1080p as MP4 files with sound, depending on the video.'],
+      ['Do I need a Zhihu account?', 'No. Only the public video link is needed.'],
+      ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+    ],
+  },
+  weibo: {
+    name: 'Weibo',
+    keyword: 'Weibo video downloader',
+    title: 'Weibo Video Downloader — Save Weibo Videos as MP4 | Save Video',
+    description: 'Weibo video downloader: paste a Weibo video link, preview the video and save it in 720p or 1080p as MP4 with sound. Free, no account, works on phone and PC.',
+    h1: 'Weibo videos in every quality',
+    intro: 'A free Weibo video downloader: paste the video link, preview the clip, and save it as MP4 with sound in 720p or 1080p. Works with weibo.com video links and m.weibo.cn status links. No account, no app to install.',
+    example: 'https://weibo.com/7827771738/N4xlMvjhI',
+    faq: [
+      ['Is the Weibo video downloader free?', 'Yes — free, with no account and nothing to install.'],
+      ['Which Weibo links work?', 'Video links (weibo.com/…/…) and mobile status links (m.weibo.cn/status/…) work.'],
+      ['What qualities are available?', 'Weibo offers 720p and 1080p as MP4 files with sound, depending on the video.'],
+      ['Do I need a Weibo account?', 'No. Only the public video link is needed.'],
+      ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+    ],
+  },
+  sohu: {
+    name: 'Sohu',
+    keyword: 'Sohu video downloader',
+    title: 'Sohu Video Downloader — Save Sohu Videos as MP4 | Save Video',
+    description: 'Sohu video downloader: paste a Sohu video link, preview the video and save it as MP4 with sound. Free, no account, works on phone and PC.',
+    h1: 'Sohu videos in every quality',
+    intro: 'A free Sohu video downloader: paste the video link, preview the clip, and save it as MP4 with sound. Works with tv.sohu.com video links. No account, no app to install.',
+    example: 'https://tv.sohu.com/v/dXMvNDQxNzU2MjE5LzY5NjY5MzkxNC5zaHRtbA==.html',
+    faq: [
+      ['Is the Sohu video downloader free?', 'Yes — free, with no account and nothing to install.'],
+      ['Which Sohu links work?', 'Video page links (tv.sohu.com/v/…) work.'],
+      ['What qualities are available?', 'Sohu offers its videos as MP4 files with sound, in the quality the video was uploaded.'],
+      ['Do I need a Sohu account?', 'No. Only the public video link is needed.'],
+      ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+    ],
+  },
 };
 
 function faqJsonLd(faq) {
@@ -2098,7 +2610,7 @@ app.get('/sitemap.xml', (req, res) => {
     urls.join('\n') + '\n</urlset>');
 });
 
-app.get('/:platform(youtube|tiktok|douyin|facebook|instagram|twitter|bluesky|tumblr|twitch|pinterest|moj|sharechat|linkedin|snapchat|tencent)', (req, res) => {
+app.get('/:platform(youtube|tiktok|douyin|facebook|instagram|twitter|bluesky|tumblr|twitch|pinterest|moj|sharechat|linkedin|snapchat|tencent|kuaishou|haokan|pear|zhihu|weibo|sohu)', (req, res) => {
   res.type('text/html').send(renderLanding(req.params.platform, req));
 });
 
@@ -2139,7 +2651,7 @@ app.post('/api/meta', rateLimit(30, 60000), async (req, res) => {
 app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
   let url = String(req.body && req.body.url || '').trim();
   if (!url || !(await validateUserUrl(url))) {
-    return res.status(400).json({ error: 'Please paste a valid video link from TikTok, Douyin, Facebook, Instagram, YouTube, X, Bluesky, Tumblr, Twitch, Pinterest, Moj, ShareChat, LinkedIn, Snapchat or Tencent Video.' });
+    return res.status(400).json({ error: 'Please paste a valid video link from TikTok, Douyin, Facebook, Instagram, YouTube, X, Bluesky, Tumblr, Twitch, Pinterest, Moj, ShareChat, LinkedIn, Snapchat, Tencent Video, Kuaishou, Haokan, Pear Video, Zhihu, Weibo or Sohu.' });
   }
   // TikTok short links: resolve the 301 to the canonical video URL
   // first (see resolveTikTokShort) so every stage below — cache,
@@ -2147,8 +2659,13 @@ app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
   if (isTikTok(url)) url = await resolveTikTokShort(url);
   // Douyin: signed CDN URLs live ~5 min, shorter than the 10-min info
   // cache — never serve a cached Douyin result, and never store one.
+  // Kuaishou: same treatment — its signed CDN URLs have no visible
+  // expiry, so they are resolved fresh on every request.
+  // Weibo: its CDN URLs live ~1 h, and Sohu's sig token is minted per
+  // request — both are likewise resolved fresh on every request.
   const isDouyin = clientSideKey(url) === 'douyin';
-  const cached = isDouyin ? null : cacheGet(url);
+  const noCacheKey = clientSideKey(url);
+  const cached = (isDouyin || noCacheKey === 'kuaishou' || noCacheKey === 'weibo' || noCacheKey === 'sohu') ? null : cacheGet(url);
   if (cached) return res.json(cached);
   // Hard 25s overall cap: whatever the extraction path does (tikwm,
   // page scrape, yt-dlp fallback rounds), /api/info ALWAYS answers
@@ -2172,6 +2689,24 @@ app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
       if (!result) throw new Error('Could not read this Douyin link. The video may be private, removed, or Douyin is blocking us right now.');
       result.clientSide = true;
       return { status: 200, body: result }; // no cacheSet: signed URLs live ~5 min
+    }
+    if (!result) {
+      // Kuaishou / Haokan / Pear Video / Zhihu: each has its own
+      // no-login lane (see the functions above). No yt-dlp fall-through:
+      // yt-dlp has no extractor for Kuaishou or Haokan, and the direct
+      // calls are faster than its Zhihu/Pear extractors — falling
+      // through could only burn time against the 25s cap. Fail fast
+      // with a clear error instead; the frontend retries the next region.
+      const cnKey = clientSideKey(url);
+      if (cnKey === 'kuaishou' || cnKey === 'haokan' || cnKey === 'pear' || cnKey === 'zhihu') {
+        const cnName = { kuaishou: 'Kuaishou', haokan: 'Haokan', pear: 'Pear Video', zhihu: 'Zhihu' }[cnKey];
+        const cnFn = { kuaishou: kuaishouInfo, haokan: haokanInfo, pear: pearInfo, zhihu: zhihuInfo }[cnKey];
+        result = await cnFn(url);
+        if (!result) throw new Error('Could not read this ' + cnName + ' link. The video may be private, removed, or ' + cnName + ' is blocking us right now.');
+        result.clientSide = true;
+        if (cnKey !== 'kuaishou') cacheSet(url, result); // Kuaishou: no cache (see above)
+        return { status: 200, body: result };
+      }
     }
     if (!result) {
       // Pinterest / Moj / ShareChat / Snapchat / Tumblr: the direct file
@@ -2226,6 +2761,17 @@ app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
       if (scrapeKey === 'twitch' && (info.duration || 0) > 7200) {
         return { status: 404, body: { error: 'This is a full Twitch broadcast (' + Math.round(info.duration / 3600) + 'h long). Broadcasts stream only and cannot be saved as one file — only short Twitch clips can be saved.' } };
       }
+      // Weibo + Sohu reach here through yt-dlp's own extractors (no
+      // dedicated lane above). Weibo: the extractor mints Weibo's
+      // anonymous first-visit guest token itself (fingerprint POST +
+      // callback, no account, no stored credentials — a plain no-cookie
+      // fetch is 302'd to the Sina Visitor System); its CDNs send no
+      // ACAO, so the browser opens the file in a new tab instead of
+      // fetch+blob (see the note below). Sohu: the extractor reads the
+      // page's vid, then hot.vrs.sohu.com (429s after ~6–8 rapid calls
+      // from one IP — one info call per paste keeps us under it) and the
+      // allot endpoint for a direct mp4; some Sohu videos are licensed
+      // to Mainland China only and fail per-video as geo-blocked.
       rawCacheSet(url, info);
       if (isClientSideOnly(url)) {
         // Direct files only — the visitor's browser downloads them itself.
@@ -2244,6 +2790,21 @@ app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
           clientSide: true,
           note: clientSideNote(url, info),
         };
+        if (scrapeKey === 'sohu') {
+          // Sohu: yt-dlp reports a bogus 2160p height (the 'high' file
+          // is really 960x540) — label by Sohu's own quality name
+          // instead. Its CDN URLs also come back http://, which an
+          // https page cannot preview or fetch (mixed content) — the
+          // same files serve over https with ACAO: *, so rewrite the
+          // scheme.
+          const sohuLabel = { nor: 'Normal', high: 'High', super: 'Super', ori: 'Original' };
+          const toHttps = (u) => String(u || '').replace(/^http:\/\/(video\d+\.vod\.tv\.itc\.cn\/)/, 'https://$1');
+          for (const f of result.formats) {
+            if (sohuLabel[f.id]) f.label = sohuLabel[f.id];
+            f.url = toHttps(f.url);
+          }
+          result.previewUrl = toHttps(result.previewUrl);
+        }
       } else {
         const formats = buildFormats(info, { noSeparateAudio: isTikTok(url) });
         if (!formats.length) return { status: 404, body: { error: 'No playable versions were found for this link.' } };
@@ -2258,7 +2819,8 @@ app.post('/api/info', rateLimit(30, 60000), async (req, res) => {
         };
       }
     }
-    cacheSet(url, result);
+    // Weibo / Sohu: signed URLs (see above) — never store the result.
+    if (noCacheKey !== 'weibo' && noCacheKey !== 'sohu') cacheSet(url, result);
     return { status: 200, body: result };
   } catch (e) {
     if (e.geoBlocked) {
@@ -2284,6 +2846,8 @@ function clientSideNote(url, info) {
   const key = clientSideKey(url);
   if (key === 'twitch') return 'Twitch clips only — full broadcasts stream only and cannot be saved as one file.';
   if (key === 'tumblr') return 'Only posts with a video uploaded to Tumblr work — GIFs and embedded YouTube/Vimeo players have no Tumblr file.';
+  if (key === 'pear') return 'Pear Video files open in a new tab to save — their server does not let the browser download the file directly.';
+  if (key === 'weibo') return 'Weibo files open in a new tab to save — their server does not let the browser download the file directly.';
   return '';
 }
 
