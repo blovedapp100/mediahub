@@ -1414,15 +1414,41 @@
     function upgradeSwap(data) {
       if (reqId !== latestReq || upgradeDone || !data || !Array.isArray(data.formats)) return false;
       var shown = formatsEl.querySelectorAll('li').length;
-      if (data.formats.length <= shown) return false;
+      if (data.formats.length <= shown) {
+        // YT-LONG FIX (2026-11-26): the job's list can be SHORTER yet
+        // better. The choc first list (10 video-only + audio = 11
+        // rows) is longer than the own full list (merged video+audio
+        // pairs, one file with sound = 7-9 rows), but the own list is
+        // the better one — so swap when the job brings a with-sound
+        // quality and the shown list has none. The shown list's notes
+        // are rendered as text in each <li> ("With sound" / "Video
+        // only" / "Sound only"), so the check reads them directly.
+        var jobHasSound = data.formats.some(function (f) { return f && f.hasAudio && f.label !== 'Audio only'; });
+        if (!jobHasSound) return false;
+        var shownHasSound = false;
+        var items = formatsEl.querySelectorAll('li');
+        for (var i = 0; i < items.length; i++) {
+          if ((items[i].textContent || '').indexOf('With sound') !== -1) { shownHasSound = true; break; }
+        }
+        if (shownHasSound) return false;
+        renderFormats(data);
+        return true;
+      }
       renderFormats(data);
       return true;
     }
     // Silent background job for the progressive upgrade: the same
-    // lookup with no sync cap, polled up to 60s; on ready it swaps in
+    // lookup with no sync cap, polled up to 180s; on ready it swaps in
     // the fuller list (upgradeSwap) and stops. Silent by design: no
-    // progress row, no error, never touches the preview player; stops
-    // on a newer request (reqId) or when a fuller list arrives.
+    // progress row, no error, never touches the playing preview
+    // player; stops on a newer request (reqId) or when a fuller list
+    // arrives. (The 60s cap was too short: the job lands at ~45-50s
+    // on Render after the WARP-pass skip, and at ~100s before it —
+    // YT-long fix 2026-11-26.) When the job's answer carries a
+    // previewStream (same-origin relay, with sound) and the visitor
+    // has not tapped play yet, the pending preview URL is updated to
+    // it — so the tap plays with sound. A video already playing is
+    // never swapped mid-play.
     // Job creation uses orderOriginsForJob (backups first, own origin
     // last — speed fix 1c); the 10s per-origin cap and the 429/400
     // early-break are unchanged.
@@ -1458,7 +1484,7 @@
       var poll = async function () {
         if (reqId !== latestReq) { upgradeStop(); return; }
         if (upgradeDone) return;
-        if (Date.now() - jobStart > 60000) { upgradeStop(); return; }
+        if (Date.now() - jobStart > 180000) { upgradeStop(); return; }
         var pr, pd;
         var pCtrl = new AbortController();
         var pTimer = setTimeout(function () { pCtrl.abort(); }, 10000);
@@ -1471,6 +1497,13 @@
         if (upgradeDone) return;
         if (pd && pd.status === 'ready' && pd.formats && pd.formats.length) {
           upgradeSwap(pd);
+          // YT-LONG FIX (2026-11-26): the job's answer carries the
+          // preview relay (with sound) when the first list's preview
+          // was the silent choc stream. Update the PENDING preview URL
+          // so a later tap plays with sound. Only when the visitor
+          // has not tapped yet (pendingYouTubePreview non-empty) — a
+          // video already playing is never swapped mid-play.
+          if (pd.previewStream && pendingYouTubePreview) pendingYouTubePreview = pd.previewStream;
           upgradeStop(); // job is done either way — nothing fuller left to show
           return;
         }
@@ -1495,8 +1528,10 @@
         // the SILENT upgrade flow — background-job route only (no
         // merge poll: /api/merge is a TikTok union, not a general
         // fuller list). It never shows an error or progress row, never
-        // touches the preview player, and stops on a newer request
-        // (reqId) or when a fuller list arrives (see startUpgradeJob).
+        // touches the playing preview player (it may update the pending
+        // tap-to-play URL — YT-long fix 2026-11-26), and stops on a
+        // newer request (reqId) or when a fuller list arrives (see
+        // startUpgradeJob).
         if (!isPartial) return;
       }
       if (platform === 'TikTok') {
@@ -1744,9 +1779,16 @@
         // egress IP and 403s / stalls on the visitor's phone, leaving
         // a black box. Show the still image + a play button; the
         // stream loads only when the visitor presses play.
+        // YT-LONG FIX (2026-11-26): prefer the same-origin relay
+        // (previewStream) when the server sent one — the YT-A proxy
+        // URL is unplayable cross-origin (CORP, no ACAO, no Range),
+        // so a tap on it did nothing (black, silent, "Nothing
+        // played"). The relay streams the same file with video
+        // headers, so the tap plays with sound. Falls back to the raw
+        // previewUrl (choc proxy / Piped) when no relay exists.
         resetPreviewPlayer();
         sizeFromThumb(data.thumbnail);
-        pendingYouTubePreview = data.previewUrl;
+        pendingYouTubePreview = data.previewStream || data.previewUrl;
         videoEl.style.display = 'none';
         if (playerWrap) playerWrap.classList.add('no-video');
         if (data.thumbnail) { thumbImg.src = data.thumbnail; thumbImg.style.display = ''; }
