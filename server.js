@@ -2385,6 +2385,58 @@ function withTimeout(promise, ms, msg) {
   ]);
 }
 
+// First-success race with a short grace window (YouTube speed fix
+// 2026-11-25). Each promise resolves to a FULL (non-degraded) result
+// or null; degraded results never settle the race — the caller keeps
+// the best degraded as a fallback instead. The first full result
+// wins, but a second result landing within ~500ms with a fuller list
+// (higher infoScore) replaces it, so a fast thin answer does not beat
+// an own full list that was a fraction behind it. A geo-block
+// rejection ends the race at once: no other lane in this region can
+// read the video, so waiting out the other side only burns the 25s
+// cap. Any other rejection counts as that side answering null.
+function raceFirstFull(promises, graceMs = 500) {
+  return new Promise((resolve, reject) => {
+    let best = null;
+    let done = 0;
+    let settled = false;
+    let graceTimer = null;
+    const finish = (v) => {
+      if (settled) return;
+      settled = true;
+      if (graceTimer) clearTimeout(graceTimer);
+      resolve(v);
+    };
+    const failGeo = (e) => {
+      if (settled) return;
+      settled = true;
+      if (graceTimer) clearTimeout(graceTimer);
+      reject(e);
+    };
+    if (!promises.length) { finish(null); return; }
+    promises.forEach((p) => {
+      Promise.resolve(p).then((v) => {
+        if (settled) return;
+        done++;
+        if (v && (!best || infoScore(v.info) > infoScore(best.info))) {
+          const isFirst = !best;
+          best = v;
+          if (isFirst && done < promises.length) {
+            graceTimer = setTimeout(() => finish(best), graceMs);
+            return;
+          }
+        }
+        if (done === promises.length) finish(best);
+      }, (e) => {
+        if (settled) return;
+        if (e && e.geoBlocked) { failGeo(e); return; }
+        done++;
+        if (done === promises.length) finish(best);
+      });
+    });
+  });
+}
+
 // Info lookup: OWN FIRST (standing rule 2026-11-24) — our own extraction runs before any third-party resolver. TikTok runs in TWO rounds —
 // direct first (8s), then the WARP proxy round (12s). Direct first, so
 // a host whose own IP works never hides behind the proxy; the proxy
@@ -2394,8 +2446,13 @@ function withTimeout(promise, ms, msg) {
 // WARP pass — measured 2026-11-24: concurrent clients each take ~17s
 // and are killed by the round caps, while one client alone takes
 // ~5-8s. The Invidious/Piped mirrors are pre-fetched alongside the
-// sequence (cheap HTTP, no yt-dlp process) but are only USED after
-// every own client and pass has failed — never mid-sequence.
+// sequence (cheap HTTP, no yt-dlp process) and RACED against it
+// (first full list wins, 500ms grace for a fuller second result) —
+// a mirror that answers in ~2s no longer waits behind passes that
+// nominally take 5 clients x 9s + 5 x 12s and are killed by the 25s
+// cap. A degraded mirror answer never settles the race (see
+// raceFirstFull): it waits as a fallback, as a degraded own answer
+// does.
 // A degraded (android-only, format 18) result is kept as a fallback
 // and never settles the lookup while a fuller list may still come.
 // TikTok: the plain client races two other API hostnames (the
@@ -2429,7 +2486,7 @@ async function ytdlpInfoWithFallbacks(url) {
     // finish inside the 12s round-2 cap was android, which returns just
     // format 18. That is exactly the "one quality" the owner saw.
     // Sequential: the first client usually answers with the full list
-    // in ~6s, inside the frontend's 10s per-origin budget for /api/info.
+    // in ~6s, inside the frontend's 27s per-origin budget for /api/info.
     const clients = [
       [], // default web client — full adaptive list when it answers
       ['--extractor-args', 'youtube:player_client=tv_embedded'], // full list
@@ -2439,8 +2496,8 @@ async function ytdlpInfoWithFallbacks(url) {
     ];
     let lastDetail = '';
     // Best degraded result across passes (see isDegradedInfo below) —
-    // returned only when no pass produced a full format list.
-    let fallback = null;
+    // returned only when no side produced a full format list.
+    let ownFallback = null;
     // Fast geo probe — resolves true (geo) or false (inconclusive)
     // within ~4s of starting. A yt-dlp probe CANNOT work: a single
     // android client takes 7.5–9.5s to surface the geo error (its player
@@ -2508,7 +2565,7 @@ async function ytdlpInfoWithFallbacks(url) {
     // ~2s, so a geo-blocked video fails here in ~2s instead of after
     // a 9s client timeout. The wait is capped at 2500ms, so a slow
     // probe costs normal videos at most 2.5s (a normal lookup still
-    // lands in ~8s, inside the frontend's 10s per-origin budget). If
+    // lands in ~8s, inside the frontend's 27s per-origin budget). If
     // the probe has not answered yet, the sequence starts anyway and
     // the per-client checks + race below catch it the moment it
     // resolves.
@@ -2520,16 +2577,35 @@ async function ytdlpInfoWithFallbacks(url) {
     // The Invidious/Piped mirrors are pre-fetched alongside the client
     // sequence (started here, after the probe's quiet window): cheap HTTP
     // fetches, no yt-dlp process, so they cost nothing. Bounded at 9s and
-    // never rejects, so a dead mirror cannot hang the sequence. Pre-fetch
-    // only — the result is USED only after both passes fail (see after the
-    // loop), never mid-sequence.
+    // never rejects, so a dead mirror cannot hang the sequence. The
+    // mirror is a RACE side now (raceFirstFull below), not a last
+    // resort: whichever of the mirror / own passes returns a FULL list
+    // first wins, so a round ends at the first success.
     let mirrorBest = null;
     const mirrorDone = withTimeout(mirrorInfo(url), 9000, 'mirror timeout')
       .then((info) => { if (info) mirrorBest = { info, clientArgs: null }; })
       .catch(() => {});
+    // Mirror race side: resolves to the mirror's FULL list, or null
+    // when the mirror is dead or degraded-only. mirrorBest keeps the
+    // raw mirror answer for the degraded-fallback comparison after
+    // the race.
+    const mirrorFullP = mirrorDone.then(() => {
+      if (mirrorBest && !isDegradedInfo(mirrorBest.info)) {
+        mirrorBest.viaProxy = false;
+        return mirrorBest;
+      }
+      return null;
+    });
     // Two passes: direct egress first, then the WARP proxy. Direct
     // first, so a host whose own IP works never hides behind the
     // proxy; the proxy only runs when direct fails.
+    // The passes run as runOwnPasses(), RACED against the mirror (see
+    // below): the first FULL list wins. A pass that only ever yields
+    // a degraded list resolves null — the best degraded list is kept
+    // in ownFallback and returned only when no side produced a full
+    // list at all. A geo-block still throws out of the passes and
+    // rejects the race at once (fail fast, no other lane can help).
+    const runOwnPasses = async () => {
     const passes = [{ allowProxy: false, timeout: 9000 }, { allowProxy: true, timeout: 12000 }];
     for (let pi = 0; pi < passes.length; pi++) {
       const pass = passes[pi];
@@ -2561,7 +2637,7 @@ async function ytdlpInfoWithFallbacks(url) {
           // is the bug. Keep it as a fallback and let the next client /
           // pass try for the full list; the fallback is returned only
           // if nothing does better.
-          if (!fallback || infoScore(info) > infoScore(fallback.info)) fallback = cand;
+          if (!ownFallback || infoScore(info) > infoScore(ownFallback.info)) ownFallback = cand;
         } catch (e) {
           lastDetail = (e && e.detail) || '';
           // Either geo signal fails fast: the probe (above), or the
@@ -2580,18 +2656,26 @@ async function ytdlpInfoWithFallbacks(url) {
       if (await probeGeo) geoThrow();
       if (isGeoBlocked(lastDetail)) geoThrow();
     }
-    // LAST RESORT (YouTube only): every own client and pass failed, so
-    // the pre-fetched mirror may answer. Order: own non-degraded >
-    // mirror full list > own degraded > error. The mirror is checked
-    // only here — never mid-sequence — so it can never beat an own
-    // result (own-first, 2026-11-24).
+    // Both passes ran without a full list: no full own result.
+    return null;
+    };
+    // FIRST-SUCCESS RACE (YouTube speed fix 2026-11-25): the mirror
+    // and the own passes run in parallel and the first FULL list
+    // wins, with a 500ms grace for a fuller second result. A degraded
+    // mirror answer (the only kind the surviving Piped host returns
+    // for this video) never settles the race — it waits as a fallback.
+    // Order when nothing is full: best degraded (own or mirror) >
+    // error. The old code used the mirror only after both passes
+    // failed (5 clients x 9s + 5 x 12s nominal), so a mirror that
+    // answered in ~2s was never reached inside the 25s cap.
+    const winner = await raceFirstFull([
+      runOwnPasses(),
+      mirrorFullP,
+    ], 500);
+    if (winner) return winner;
     await mirrorDone;
-    if (mirrorBest && !isDegradedInfo(mirrorBest.info)) {
-      mirrorBest.viaProxy = false;
-      return mirrorBest;
-    }
-    if (mirrorBest && (!fallback || infoScore(mirrorBest.info) > infoScore(fallback.info))) fallback = mirrorBest;
-    if (fallback) return fallback;
+    if (mirrorBest && (!ownFallback || infoScore(mirrorBest.info) > infoScore(ownFallback.info))) ownFallback = mirrorBest;
+    if (ownFallback) return ownFallback;
     const err = new Error('Could not read this link. The video may be private, removed, or the site is blocking us.');
     err.detail = lastDetail;
     if (isGeoBlocked(lastDetail)) err.geoBlocked = true;
@@ -2819,8 +2903,23 @@ async function fastMeta(url) {
 // mirrors that keep their own YouTube access. Each attempt is short (5s) and
 // fail-safe: a dead mirror just means "try the next one". Hosts are
 // configurable via INVIDIOUS_HOSTS / PIPED_HOSTS (comma-separated) for tests.
-const INVIDIOUS_HOSTS = (process.env.INVIDIOUS_HOSTS || 'https://invidious.privacyredirect.com,https://yewtu.be,https://inv.nadeko.net').split(',').map((s) => s.trim()).filter(Boolean);
-const PIPED_HOSTS = (process.env.PIPED_HOSTS || 'https://pipedapi.kavin.rocks,https://pipedapi-libre.kavin.rocks,https://pipedapi.leptons.xyz,https://api.piped.private.coffee').split(',').map((s) => s.trim()).filter(Boolean);
+// MIRROR HEALTH (measured 2026-11-25 from this machine, video Bgou81ffn5U):
+// every listed Invidious host was dead — invidious.privacyredirect.com
+// empty reply in 2.4s, yewtu.be 403 in 2.2s, inv.nadeko.net 403 in 1.9s
+// (extra candidates iv.melmac.space / vid.puffyan.us / invidious.0011.lt /
+// yt.ahwx.org also dead) — and of the Piped hosts only
+// api.piped.private.coffee answered 200 (2.4s, 22 KB, but only the
+// progressive 360p itag-18 stream for this video: a DEGRADED result, so
+// it can only ever be a fallback, never the race winner — see
+// isDegradedInfo). kavin.rocks + libre both timed out at 6s, leptons.xyz
+// 502, projectsegfau.lt "Piped has shutdown", adminforge.de 403,
+// reallyaweso.me 502, smnz.de timeout. Dead hosts are DROPPED from the
+// defaults: each one cost up to 5s of the 9s mirror budget while the
+// working host waited behind it. This machine's egress is not Render's,
+// so a host dropped here could in principle answer from Render — the
+// env vars above restore any host without a code change.
+const INVIDIOUS_HOSTS = (process.env.INVIDIOUS_HOSTS || '').split(',').map((s) => s.trim()).filter(Boolean);
+const PIPED_HOSTS = (process.env.PIPED_HOSTS || 'https://api.piped.private.coffee').split(',').map((s) => s.trim()).filter(Boolean);
 
 async function fetchJsonTimeout(url, timeoutMs) {
   const ctrl = new AbortController();
@@ -5777,6 +5876,10 @@ app.post('/api/info', rateLimit('info', 30, 60000), async (req, res) => {
     return res.status(out.status).json(out.body);
   } catch (e) {
     console.error('info timed out:', platformOf(url));
+    // YouTube-specific timeout message (2026-11-25): the generic
+    // "taking too long" text hid that the slow leg was YouTube. Other
+    // platforms keep the generic text.
+    if (isYouTube(url)) return res.status(502).json({ error: 'YouTube is slow to respond from our server right now - please try again' });
     return res.status(502).json({ error: 'This link is taking too long to read. Please try again.' });
   }
 });
