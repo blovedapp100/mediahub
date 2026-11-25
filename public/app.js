@@ -1042,8 +1042,20 @@
     var hasVideo = !!(data.previewUrl && videoEl);
     if (videoEl) {
       if (hasVideo) {
+        // v3: the result can render TWICE for one link (sync info, then
+        // the background-job result ~60s later). The second render
+        // reset the box and sized it from the (by then loaded) 9:16
+        // cover, while the video's 3:4 re-size never re-fired — setting
+        // the SAME src does not fire loadedmetadata again, and
+        // setupPreviewPlayer() early-returns once Plyr exists. So: if
+        // the stream's metadata is already here, size from the VIDEO
+        // right away; only fall back to the thumbnail while the stream
+        // is still loading (its loadedmetadata listener then overrides
+        // the thumb, as v2 intended).
+        var hadVideoMeta = !!(videoEl.videoWidth && videoEl.videoHeight);
         resetPreviewPlayer();
-        sizeFromThumb(); // keep the preview's size: the box must not shrink back while the stream loads
+        if (hadVideoMeta) sizePreviewPlayer();
+        else sizeFromThumb(); // keep the preview's size while the stream loads
         videoEl.referrerPolicy = 'no-referrer';
         videoEl.src = data.previewUrl;
         videoEl.poster = data.thumbnail || '';
