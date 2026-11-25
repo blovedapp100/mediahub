@@ -99,8 +99,15 @@
   // ~70vh tall, so a vertical clip fills the phone's width instead of
   // sitting in a narrow strip; the video is always shown whole — never
   // cropped, never stretched — whatever its shape: 9:16, 16:9, 1:1, 4:5.
-  function sizePreviewPlayerFromRatio(ratio) {
+  // The video's own ratio ALWAYS wins: a cover thumbnail can be a
+  // different crop from the video frame (TikTok cover 9:16, frame 3:4),
+  // so sizing from the thumbnail alone letterboxes the video. The
+  // thumbnail only sizes the box until the stream's metadata arrives;
+  // once the video has sized the box, the thumbnail never overrides it.
+  var previewVideoSized = false; // true once the stream's metadata sized the box
+  function sizePreviewPlayerFromRatio(ratio, fromVideo) {
     if (!ratio || !playerWrap) return;
+    if (!fromVideo && previewVideoSized) return; // the video's ratio already won
     var availW = playerWrap.parentElement ? playerWrap.parentElement.clientWidth : 0;
     var isPhone = window.innerWidth <= 600;
     var maxH = Math.round(window.innerHeight * 0.70);
@@ -108,13 +115,17 @@
     if (!isPhone) w = Math.min(w, availW * 0.55); // keep room for the meta column
     if (w < 200) w = 200; // Plyr's own minimum width
     playerWrap.style.width = Math.round(w) + 'px';
-    playerWrap.style.height = Math.round(w / ratio) + 'px';
+    // aspect-ratio, not an explicit height: the height follows the width,
+    // so the box keeps the right shape even if the layout width settles
+    // later (a stale pixel height is what cropped the X preview).
+    playerWrap.style.aspectRatio = String(ratio);
+    if (fromVideo) previewVideoSized = true;
     previewSized = true;
   }
 
   function sizePreviewPlayer() {
     if (!videoEl || !videoEl.videoWidth || !videoEl.videoHeight) return;
-    sizePreviewPlayerFromRatio(videoEl.videoWidth / videoEl.videoHeight);
+    sizePreviewPlayerFromRatio(videoEl.videoWidth / videoEl.videoHeight, true);
   }
 
   // Size from the thumbnail: it loads in under a second and carries the
@@ -160,9 +171,11 @@
   function resetPreviewPlayer() {
     pausePreviewPlayer();
     previewSized = false;
+    previewVideoSized = false;
     if (playerWrap) {
       playerWrap.style.width = '';
       playerWrap.style.height = '';
+      playerWrap.style.aspectRatio = '';
       playerWrap.classList.remove('no-video');
     }
   }
