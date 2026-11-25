@@ -304,14 +304,88 @@ function setDownloadHeaders(res, title, ext, contentType) {
   }
 }
 
+// PREVIEW RELAY headers (YT-long fix 2026-11-26): an inline <video>
+// preview needs the file served as video, NOT as a download —
+// Content-Disposition: attachment makes the browser refuse to play it
+// inline. No Range support (the upstream proxies ignore Range, so a
+// 206 would be a lie); the browser plays from the start, which is
+// what a preview does.
+function setPreviewHeaders(res, contentType) {
+  res.setHeader('Content-Type', contentType);
+  res.setHeader('Accept-Ranges', 'none');
+  res.setHeader('Cache-Control', 'no-store');
+}
+
+// Hostname of a URL, '' when it is not a URL at all.
+function hostOfUrl(u) {
+  try { return new URL(String(u || '')).hostname.toLowerCase(); } catch { return ''; }
+}
+
+// A preview URL is UNPLAYABLE in a visitor's <video> element when its
+// host (a) sends no CORS headers / blocks cross-origin reads, or (b)
+// is signed for the server's egress IP. Measured 2026-11-26:
+//   - ytdownloader.tech: CORP: same-origin, no ACAO, ignores Range,
+//     Content-Disposition: attachment — black, silent, unplayable.
+//   - *.googlevideo.com: signed for the server's IP — 403s from the
+//     visitor's browser (the frontend already knew this: the YouTube
+//     lazy-preview comment says googlevideo 403s/stalls on the phone).
+// Playable hosts (choc proxy: ACAO: *, Accept-Ranges: bytes; TikTok
+// CDN; Facebook/Instagram CDNs) need no relay.
+function isUnplayablePreviewHost(u) {
+  const h = hostOfUrl(u);
+  return h === 'ytdownloader.tech' || h === 'googlevideo.com' || h.endsWith('.googlevideo.com');
+}
+
+// Same-origin relay URL for a format whose direct URL is unplayable
+// cross-origin. /api/save?preview=1 streams the file through the
+// server with video headers (never a 302, never a download header).
+// This is the PREVIEW only — the Save button keeps the cache-first
+// 302 (the 302-vs-filename decision is unchanged).
+function previewRelayUrl(url, formatId, title) {
+  return '/api/save?url=' + encodeURIComponent(url) + '&formatId=' + encodeURIComponent(formatId) +
+    '&t=' + encodeURIComponent(title || 'video') + '&preview=1';
+}
+
+// Attach previewStream to a GENERIC (buildFormats) result: when the
+// preview URL's host is unplayable cross-origin (YT-A proxy /
+// googlevideo), the frontend plays the same-origin relay instead.
+// The relay uses the SMALLEST with-sound public format (usually itag
+// 18, 360p) — NOT the preview URL's format, which is the HIGHEST
+// with-sound quality (e.g. a 2160p60 merged pair): relaying that
+// would ffmpeg-merge a ~200 MB file before the preview could start.
+// A 360p preview starts in seconds and the player is small; the
+// quality list still offers every higher quality for saving.
+// Preference: a single (non-merged) with-sound format first (it
+// streams directly, no ffmpeg), else the smallest merged pair.
+// No-op when no with-sound format exists, or when the preview URL is
+// already playable (choc proxy, TikTok/FB/IG CDNs).
+function attachPreviewStream(result, url) {
+  if (!result || !isYouTube(url) || !Array.isArray(result.formats)) return;
+  if (!isUnplayablePreviewHost(result.previewUrl || '')) return;
+  const heightOf = (f) => {
+    const m = String(f.label || '').match(/(\d{3,4})p/);
+    return m ? parseInt(m[1], 10) : 0;
+  };
+  const withSound = result.formats.filter((f) => f && f.url && f.hasAudio && f.label !== 'Audio only');
+  if (!withSound.length) return;
+  const single = withSound.filter((f) => String(f.id || '').indexOf('+') === -1);
+  const pool = single.length ? single : withSound;
+  pool.sort((a, b) => heightOf(a) - heightOf(b));
+  const pick = pool[0];
+  if (!pick || !pick.id) return;
+  result.previewStream = previewRelayUrl(url, pick.id, result.title);
+}
+
 // Stream a direct file URL straight to the client. Returns true when the
 // download started, false when the URL did not answer — the caller then
 // falls back to the yt-dlp save. Headers are only set after the fetch
-// succeeds, so a failed attempt commits nothing.
-async function streamThrough(res, streamUrl, title, ext, contentType) {
+// succeeds, so a failed attempt commits nothing. isPreview serves the
+// file as inline video (preview relay) instead of a download.
+async function streamThrough(res, streamUrl, title, ext, contentType, isPreview) {
   const r = await fetch(streamUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
   if (!r.ok || !r.body) return false;
-  setDownloadHeaders(res, title, ext, contentType);
+  if (isPreview) setPreviewHeaders(res, contentType);
+  else setDownloadHeaders(res, title, ext, contentType);
   const reader = r.body.getReader();
   try {
     for (;;) {
@@ -338,7 +412,7 @@ async function streamThrough(res, streamUrl, title, ext, contentType) {
 // flowing on a fast egress; on a throttled egress the first byte waits
 // for the first video fragment (measured 11.4s on this VM's throttled
 // googlevideo path — download-rate-bound, not code-bound).
-async function tryStreamMerged(res, title, videoUrl, audioUrl, proxyArgs) {
+async function tryStreamMerged(res, title, videoUrl, audioUrl, proxyArgs, isPreview) {
   return new Promise((resolve) => {
     let sent = false;
     let settled = false;
@@ -362,7 +436,11 @@ async function tryStreamMerged(res, title, videoUrl, audioUrl, proxyArgs) {
     yv.stdout.pipe(ff.stdio[3]);
     ya.stdout.pipe(ff.stdio[4]);
     ff.stdout.on('data', (chunk) => {
-      if (!sent) { setDownloadHeaders(res, title, 'mp4', 'video/mp4'); sent = true; }
+      if (!sent) {
+        if (isPreview) setPreviewHeaders(res, 'video/mp4');
+        else setDownloadHeaders(res, title, 'mp4', 'video/mp4');
+        sent = true;
+      }
       if (!res.write(chunk)) ff.stdout.pause();
     });
     res.on('drain', () => { try { ff.stdout.resume(); } catch {} });
@@ -940,14 +1018,19 @@ async function fbChain(url, budgetLeft) {
     [(t) => freeapiInfo(url, t), 12000],
   ], budgetLeft);
   if (!r) return null;
-  // FACEBOOK (2026-11-25): every video file Facebook returns is
+  // FACEBOOK (2026-11-25): most video files Facebook returns are
   // video-only (ffprobe-proven); the sound is a separate track the
   // chain surfaces as an audio row when it has one. The lanes assert
   // hasAudio:true on the video rows — correct that here so the site
   // never promises sound on a silent file. (The 'Audio only' rows keep
   // hasAudio:true — they are the sound.)
+  // EXCEPTION (2026-11-26, ffprobe-proven on a live download):
+  // xcasper's files DO carry real audio (HE-AAC stereo, mean -16.1 dB,
+  // max -5.5 dB on the 5,202,168 B HD file) — never override those.
   for (const f of (r.formats || [])) {
-    if (f && f.ext === 'mp4' && f.label !== 'Audio only') { f.hasAudio = false; f.note = 'Video only'; }
+    if (!f || f.ext !== 'mp4' || f.label === 'Audio only') continue;
+    if (String(f.id || '').startsWith('xc-')) { f.hasAudio = true; f.note = 'With sound'; continue; }
+    f.hasAudio = false; f.note = 'Video only';
   }
   return r;
 }
@@ -1170,8 +1253,12 @@ async function invidiousChocInfo(url, timeoutMs) {
         label: f.qualityLabel || (f.height ? f.height + 'p' : 'Video'),
         ext: 'mp4', note: 'Video only', url: proxy,
       });
-    } else if (isAud && cont === 'mp4') {
-      if (!bestAudio || (f.bitrate || 0) > (bestAudio.bitrate || 0)) bestAudio = { itag: f.itag, bitrate: f.bitrate || 0 };
+    } else if (isAud && (cont === 'mp4' || cont === 'm4a')) {
+      // Bitrate is a STRING in the API response ("130875" < "50200"
+      // lexicographically) — compare numerically or the lowest-bitrate
+      // audio wins. (YT-long fix 2026-11-26: this picked itag 139
+      // 50 kbps over itag 140 130 kbps.)
+      if (!bestAudio || (Number(f.bitrate) || 0) > (Number(bestAudio.bitrate) || 0)) bestAudio = { itag: f.itag, bitrate: f.bitrate || 0 };
     }
   }
   if (bestAudio) {
@@ -1200,36 +1287,128 @@ async function cobaltRue(url, timeoutMs) {
   };
 }
 
+// ---- YouTube resolver chain: merge + preview helpers (YT-long fix) ----
+
+// Merge several chain-lane answers into ONE info object: the union of
+// every lane's formats, deduped by id. Chain formats carry no
+// vcodec/acodec/height (only id/label/ext/url), so buildFormats would
+// collapse them all into one "Best quality" row and pair them into
+// merged ids chainStreamUrl cannot resolve — the union is returned
+// as-is (like the old ytChain early return) and never goes through
+// buildFormats.
+function mergeChainAnswers(answers) {
+  const seen = new Set();
+  const formats = [];
+  let title = '';
+  for (const a of answers) {
+    if (!a) continue;
+    if (!title && a.title) title = a.title;
+    for (const f of (Array.isArray(a.formats) ? a.formats : [])) {
+      if (!f || !f.url || !f.id) continue;
+      const id = String(f.id);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      formats.push(f);
+    }
+  }
+  if (!formats.length) return null;
+  return { title: title || 'Video', formats };
+}
+
+// Height of a chain format, from its label ("1080p60", "720p", "360p").
+function chainFormatHeight(f) {
+  const m = String((f && f.label) || '').match(/(\d{3,4})p/);
+  return m ? parseInt(m[1], 10) : 0;
+}
+
+// Pick the preview format from a CHAIN answer: a progressive
+// (with-sound) file first (YT-A yd-, y2mate ym-, cobalt cb-), else the
+// highest video-only mp4 (choc). Chain formats carry no height field,
+// so the label decides.
+function chainPreviewFormat(formats) {
+  const list = (Array.isArray(formats) ? formats : []).filter((f) => f && f.url);
+  if (!list.length) return null;
+  const prog = list
+    .filter((f) => /^(yd|ym|cb)-/.test(String(f.id || '')))
+    .sort((a, b) => chainFormatHeight(b) - chainFormatHeight(a))[0];
+  if (prog) return prog;
+  return list
+    .filter((f) => String(f.ext || '').toLowerCase() === 'mp4')
+    .sort((a, b) => chainFormatHeight(b) - chainFormatHeight(a))[0] || list[0];
+}
+
+// Set previewUrl (+ previewStream when the pick is unplayable
+// cross-origin) on a chain answer body. The choc proxy URL is playable
+// as-is (ACAO: *, Range); the YT-A proxy URL is not (CORP, no ACAO,
+// no Range) so it gets the same-origin relay.
+function attachChainPreview(body, url) {
+  const pick = chainPreviewFormat(body.formats);
+  if (!pick) { body.previewUrl = ''; return; }
+  body.previewUrl = pick.url;
+  if (isUnplayablePreviewHost(pick.url)) {
+    body.previewStream = previewRelayUrl(url, pick.id, body.title);
+  }
+}
+
+// A chain list is THIN when it has fewer than 8 formats or tops out
+// below 720p (same bar as isLimitedList, but reading the label height
+// chain formats carry). A thin chain answer is marked partial:true so
+// the frontend still starts the silent upgrade job.
+function chainListIsThin(formats) {
+  const list = Array.isArray(formats) ? formats : [];
+  if (list.length < 8) return true;
+  let maxH = 0;
+  for (const f of list) { const h = chainFormatHeight(f); if (h > maxH) maxH = h; }
+  return maxH < 720;
+}
+
 async function ytChain(url, budgetLeft, ydPrefetch, chocPrefetch) {
   const vid = youtubeId(url);
   if (!vid) return null;
-  // Pre-started Resolver A resolve (step 17): await it first — it has
-  // been running since the own branch started, so a 20-24s resolve
-  // for a long video can still finish inside the cap.
+  // YT-LONG FIX (2026-11-26): the old code awaited ydPrefetch FIRST
+  // and returned it immediately when non-null — even a THIN 1-format
+  // answer — so the fuller choc list (already in hand) was discarded
+  // and the job completed with the same single 360p format (verified
+  // live 2026-11-26: job 0ef78cfe ready at ~100s with formats=1).
+  // Await BOTH prefetches (they run in parallel since lookupInfo
+  // started them) and the remaining lanes, then return the UNION —
+  // the fullest saveable answer. y2mate/cobalt are dead right now
+  // (auth null / HTTP 400, measured 2026-11-26), so the union is
+  // choc (up to 1080p60 video-only + audio) + YT-A (360p with sound)
+  // in practice; a recovered lane joins the union automatically.
+  const answers = [];
   if (ydPrefetch) {
     try {
       const r = await withTimeout(ydPrefetch, Math.max(0, budgetLeft()), 'prefetch timeout');
-      if (r) return r;
+      if (r) answers.push(r);
     } catch {}
   }
-  // Pre-started YT-C (Invidious choc) metadata (speed fix 2026-11-25):
-  // the same prefetch treatment as YT-A — choc is the only full-range
-  // mirror (adaptive up to 2160p, ~7-10s), but ytChain only runs after
-  // own failure with ~0-4s budget left, so the lane never ran. Started
-  // alongside the own branch in lookupInfo; awaited here second, so a
-  // long own failure still leaves its answer in hand.
   if (chocPrefetch) {
     try {
       const r = await withTimeout(chocPrefetch, Math.max(0, budgetLeft()), 'prefetch timeout');
-      if (r) return r;
+      if (r) answers.push(r);
     } catch {}
   }
-  return runChain([
-    [(t) => ytdownloaderTech(url, t), 20000],
+  // Remaining lanes that were NOT prefetch-started (y2mate, cobalt —
+  // both dead right now, they fail fast in ~2-5s). The fresh YT-A /
+  // choc resolves are skipped when the prefetches already answered:
+  // they are the same endpoints, so a fresh resolve would cost ~20s
+  // for a duplicate. Only when BOTH prefetches came back empty is the
+  // full chain retried (a prefetch can fail while a fresh call works
+  // if the instance was briefly down).
+  const rest = await runChain([
     [(t) => y2mateEta(url, t), 20000],
-    [(t) => invidiousChocInfo(url, t), 18000],
     [(t) => cobaltRue(url, t), 15000],
   ], budgetLeft);
+  if (rest) answers.push(rest);
+  if (!answers.length) {
+    const retry = await runChain([
+      [(t) => ytdownloaderTech(url, t), 20000],
+      [(t) => invidiousChocInfo(url, t), 18000],
+    ], budgetLeft);
+    if (retry) answers.push(retry);
+  }
+  return mergeChainAnswers(answers);
 }
 
 // ---- Western social: platform's OWN public APIs as own lanes ----------
@@ -2499,6 +2678,7 @@ async function ytdlpInfoWithFallbacks(url, opts = {}) {
   // the YT-A resolve started alongside the own branch (lookupInfo).
   const fastPartial = !opts || opts.fastPartial !== false;
   const ydPrefetchOpt = (opts && opts.ydPrefetch) || null;
+  const chocPrefetchOpt = (opts && opts.chocPrefetch) || null;
   const wrapErr = (e) => {
     const err = new Error('Could not read this link. The video may be private, removed, or the site is blocking us.');
     err.detail = (e && e.errors && e.errors.map((x) => x && x.detail).filter(Boolean).join(' | ')) || (e && e.detail) || '';
@@ -2713,6 +2893,22 @@ async function ytdlpInfoWithFallbacks(url, opts = {}) {
       if (!fastPartial || !ydPrefetchOpt) return new Promise(() => {});
       const r = await ydPrefetchOpt;
       if (!r || !Array.isArray(r.formats) || !r.formats.length || !r.formats[0].url) return new Promise(() => {});
+      // YT-LONG FIX (2026-11-26): YT-A's single-format answer must
+      // not win the race over choc's FULL list just by being ~0.5s
+      // faster (measured: YT-A won a cold run at ~1.5s and the first
+      // list was 1 format). Give choc a 1.5s grace to land after YT-A
+      // before settling: choc (~2s) usually lands inside it, so the
+      // first list is the full list; when choc is down/slow the grace
+      // expires and YT-A settles alone. The grace is ONE-SIDED (only
+      // ydFastP waits) so the two sides can never deadlock — choc
+      // settles the moment it resolves.
+      if (chocPrefetchOpt) {
+        const chocWon = await Promise.race([
+          chocPrefetchOpt.then((x) => (x && Array.isArray(x.formats) && x.formats.length) ? 'choc' : 'no'),
+          new Promise((ok) => setTimeout(() => ok('grace'), 1500)),
+        ]).catch(() => 'no');
+        if (chocWon === 'choc') return new Promise(() => {}); // choc wins — chocFastP settles it
+      }
       const f = r.formats[0];
       const h = parseInt(String(f.label || '').replace(/[^0-9]/g, ''), 10) || 0;
       const info = {
@@ -2736,6 +2932,39 @@ async function ytdlpInfoWithFallbacks(url, opts = {}) {
       };
       return { info, clientArgs: null, viaProxy: false, partial: true };
     })();
+    // YT-LONG FIX (2026-11-26): the choc (Invidious) metadata was
+    // pre-started alongside the own branch in lookupInfo but never
+    // raced here — it only ran inside ytChain AFTER own failure, with
+    // ~0-4s budget left. Choc's metadata answers in ~1.5-2s with the
+    // FULL adaptive list (10 mp4 video-only up to 1080p60 + best
+    // audio m4a) and its proxy files DO download (9.1 MB in 8.9s at
+    // ~1 MB/s, 720p60 66 MB in 30.7s at ~2.1 MB/s, both with a plain
+    // browser UA — measured 2026-11-26; the old "~55s for 322 KB"
+    // probe is stale). Racing it here makes the first list the FULL
+    // list in ~2.5s on Render, instead of YT-A's thin 1-format list
+    // in ~20s. The answer is marked partial:true (no progressive
+    // format in it — the preview is the choc video-only stream,
+    // silent) so the frontend still starts the silent upgrade job,
+    // which returns the union (choc + YT-A progressive) and the
+    // preview relay with sound. Sync path only (fastPartial): on the
+    // job path the lookup waits for the full own list instead.
+    // The info is returned as a CHAIN answer (chainAnswer): its
+    // formats carry no vcodec/acodec/height, so buildFormats would
+    // collapse all 10 video rows into one "Best quality" row with id
+    // "undefined" and pair them into merged ids chainStreamUrl cannot
+    // resolve — lookupInfo returns chain answers as-is, like ytChain.
+    // skipProgRescue: the android rescue (fetchAndroidProg, 12s cap)
+    // would block this ~2.5s answer for 12s on Render and its itag-18
+    // URL is IP-bound anyway (unplayable in the browser); the
+    // progressive format arrives via the upgrade job instead.
+    const chocFastP = (async () => {
+      if (!fastPartial || !chocPrefetchOpt) return new Promise(() => {});
+      const r = await chocPrefetchOpt;
+      if (!r || !Array.isArray(r.formats) || !r.formats.length) return new Promise(() => {});
+      // Settles the moment choc resolves (no grace — the grace lives
+      // one-sided in ydFastP so the two sides can never deadlock).
+      return { info: { ...r, chainAnswer: true }, clientArgs: null, viaProxy: false, partial: true, skipProgRescue: true };
+    })();
     // Two passes: direct egress first, then the WARP proxy. Direct
     // first, so a host whose own IP works never hides behind the
     // proxy; the proxy only runs when direct fails.
@@ -2749,6 +2978,16 @@ async function ytdlpInfoWithFallbacks(url, opts = {}) {
     const passes = [{ allowProxy: false, timeout: 9000 }, { allowProxy: true, timeout: 12000 }];
     for (let pi = 0; pi < passes.length; pi++) {
       const pass = passes[pi];
+      // YT-LONG FIX (2026-11-26): on the JOB path (fastPartial false)
+      // skip the WARP pass once the direct pass produced nothing. The
+      // live job took ~105s (direct 45s + WARP 60s) and still returned
+      // 1 format — the WARP egress (Cloudflare datacenter IP) is
+      // blocked for YouTube exactly like Render's own IP, so the pass
+      // burns 60s for nothing; the ytChain union is the job's answer.
+      // A geo-blocked video never reaches here (the probe throws
+      // first), so the WARP pass loses no geo coverage. The SYNC path
+      // keeps the WARP pass (bounded by the 25s cap).
+      if (pi === 1 && !fastPartial) return null;
       for (const args of clients) {
         // The lookup already answered (a fast partial side settled the
         // race): do not start another client for it — the in-flight
@@ -2831,6 +3070,7 @@ async function ytdlpInfoWithFallbacks(url, opts = {}) {
       mirrorDegradedP,
       ownDegradedP,
       ydFastP,
+      chocFastP,
     ]);
     raceSettled = true;
     // PREVIEW SOUND (2026-11-25): the winner's list can be DASH-only
@@ -2923,7 +3163,11 @@ async function ytdlpInfoWithFallbacks(url, opts = {}) {
     };
     if (winner) {
       const wf = Array.isArray(winner.info && winner.info.formats) ? winner.info.formats : [];
-      winner.info.formats = await ensureProgressive(wf, winner.viaProxy);
+      // YT-LONG FIX: a chain winner (choc) skips the progressive
+      // rescue — the android pass would cost 12s on Render and its
+      // itag-18 URL is IP-bound (no playable preview from it); the
+      // progressive format + relay arrive via the upgrade job.
+      winner.info.formats = winner.skipProgRescue ? wf : await ensureProgressive(wf, winner.viaProxy);
       if (!winner.partial && isLimitedList(winner.info.formats)) winner.partial = true;
       return winner;
     }
@@ -5879,7 +6123,7 @@ try {
       // FAST-QUALITY opts (2026-11-25): the sync path (25s budget) may
       // settle a partial first list; the job path (300s) waits for the
       // full list so the silent upgrade can actually deliver one.
-      const fqOpts = { fastPartial: timeoutMs <= 25000, ydPrefetch };
+      const fqOpts = { fastPartial: timeoutMs <= 25000, ydPrefetch, chocPrefetch };
       // FAST FIRST (2026-11-25): Facebook/Instagram on the SYNC path
       // race the chain in parallel with own yt-dlp — the chain's
       // fastest lane (xcasper ~3s FB, curl-x ~2-4s IG) is the first
@@ -5959,6 +6203,30 @@ try {
     // SSSTik also found nothing — there is no fifth route. info stays
     // null for the honest error below instead of burning the 25s cap
     // on a repeat run.
+    // YT-LONG FIX (2026-11-26): a CHAIN answer (chocFastP winner) is
+    // returned as-is, like the ytChain early return below. Its formats
+    // carry no vcodec/acodec/height, so buildFormats would collapse
+    // all 10 video rows into one "Best quality" row with id
+    // "undefined" and pair them into merged ids chainStreamUrl cannot
+    // resolve. The formats are already public (ch- ids, saveable via
+    // /api/save's chain branch). The preview is the choc video-only
+    // stream (playable: ACAO: *, Range) — no relay needed, so no
+    // previewStream is set here; the upgrade job adds the YT-A
+    // progressive format + the relay.
+    if (info && info.chainAnswer) {
+      const body = {
+        title: stripTitleCounts(info.title) || 'Video',
+        titleOrigin: 'third-party',
+        thumbnail: info.thumbnail || '',
+        duration: info.duration || 0,
+        uploader: info.uploader || '',
+        formats: info.formats,
+        partial: true,
+      };
+      attachChainPreview(body, url);
+      rawCacheSet(url, info, CHAIN_CACHE_TTL_MS);
+      return { status: 200, body };
+    }
     // NO PUBLIC STREAM (TikTok only): every lane agreed the video has
     // no stream to fetch — tikwm returned no video, SSSTik could not
     // resolve it, and yt-dlp's own verdict was "No video formats
@@ -6016,7 +6284,15 @@ try {
     // fails FAST (see REPORT.md).
     if (!info && isYouTube(url)) {
       const yt = await ytChain(url, budgetLeft, ydPrefetch, chocPrefetch);
-      if (yt) { yt.titleOrigin = 'third-party'; rawCacheSet(url, yt, CHAIN_CACHE_TTL_MS); return { status: 200, body: yt }; }
+      if (yt) {
+        yt.titleOrigin = 'third-party';
+        attachChainPreview(yt, url);
+        // A thin union (e.g. YT-A alone, 1 format) is partial so the
+        // frontend still starts the silent upgrade job.
+        if (chainListIsThin(yt.formats)) yt.partial = true;
+        rawCacheSet(url, yt, CHAIN_CACHE_TTL_MS);
+        return { status: 200, body: yt };
+      }
     }
     if (!info) throw new Error('Could not read this link. The video may be private, removed, or the site is blocking us.');
     // Twitch VOD guard: full broadcasts are hours long and stream-only
@@ -6106,6 +6382,10 @@ try {
   // body (and in the /api/job ready body, which reuses it) so the
   // frontend can recognise it and upgrade it silently.
   if (infoPartial && result) result.partial = true;
+  // YT-LONG FIX (2026-11-26): when the preview URL is unplayable
+  // cross-origin (YT-A proxy / googlevideo), attach the same-origin
+  // relay so the frontend's preview player can actually play it.
+  if (result) attachPreviewStream(result, url);
   // Sohu: signed URLs (see above) — never store the result.
   // A degraded YouTube result (android-only, e.g. just format 18)
   // must NOT be cached for 10 minutes either: it would show every
@@ -6375,6 +6655,19 @@ app.get('/api/save', rateLimit('save', 10, 60000), async (req, res) => {
   // again here so a direct /api/save call with a counted or
   // third-party title still gets a clean filename.
   const title = safeTitle(stripTitleCounts(req.query.t || req.query.title) || 'video');
+  // PREVIEW RELAY (YT-long fix 2026-11-26): preview=1 streams the
+  // file as inline video (no redirect, no Content-Disposition) so a
+  // <video> element can play a URL that is unplayable cross-origin
+  // (YT-A proxy / googlevideo). This is the inline PREVIEW only —
+  // the Save button never sends preview=1, so downloads (and the
+  // 302-vs-filename decision) are unchanged.
+  const isPreview = req.query.preview === '1';
+  // Headers for this request: preview headers when preview=1, else
+  // the normal download headers. One place, so no branch can forget.
+  const sendHeaders = (ext, contentType) => {
+    if (isPreview) setPreviewHeaders(res, contentType);
+    else setDownloadHeaders(res, title, ext, contentType);
+  };
   if (!url || !(await validateUserUrl(url))) {
     return res.status(400).json({ error: 'Invalid link.' });
   }
@@ -6393,7 +6686,9 @@ app.get('/api/save', rateLimit('save', 10, 60000), async (req, res) => {
   // fall through to the stream paths below. NOTE: a redirect hands the
   // browser the CDN's own filename, not the video title — the title
   // filename only survives on server-streamed downloads (see REPORT).
-  if (!formatId.includes('+')) {
+  // A preview NEVER redirects (the redirect target is exactly the
+  // unplayable URL) — it streams through the server below instead.
+  if (!formatId.includes('+') && !isPreview) {
     const rawForSave = rawCacheGet(url);
     const saveFmt = rawForSave && Array.isArray(rawForSave.formats)
       ? rawForSave.formats.find((f) => f && (String(f.format_id) === formatId || String(f.id) === formatId) && f.url)
@@ -6401,6 +6696,27 @@ app.get('/api/save', rateLimit('save', 10, 60000), async (req, res) => {
           ? rawForSave.formats.find((f) => f && f.url) : null)
       : null;
     if (saveFmt && isRedirectSafeUrl(saveFmt.url)) return res.redirect(302, saveFmt.url);
+  }
+  // PREVIEW RELAY (single formats): stream the CACHED format URL
+  // straight through with video headers — no re-resolve (the YT-A
+  // resolve alone costs ~20s for a long video) and no 302. When the
+  // cache has no such URL the normal branches below re-resolve it
+  // (chain branch for yd-/ch- ids, direct stream / yt-dlp for the
+  // rest) — with preview headers via sendHeaders.
+  if (isPreview && !formatId.includes('+')) {
+    const rawP = rawCacheGet(url);
+    const pFmt = rawP && Array.isArray(rawP.formats)
+      ? rawP.formats.find((f) => f && (String(f.format_id) === formatId || String(f.id) === formatId) && f.url)
+      : null;
+    if (pFmt) {
+      const pExt = String(pFmt.ext || 'mp4').toLowerCase();
+      const pType = pExt === 'mp3' ? 'audio/mpeg' : pExt === 'm4a' ? 'audio/mp4' : pExt === 'webm' ? 'video/webm' : 'video/mp4';
+      try {
+        if (await streamThrough(res, pFmt.url, title, pExt, pType, true)) return;
+      } catch (e) {
+        console.error('preview stream failed:', scrub(e.message));
+      }
+    }
   }
   // Series / SSSTik Best (ids 'best' and 'ssstik-best' — the live site
   // has served both across origins since the id was renamed): the file
@@ -6429,7 +6745,7 @@ app.get('/api/save', rateLimit('save', 10, 60000), async (req, res) => {
     try {
       const r = await fetch(streamUrl, { headers: { 'User-Agent': 'Mozilla/5.0', Referer: 'https://www.tiktok.com/' } });
       if (!r.ok || !r.body) return res.status(502).json({ error: 'This clip is not available right now. Please try again.' });
-      setDownloadHeaders(res, title, ext, ext === 'mp3' ? 'audio/mpeg' : 'video/mp4');
+      sendHeaders(ext, ext === 'mp3' ? 'audio/mpeg' : 'video/mp4');
       const reader = r.body.getReader();
       try {
         for (;;) {
@@ -6455,7 +6771,7 @@ app.get('/api/save', rateLimit('save', 10, 60000), async (req, res) => {
     try {
       const r = await fetch(streamUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
       if (!r.ok || !r.body) return res.status(502).json({ error: 'This clip is not available right now. Please try again.' });
-      setDownloadHeaders(res, title, ext, ext === 'm4a' ? 'audio/mp4' : 'video/mp4');
+      sendHeaders(ext, ext === 'm4a' ? 'audio/mp4' : 'video/mp4');
       const reader = r.body.getReader();
       try {
         for (;;) {
@@ -6490,7 +6806,7 @@ app.get('/api/save', rateLimit('save', 10, 60000), async (req, res) => {
     try {
       const r = await fetch(streamUrl, { headers: { 'User-Agent': saveUa } });
       if (!r.ok || !r.body) return res.status(502).json({ error: 'This clip is not available right now. Please try again.' });
-      setDownloadHeaders(res, title, ext, ext === 'mp3' ? 'audio/mpeg' : ext === 'm4a' ? 'audio/mp4' : 'video/mp4');
+      sendHeaders(ext, ext === 'mp3' ? 'audio/mpeg' : ext === 'm4a' ? 'audio/mp4' : 'video/mp4');
       const reader = r.body.getReader();
       try {
         for (;;) {
@@ -6530,7 +6846,7 @@ app.get('/api/save', rateLimit('save', 10, 60000), async (req, res) => {
       const ext2 = String(fmt.ext || 'mp4').toLowerCase();
       const ctype = ext2 === 'mp3' ? 'audio/mpeg' : ext2 === 'm4a' ? 'audio/mp4' : ext2 === 'webm' ? 'video/webm' : 'video/mp4';
       try {
-        if (await streamThrough(res, fmt.url, title, ext2, ctype)) return;
+        if (await streamThrough(res, fmt.url, title, ext2, ctype, isPreview)) return;
       } catch (e) {
         console.error('direct stream failed:', scrub(e.message));
       }
@@ -6555,7 +6871,7 @@ app.get('/api/save', rateLimit('save', 10, 60000), async (req, res) => {
     child.stderr.on('data', (d) => { if (stderr.length < 4000) stderr += d.toString(); });
     child.on('error', () => { if (!res.headersSent) res.status(502).json({ error: 'This clip is not available right now. Please try again.' }); });
     child.stdout.on('data', (chunk) => {
-      if (!sent) { setDownloadHeaders(res, title, spec.ext, spec.ctype); sent = true; }
+      if (!sent) { sendHeaders(spec.ext, spec.ctype); sent = true; }
       if (!res.write(chunk)) child.stdout.pause();
     });
     res.on('drain', () => child.stdout.resume());
@@ -6591,7 +6907,7 @@ app.get('/api/save', rateLimit('save', 10, 60000), async (req, res) => {
     ff.on('error', () => { try { fs.unlinkSync(tmpPath); } catch {} if (!res.headersSent) res.status(502).json({ error: 'This clip is not available right now. Please try again.' }); });
     ff.on('close', (code) => {
       if (code !== 0) { console.error('kick remux failed:', code, scrub(ffErr.slice(-500))); try { fs.unlinkSync(tmpPath); } catch {} if (!res.headersSent) res.status(502).json({ error: 'This clip is not available right now. Please try again.' }); return; }
-      setDownloadHeaders(res, title, 'mp4', 'video/mp4');
+      sendHeaders('mp4', 'video/mp4');
       const stream = fs.createReadStream(tmpPath);
       stream.on('error', () => { try { fs.unlinkSync(tmpPath); } catch {} if (!res.headersSent) res.status(502).json({ error: 'This clip is not available right now. Please try again.' }); });
       stream.on('end', () => { try { fs.unlinkSync(tmpPath); } catch {} });
@@ -6613,7 +6929,7 @@ app.get('/api/save', rateLimit('save', 10, 60000), async (req, res) => {
     const vFmt = rawM && Array.isArray(rawM.formats) ? rawM.formats.find((f) => f && String(f.format_id) === vidId && f.url) : null;
     const aFmt = rawM && Array.isArray(rawM.formats) ? rawM.formats.find((f) => f && String(f.format_id) === audId && f.url) : null;
     if (vFmt && aFmt) {
-      const streamed = await tryStreamMerged(res, title, vFmt.url, aFmt.url, saveProxyArgs);
+      const streamed = await tryStreamMerged(res, title, vFmt.url, aFmt.url, saveProxyArgs, isPreview);
       if (streamed) return;
     }
     // Merged video+audio cannot be streamed to stdout as MP4 (ffmpeg falls
@@ -6642,7 +6958,7 @@ app.get('/api/save', rateLimit('save', 10, 60000), async (req, res) => {
         if (!res.headersSent) res.status(502).json({ error: 'This clip is not available right now. Please try again.' });
         return;
       }
-      setDownloadHeaders(res, title, ext, 'video/mp4');
+      sendHeaders(ext, 'video/mp4');
       const stream = fs.createReadStream(tmp);
       stream.on('error', () => { fs.unlink(tmp, () => {}); try { res.end(); } catch {} });
       stream.on('end', () => fs.unlink(tmp, () => {}));
@@ -6676,7 +6992,7 @@ app.get('/api/save', rateLimit('save', 10, 60000), async (req, res) => {
   // the exit code is known.
   child.stdout.on('data', (chunk) => {
     if (!sent) {
-      setDownloadHeaders(res, title, singleExt, singleType);
+      sendHeaders(singleExt, singleType);
       sent = true;
     }
     if (!res.write(chunk)) child.stdout.pause();
