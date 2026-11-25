@@ -837,6 +837,23 @@
     ['US', 'EU', 'ASIA'].forEach(function (r) { if (first[r]) out.push(first[r]); });
     return out.concat(rest);
   }
+  // Job-creation order (2026-11-25 speed fix 1c): BACKUP origins first,
+  // the own origin LAST. A background job POST takes the first origin
+  // that accepts it, so the old region-diverse order (own origin first)
+  // always landed the job on main — the slowest origin for
+  // YouTube/TikTok/Facebook (502s there while EU answers in ~2s).
+  // Region diversity is kept for the backups; only the own origin is
+  // moved to the end. Used by startJobFlow() and by the silent upgrade
+  // job inside maybeUpgradeQualities(). Per-origin 10s cap and the
+  // 429/400 early-break live in those callers and are unchanged.
+  function orderOriginsForJob(list) {
+    var own = location.origin;
+    var src = list || [];
+    var others = src.filter(function (o) { return o !== own; });
+    var ordered = orderOriginsByRegion(others);
+    if (src.indexOf(own) !== -1) ordered.push(own);
+    return ordered;
+  }
   // Try each origin in order until one answers with ok JSON.
   // Returns { data, origin }. Throws the last error when all fail.
   // 4xx answers are terminal: they are decided by the LINK (not the
@@ -1120,11 +1137,15 @@
     // Stage 1 — fast preview (title + thumbnail) in about a second.
     // At most 2 origins (own + 1 backup): a 404 means "no preview for
     // this link" on every region, so trying more only burns time.
+    // Parallel + region-diverse (2026-11-25 speed fix 5): without opts
+    // this ran SERIAL (main first, 5s, then backup) — TikTok's meta
+    // 404s on main, so the preview never showed early. Now the fastest
+    // region's meta wins.
     tryOrigins('/api/meta', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url: url }),
-    }, 5000, 2)
+    }, 5000, 2, { regionDiverse: true, parallel: true })
       .then(function (res) {
         var data = res && res.data;
         if (reqId !== latestReq || !data || !data.title) return;
@@ -1181,6 +1202,8 @@
     // each: it is only the fast preview.)
     // Note: timing.max is no longer used for /api/info; the table keeps
     // its measured per-platform figures for the on-screen estimate.
+    // On a non-terminal failure the race is retried once at 15s (speed
+    // fix 1a) before the job takes over — see the catch below.
     // ---- Background jobs (slow videos) ---------------------------------
     // Some videos can never finish inside /api/info's 25s cap: long
     // YouTube videos, Douyin/Kuaishou, Moj/ShareChat, Zhihu. For those
@@ -1242,7 +1265,10 @@
       jobShowProgress(0, 'Getting it ready…');
       var origins;
       try { origins = await getOrigins(); } catch (e) { origins = [location.origin]; }
-      origins = orderOriginsByRegion(origins.slice());
+      // Speed fix 1c: backups first, own origin last (see
+      // orderOriginsForJob) — the job must not land on main, the
+      // slowest origin for YouTube/TikTok/Facebook.
+      origins = orderOriginsForJob(origins.slice());
       var started = null;
       for (var i = 0; i < Math.min(3, origins.length); i++) {
         try {
@@ -1290,6 +1316,10 @@
           jobStopped = true;
           renderResult(pd);
           timerDone((Date.now() - timerStart) / 1000);
+          // A job answer can itself be partial (server marks it
+          // partial:true) — the silent upgrade below then chases the
+          // fuller list, exactly as for a sync answer.
+          maybeUpgradeQualities(pd);
           if (reqId === latestReq) setBusy(false);
           return;
         }
@@ -1354,89 +1384,124 @@
       renderFormats(data);
       return true;
     }
-    function maybeUpgradeQualities(data) {
-      if (platform !== 'TikTok' || !data || !Array.isArray(data.formats)) return;
-      if (data.formats.length >= 4) return; // full set already (Best + HD + SD + Audio)
-      if (reqId !== latestReq) return;
-      var mergeOrigin = currentInfoOrigin || location.origin;
-      var mergeDeadline = Date.now() + 12000;
-      var pollMerge = async function () {
-        if (reqId !== latestReq || upgradeDone) return;
-        if (Date.now() > mergeDeadline) return; // the job below is the remaining route
+    // Silent background job for the progressive upgrade: the same
+    // lookup with no sync cap, polled up to 60s; on ready it swaps in
+    // the fuller list (upgradeSwap) and stops. Silent by design: no
+    // progress row, no error, never touches the preview player; stops
+    // on a newer request (reqId) or when a fuller list arrives.
+    // Job creation uses orderOriginsForJob (backups first, own origin
+    // last — speed fix 1c); the 10s per-origin cap and the 429/400
+    // early-break are unchanged.
+    async function startUpgradeJob() {
+      if (reqId !== latestReq || upgradeDone) return;
+      var origins;
+      try { origins = await getOrigins(); } catch (e) { origins = [location.origin]; }
+      origins = orderOriginsForJob(origins.slice());
+      var started = null;
+      for (var i = 0; i < Math.min(3, origins.length); i++) {
         try {
-          var mCtrl = new AbortController();
-          var mTimer = setTimeout(function () { mCtrl.abort(); }, 5000);
-          var r;
+          var postCtrl = new AbortController();
+          var postTimer = setTimeout(function () { postCtrl.abort(); }, 10000);
+          var rr;
           try {
-            r = await fetch(mergeOrigin + '/api/merge?url=' + encodeURIComponent(url), { signal: mCtrl.signal });
-          } finally { clearTimeout(mTimer); }
-          if (r.ok) {
-            var d = await r.json().catch(function () { return null; });
-            if (d && upgradeSwap(d)) { upgradeStop(); return; }
-          }
-        } catch (e) { /* next poll */ }
+            rr = await fetch(origins[i] + '/api/job', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ url: url }),
+              signal: postCtrl.signal,
+            });
+          } finally { clearTimeout(postTimer); }
+          var dd = await rr.json().catch(function () { return null; });
+          if (rr.ok && dd && dd.jobId) { started = { origin: origins[i], jobId: dd.jobId }; break; }
+          if (rr.status === 429 || rr.status === 400) break;
+        } catch (e) { /* next origin */ }
         if (reqId !== latestReq || upgradeDone) return;
-        upgradeTimer = setTimeout(pollMerge, 2000);
-      };
-      pollMerge();
-      // Silent background job: same lookup with no sync cap, so tikwm
-      // gets its 15s timeout and the 10s grace can merge it. Started
-      // at once (the job itself takes ~10s) — the merge poll above
-      // usually wins first when tikwm cooperates quickly.
-      (async function () {
-        if (reqId !== latestReq || upgradeDone) return;
-        var origins;
-        try { origins = await getOrigins(); } catch (e) { origins = [location.origin]; }
-        origins = orderOriginsByRegion(origins.slice());
-        var started = null;
-        for (var i = 0; i < Math.min(3, origins.length); i++) {
-          try {
-            var postCtrl = new AbortController();
-            var postTimer = setTimeout(function () { postCtrl.abort(); }, 10000);
-            var rr;
-            try {
-              rr = await fetch(origins[i] + '/api/job', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ url: url }),
-                signal: postCtrl.signal,
-              });
-            } finally { clearTimeout(postTimer); }
-            var dd = await rr.json().catch(function () { return null; });
-            if (rr.ok && dd && dd.jobId) { started = { origin: origins[i], jobId: dd.jobId }; break; }
-            if (rr.status === 429 || rr.status === 400) break;
-          } catch (e) { /* next origin */ }
-          if (reqId !== latestReq || upgradeDone) return;
+      }
+      if (!started) return;
+      upgradeJobOrigin = started.origin;
+      upgradeJobId = started.jobId;
+      var jobStart = Date.now();
+      var poll = async function () {
+        if (reqId !== latestReq) { upgradeStop(); return; }
+        if (upgradeDone) return;
+        if (Date.now() - jobStart > 60000) { upgradeStop(); return; }
+        var pr, pd;
+        var pCtrl = new AbortController();
+        var pTimer = setTimeout(function () { pCtrl.abort(); }, 10000);
+        try {
+          pr = await fetch(upgradeJobOrigin + '/api/job/' + upgradeJobId, { signal: pCtrl.signal });
+          pd = await pr.json().catch(function () { return null; });
+        } catch (e) { pd = null; }
+        finally { clearTimeout(pTimer); }
+        if (reqId !== latestReq) { upgradeStop(); return; }
+        if (upgradeDone) return;
+        if (pd && pd.status === 'ready' && pd.formats && pd.formats.length) {
+          upgradeSwap(pd);
+          upgradeStop(); // job is done either way — nothing fuller left to show
+          return;
         }
-        if (!started) return;
-        upgradeJobOrigin = started.origin;
-        upgradeJobId = started.jobId;
-        var jobStart = Date.now();
-        var poll = async function () {
-          if (reqId !== latestReq) { upgradeStop(); return; }
-          if (upgradeDone) return;
-          if (Date.now() - jobStart > 60000) { upgradeStop(); return; }
-          var pr, pd;
-          var pCtrl = new AbortController();
-          var pTimer = setTimeout(function () { pCtrl.abort(); }, 10000);
-          try {
-            pr = await fetch(upgradeJobOrigin + '/api/job/' + upgradeJobId, { signal: pCtrl.signal });
-            pd = await pr.json().catch(function () { return null; });
-          } catch (e) { pd = null; }
-          finally { clearTimeout(pTimer); }
-          if (reqId !== latestReq) { upgradeStop(); return; }
-          if (upgradeDone) return;
-          if (pd && pd.status === 'ready' && pd.formats && pd.formats.length) {
-            upgradeSwap(pd);
-            upgradeStop(); // job is done either way — nothing fuller left to show
-            return;
-          }
-          if (pd && (pd.status === 'failed' || pr.status === 404)) { upgradeStop(); return; }
-          upgradeJobTimer = setTimeout(poll, 3000);
-        };
-        poll();
-      })();
+        if (pd && (pd.status === 'failed' || pr.status === 404)) { upgradeStop(); return; }
+        upgradeJobTimer = setTimeout(poll, 3000);
+      };
+      poll();
     }
+    function maybeUpgradeQualities(data) {
+      if (!data || !Array.isArray(data.formats)) return;
+      if (reqId !== latestReq) return;
+      var isPartial = data.partial === true;
+      if (platform === 'TikTok') {
+        // TikTok completeness trigger, unchanged: fewer than the full
+        // 4 formats (Best + HD + SD + Audio) — or a partial flag.
+        if (data.formats.length >= 4 && !isPartial) return;
+      } else {
+        // Generalised upgrade (2026-11-25 speed fix 6): the server
+        // marks a degraded/partial /api/info answer with top-level
+        // partial:true (e.g. a YouTube mirror 240p-only list). ANY
+        // platform may be partial, so a partial rendered result starts
+        // the SILENT upgrade flow — background-job route only (no
+        // merge poll: /api/merge is a TikTok union, not a general
+        // fuller list). It never shows an error or progress row, never
+        // touches the preview player, and stops on a newer request
+        // (reqId) or when a fuller list arrives (see startUpgradeJob).
+        if (!isPartial) return;
+      }
+      if (platform === 'TikTok') {
+        var mergeOrigin = currentInfoOrigin || location.origin;
+        var mergeDeadline = Date.now() + 12000;
+        var pollMerge = async function () {
+          if (reqId !== latestReq || upgradeDone) return;
+          if (Date.now() > mergeDeadline) return; // the job below is the remaining route
+          try {
+            var mCtrl = new AbortController();
+            var mTimer = setTimeout(function () { mCtrl.abort(); }, 5000);
+            var r;
+            try {
+              r = await fetch(mergeOrigin + '/api/merge?url=' + encodeURIComponent(url), { signal: mCtrl.signal });
+            } finally { clearTimeout(mTimer); }
+            if (r.ok) {
+              var d = await r.json().catch(function () { return null; });
+              if (d && upgradeSwap(d)) { upgradeStop(); return; }
+            }
+          } catch (e) { /* next poll */ }
+          if (reqId !== latestReq || upgradeDone) return;
+          upgradeTimer = setTimeout(pollMerge, 2000);
+        };
+        pollMerge();
+      }
+      // Silent background job: same lookup with no sync cap, so tikwm
+      // gets its 15s timeout and the 10s grace can merge it (TikTok),
+      // or the fuller list lands for a partial answer (any platform).
+      // Started at once (the job itself takes ~10s) — the merge poll
+      // above usually wins first when tikwm cooperates quickly.
+      startUpgradeJob();
+    }
+    // The /api/info request options, shared by the first race and the
+    // retry below (speed fix 1a) so both attempts ask for the same thing.
+    var infoReqOptions = {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: url }),
+    };
     try {
       var infoBudget = new Promise(function (resolve, reject) {
         setTimeout(function () {
@@ -1446,11 +1511,7 @@
         }, 45000);
       });
       var res = await Promise.race([
-        tryOrigins('/api/info', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url: url }),
-        }, 27000, 3, { regionDiverse: true, parallel: true }),
+        tryOrigins('/api/info', infoReqOptions, 27000, 3, { regionDiverse: true, parallel: true }),
         infoBudget,
       ]);
       jobStop(); // Stage 2 won: stop any job polling and free its slot
@@ -1464,6 +1525,48 @@
       maybeUpgradeQualities(res.data);
     } catch (err) {
       if (reqId !== latestReq) return;
+      // RACE RETRY (2026-11-25 speed fix 1a/1b): the first race can
+      // lose to a cold origin even though a second attempt — a few
+      // seconds later, against warming origins — would win. So before
+      // the job is allowed to own the UI, retry the race ONCE with a
+      // shorter 15s budget, for any error that is NOT terminal (4xx),
+      // NOT a geo-block and NOT a no-stream video (those are decided:
+      // another attempt would answer the same way). The job timer is
+      // deliberately NOT cleared before the retry: the job may start
+      // while the retry is in flight, and that is fine — a retry win
+      // below stops it with jobStop() and renders, exactly like the
+      // first-attempt success path above. A race win is therefore
+      // honoured whenever it lands, even while a job is polling.
+      // Only if the retry ALSO fails AND a job has started does the
+      // job own the UI; otherwise the error handling below runs (and
+      // may itself start the job for a slow, undecided link).
+      if (err && !err._terminal && !err.geoBlocked && !err.noStream) {
+        try {
+          var retryBudget = new Promise(function (resolve, reject) {
+            setTimeout(function () {
+              var err2 = new Error(platform + ' is taking too long right now. Please try again.');
+              err2.name = 'AbortError';
+              reject(err2);
+            }, 15000);
+          });
+          var res2 = await Promise.race([
+            tryOrigins('/api/info', infoReqOptions, 15000, 3, { regionDiverse: true, parallel: true }),
+            retryBudget,
+          ]);
+          jobStop(); // retry won: stop any job polling and free its slot
+          if (reqId !== latestReq) return;
+          clearPreviewFuse();
+          currentInfoOrigin = res2.origin;
+          renderedForReq = true;
+          resultRendered = true;
+          renderResult(res2.data);
+          timerDone((Date.now() - timerStart) / 1000);
+          maybeUpgradeQualities(res2.data);
+          return;
+        } catch (err2) {
+          err = err2; // the retry's verdict decides what happens next
+        }
+      }
       clearTimeout(jobTimer);
       if (jobStarted) return; // the job flow owns the UI now
       stopTimer();
