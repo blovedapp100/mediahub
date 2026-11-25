@@ -207,11 +207,17 @@
     pausePreviewPlayer();
     previewSized = false;
     previewVideoSized = false;
+    clearPosterStallTimer();
+    pendingYouTubePreview = '';
     if (playerWrap) {
       playerWrap.style.width = '';
       playerWrap.style.height = '';
       playerWrap.style.aspectRatio = '';
       playerWrap.classList.remove('no-video');
+      // A YouTube lazy-preview button from a previous search must not
+      // sit over the new preview.
+      var yb = playerWrap.querySelector('.yt-play-btn');
+      if (yb) yb.remove();
       // A previous video's poster must not sit over the new preview:
       // Plyr mirrors the poster into its own .plyr__poster div and
       // never refreshes it when the src changes directly, so hide it
@@ -250,6 +256,111 @@
       p.style.display = '';
       p.style.backgroundImage = "url('" + url + "')";
     }
+  }
+
+  // ---- poster survival + YouTube lazy preview (2026-11-25) ------------
+  // The still image (#thumb) used to be hidden the moment a preview
+  // stream was set up, and the <video>'s own poster / first frame took
+  // over — on mobile Chrome that frame is black (YouTube streams open
+  // on a black frame, and a googlevideo URL signed for the server's
+  // egress IP 403s / stalls on the visitor's phone), so every video
+  // showed a black poster while playing fine. So now: #thumb stays
+  // visible until the video fires loadeddata AND its first frame is
+  // not black (when that can be detected at all); a stall (>3s with
+  // no loadeddata) or an error restores #thumb. For YouTube the
+  // googlevideo preview URL is never auto-loaded at all — the still
+  // image + a play button are shown, and the stream loads only when
+  // the visitor presses play.
+  var pendingYouTubePreview = ''; // googlevideo URL waiting for a tap
+  var posterStallTimer = null;
+  var posterFrameHandler = null;
+  function clearPosterStallTimer() {
+    if (posterStallTimer) { clearTimeout(posterStallTimer); posterStallTimer = null; }
+  }
+  function firstFrameLooksBlack() {
+    // Best-effort only: a cross-origin stream without CORS taints the
+    // canvas, so getImageData throws — then we return null (unknown)
+    // and loadeddata alone decides. Never blocks the poster.
+    try {
+      if (!videoEl || !videoEl.videoWidth || !videoEl.videoHeight) return null;
+      var c = document.createElement('canvas');
+      c.width = 16; c.height = 9;
+      var ctx = c.getContext('2d');
+      if (!ctx) return null;
+      ctx.drawImage(videoEl, 0, 0, 16, 9);
+      var d = ctx.getImageData(0, 0, 16, 9).data;
+      var sum = 0, n = 0;
+      for (var i = 0; i < d.length; i += 4) { sum += d[i] + d[i + 1] + d[i + 2]; n++; }
+      return (sum / (n * 3)) < 12; // near-black first frame
+    } catch (e) { return null; }
+  }
+  // Arm the poster handover for a stream that was just given a src:
+  // hide #thumb only once a real (non-black, when detectable) frame
+  // exists; if nothing arrives in 3s, restore #thumb instead of
+  // leaving a black box. Call after setting videoEl.src + load().
+  function armPosterSurvival() {
+    clearPosterStallTimer();
+    if (posterFrameHandler && videoEl) videoEl.removeEventListener('loadeddata', posterFrameHandler);
+    posterFrameHandler = function () {
+      clearPosterStallTimer();
+      if (firstFrameLooksBlack() === true) return; // keep the still: first frame is black
+      clearPreviewPoster();
+      if (thumbImg) thumbImg.style.display = 'none';
+    };
+    if (videoEl) videoEl.addEventListener('loadeddata', posterFrameHandler, { once: true });
+    posterStallTimer = setTimeout(function () {
+      posterStallTimer = null;
+      if (thumbImg && currentThumb) { thumbImg.src = currentThumb; thumbImg.style.display = ''; }
+    }, 3000);
+  }
+  function showYouTubePlayButton() {
+    if (!playerWrap) return;
+    playerWrap.style.position = 'relative';
+    var b = playerWrap.querySelector('.yt-play-btn');
+    if (!b) {
+      b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'yt-play-btn';
+      b.setAttribute('aria-label', 'Play preview');
+      b.textContent = '▶';
+      // Inline styles (no style.css change): a centred play disc
+      // over the still image.
+      b.style.cssText = 'position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:64px;height:64px;border-radius:50%;border:0;background:rgba(0,0,0,0.65);color:#fff;font-size:26px;line-height:1;cursor:pointer;z-index:3;';
+      b.addEventListener('click', loadYouTubePreview);
+      playerWrap.appendChild(b);
+    }
+    b.style.display = '';
+  }
+  function loadYouTubePreview() {
+    if (!pendingYouTubePreview || !videoEl) return;
+    var url = pendingYouTubePreview;
+    pendingYouTubePreview = null;
+    var b = playerWrap ? playerWrap.querySelector('.yt-play-btn') : null;
+    if (b) b.style.display = 'none';
+    resetPreviewPlayer();
+    sizeFromThumb(currentThumb);
+    videoEl.referrerPolicy = 'no-referrer';
+    videoEl.src = url;
+    showPreviewPoster(currentThumb);
+    videoEl.style.display = '';
+    if (playerWrap) playerWrap.classList.remove('no-video');
+    videoEl.preload = 'auto';
+    videoEl.load();
+    setupPreviewPlayer();
+    armPosterSurvival(); // #thumb stays until a real frame exists
+    try {
+      if (previewPlyr) previewPlyr.play();
+      else videoEl.play();
+    } catch (e) { /* play usually allowed after a tap; if not, controls remain */ }
+    videoEl.onerror = function () {
+      clearPosterStallTimer();
+      pausePreviewPlayer();
+      videoEl.style.display = 'none';
+      if (playerWrap) playerWrap.classList.add('no-video');
+      if (currentThumb) { thumbImg.src = currentThumb; thumbImg.style.display = ''; }
+      showYouTubePlayButton(); // let the visitor retry the tap
+      pendingYouTubePreview = url;
+    };
   }
 
   // Re-size when the window changes (rotate the phone, resize desktop).
@@ -323,6 +434,24 @@
     } catch (e) {}
     return null;
   }
+
+  // YouTube video ID from any link form (watch / youtu.be / shorts /
+  // live / embed / v). Used ONLY for the deterministic thumbnail URL
+  // below — no other platform has one, so no ID is guessed for them.
+  function youtubeIdFromUrl(u) {
+    try {
+      var p = new URL(u);
+      var h = p.hostname.toLowerCase().replace(/^(www\.|m\.|music\.)/, '');
+      if (h === 'youtu.be') return (p.pathname.split('/').filter(function (s) { return s; })[0] || '');
+      if (h === 'youtube.com' || h.endsWith('.youtube.com')) {
+        if (p.pathname === '/watch') return p.searchParams.get('v') || '';
+        var m = p.pathname.match(/^\/(shorts|live|embed|v)\/([A-Za-z0-9_-]{6,})/);
+        if (m) return m[2];
+      }
+      return '';
+    } catch (e) { return ''; }
+  }
+  function youtubeThumbUrl(id) { return 'https://i.ytimg.com/vi/' + id + '/hqdefault.jpg'; }
 
   function showDetect() {
     var v = urlInput.value.trim();
@@ -873,6 +1002,28 @@
     msg.textContent = '';
     result.hidden = true;
     formatsEl.innerHTML = '';
+    // Instant YouTube thumbnail (2026-11-25): the poster URL is
+    // deterministic from the video ID, so paint it the moment the
+    // link is pasted — never wait for /api/meta (~1.5s) or /api/info.
+    // Falls back to mqdefault if hqdefault fails to load. A later
+    // meta/info render overwrites it with the server's thumbnail.
+    // YouTube only: no other platform has a deterministic thumb URL.
+    var ytId = youtubeIdFromUrl(url);
+    if (ytId && thumbImg) {
+      var ytThumb = youtubeThumbUrl(ytId);
+      currentThumb = ytThumb;
+      titleEl.textContent = '';
+      uploaderEl.textContent = '';
+      durationEl.textContent = '';
+      thumbImg.src = ytThumb;
+      thumbImg.style.display = '';
+      if (playerWrap) playerWrap.style.display = '';
+      result.hidden = false;
+      sizeFromThumb(ytThumb);
+      thumbImg.addEventListener('error', function () {
+        if (thumbImg.src === ytThumb) thumbImg.src = 'https://i.ytimg.com/vi/' + ytId + '/mqdefault.jpg';
+      }, { once: true });
+    }
     // JOINT RENDER (2026-11-25): the preview used to render the moment
     // /api/meta landed, leaving the visitor staring at "Finding
     // qualities…" for seconds while /api/info finished — the user asked
@@ -957,10 +1108,13 @@
     }, 4000);
     // Stage 2 — full quality list (takes a few seconds longer).
     // Tries the backup region too when this region cannot read the link.
-    // Bounded: at most 3 origins at 10s each, and a 45s global budget
-    // for the whole stage — after that the error below is shown instead
-    // of "Finding qualities…" hanging forever. (/api/meta above is
-    // capped at 2 origins, 5s each: it is only the fast preview.)
+    // Bounded: at most 3 origins at 27s each (2026-11-25: the server
+    // needs up to 25s for a blocked YouTube lookup, so the old 10s
+    // per-origin budget aborted the primary before it could ever
+    // answer), and a 45s global budget for the whole stage — after
+    // that the error below is shown instead of "Finding qualities…"
+    // hanging forever. (/api/meta above is capped at 2 origins, 5s
+    // each: it is only the fast preview.)
     // Note: timing.max is no longer used for /api/info; the table keeps
     // its measured per-platform figures for the on-screen estimate.
     // ---- Background jobs (slow videos) ---------------------------------
@@ -1231,7 +1385,7 @@
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url: url }),
-        }, 10000, 3, { regionDiverse: true }),
+        }, 27000, 3, { regionDiverse: true }),
         infoBudget,
       ]);
       jobStop(); // Stage 2 won: stop any job polling and free its slot
@@ -1379,8 +1533,23 @@
     // Proper preview player: play the source stream when possible,
     // fall back to the still image if the stream cannot play.
     var hasVideo = !!(data.previewUrl && videoEl);
+    var isYouTubeResult = detectPlatform(currentUrl) === 'YouTube';
     if (videoEl) {
-      if (hasVideo) {
+      if (hasVideo && isYouTubeResult) {
+        // YouTube lazy preview (2026-11-25): never auto-load the
+        // googlevideo preview URL — it was signed for the server's
+        // egress IP and 403s / stalls on the visitor's phone, leaving
+        // a black box. Show the still image + a play button; the
+        // stream loads only when the visitor presses play.
+        resetPreviewPlayer();
+        sizeFromThumb(data.thumbnail);
+        pendingYouTubePreview = data.previewUrl;
+        videoEl.style.display = 'none';
+        if (playerWrap) playerWrap.classList.add('no-video');
+        if (data.thumbnail) { thumbImg.src = data.thumbnail; thumbImg.style.display = ''; }
+        else thumbImg.style.display = 'none';
+        showYouTubePlayButton();
+      } else if (hasVideo) {
         // v3: the result can render TWICE for one link (sync info, then
         // the background-job result ~60s later). The second render
         // reset the box and sized it from the (by then loaded) 9:16
@@ -1407,24 +1576,24 @@
         videoEl.src = data.previewUrl;
         showPreviewPoster(data.thumbnail);
         videoEl.style.display = '';
-        thumbImg.style.display = 'none';
+        // Poster survival (2026-11-25): do NOT hide #thumb here — it
+        // stays until a real frame arrives (armPosterSurvival below).
+        // Hiding it now is what left a black box on mobile.
         // preload="auto" (not the HTML's "metadata"): the first frame
         // must be buffered, or the paused player has no frame to show
         // once the poster is dropped below.
         videoEl.preload = 'auto';
         videoEl.load();
         setupPreviewPlayer();
-        // Once the first frame is decoded, drop the poster: the paused
-        // player then shows the video's own first frame (never
-        // letterboxed), instead of a cover crop that can differ from
-        // the clip. Re-attached per result; the once flag + the
-        // removeEventListener keep at most one pending listener.
-        videoEl.removeEventListener('loadeddata', clearPreviewPoster);
-        videoEl.addEventListener('loadeddata', clearPreviewPoster, { once: true });
+        // Poster survival (2026-11-25): #thumb hides only once a real
+        // (non-black, when detectable) frame exists; a >3s stall
+        // restores #thumb instead of leaving a black box.
+        armPosterSurvival();
         videoEl.onerror = function () {
           // The stream cannot play: hide the whole player box (the
           // Plyr frame would otherwise sit there empty) and fall back
           // to the still image, exactly like the old player did.
+          clearPosterStallTimer();
           pausePreviewPlayer();
           videoEl.style.display = 'none';
           if (playerWrap) playerWrap.classList.add('no-video');
