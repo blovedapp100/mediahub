@@ -4246,7 +4246,7 @@ async function zhihuInfo(url, timeoutMs = 10000) {
     if (!formats.length) return null;
     return {
       title: j.title || 'Zhihu video',
-      thumbnail: (v.cover_url || '') ,
+      thumbnail: (v.thumbnail || v.cover_url || j.image_url || j.image_cover || '') ,
       duration: Math.round(Number(v.duration) || 0),
       uploader: (j.author && j.author.name) || '',
       previewUrl: formats[0].url,
