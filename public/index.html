@@ -25,7 +25,6 @@
 <body>
 <header class="top">
   <div class="brand"><a href="/">Save Video</a></div>
-  <button type="button" id="extInstallBtn" class="ext-install" style="display:none">Install Extension</button>
   <button type="button" id="themeToggle" class="theme-toggle" aria-label="Switch colour theme">☾ Dark</button>
 </header>
 
@@ -42,18 +41,6 @@
     <div id="progress" class="progress" aria-hidden="true"><div class="bar"><i></i></div><p>Finding the clip and its qualities…</p></div>
     <div id="timer" class="timer" aria-live="polite"></div>
     <div id="msg" class="msg" role="status" aria-live="polite"></div>
-    <div id="extSteps" class="card ext-steps" hidden>
-      <h3>Install the Save Video extension</h3>
-      <p><strong>What it does:</strong> the Save Video extension saves any video playing in your browser with one click — no need to copy and paste links. Open a video on TikTok, Facebook, Instagram and more, click the Save Video button, and it saves the best-quality video straight to your device.</p>
-      <p><strong>Note:</strong> this works on desktop Chrome (PC or Mac) — Chrome on phones cannot install extensions.</p>
-      <ol>
-        <li>The extension file just downloaded — unzip it to a folder.</li>
-        <li>In Chrome, open <code>chrome://extensions</code> and switch on <strong>Developer mode</strong> (top right).</li>
-        <li>Click <strong>Load unpacked</strong> and choose the unzipped folder.</li>
-      </ol>
-      <p>Once it is installed, the Install button disappears on its own — the site can tell the extension is there. It never sends your logins anywhere.</p>
-      <button type="button" id="extStepsClose" class="secondary">Close</button>
-    </div>
     <nav class="chips" aria-label="Platforms">
       <a class="chip" href="/tiktok">TikTok</a>
       <a class="chip" href="/douyin">Douyin</a>

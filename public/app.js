@@ -28,42 +28,6 @@
   }
 
 
-  // ---- extension install button (header, no popup) ----------------------
-  // The companion extension marks the page (data-mh-ext="1") when it is
-  // installed, so the button only ever shows when it is NOT installed.
-  // It is a plain button on the site itself — never a popup.
-  var extBtn = document.getElementById('extInstallBtn');
-  var extSteps = document.getElementById('extSteps');
-  var extStepsClose = document.getElementById('extStepsClose');
-  function extInstalled() {
-    return document.documentElement.getAttribute('data-mh-ext') === '1';
-  }
-  function syncExtBtn() {
-    if (!extBtn) return;
-    extBtn.style.display = extInstalled() ? 'none' : '';
-  }
-  if (extBtn) {
-    syncExtBtn();
-    setTimeout(syncExtBtn, 1200); // the marker may land just after this script
-    extBtn.addEventListener('click', function () {
-      // Download the extension file, then show the install steps inline.
-      var a = document.createElement('a');
-      a.href = '/SaveVideo-Extension-v1.8.zip';
-      a.download = 'SaveVideo-Extension-v1.8.zip';
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      if (extSteps) {
-        extSteps.hidden = false;
-        extSteps.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-      }
-    });
-  }
-  if (extStepsClose && extSteps) {
-    extStepsClose.addEventListener('click', function () { extSteps.hidden = true; });
-  }
-
-
   // ---- elements ------------------------------------------------------------
   var form = document.getElementById('form');
   var urlInput = document.getElementById('url');
@@ -423,6 +387,9 @@
 
   var currentUrl = '';
   var currentTitle = '';
+  var currentTitleOrigin = 'original'; // provenance of currentTitle ('original' | 'third-party')
+  var metaTitle = ''; // platform-derived title from /api/meta — the filename source
+  var metaTitleOrigin = 'original'; // provenance of metaTitle
   var currentClientSide = false;
 
   function detectPlatform(url) {
@@ -742,7 +709,7 @@
 
   // Fast path for a direct format: race the candidate URLs (same quality
   // from another source, if any — a format's own `urls` array, or a
-  // sibling format with the same label + extension), probe for ranged
+  // sibling format with the same label + file suffix), probe for ranged
   // reads, then download in parallel with live speed. Resolves 'saved'
   // on success, 'toobig' when the file is over the parallel cap (the
   // caller must NOT fetch it whole — open-in-tab / server save instead),
@@ -1023,6 +990,38 @@
     timerEl.innerHTML = 'Ready in <b>' + fmtSecs(seconds) + '</b>';
   }
 
+  // TITLE CLEANER (2026-11-25, user rule): a video's displayed title
+  // must be ONLY the title — no view/reaction/like/comment/share
+  // counts. Platforms (notably Facebook) prefix the page title with
+  // engagement counts: "79K views · 438K reactions | SWITZERLAND in
+  // winter...". Strip count segments (number + unit) at the start, at
+  // the end, and between separators. A bare word like "view" with no
+  // number is NOT stripped ("A view from the top" stays intact).
+  // Same logic as the server's stripTitleCounts (defence in depth).
+  function stripTitleCounts(t) {
+    var s = String(t || '').trim();
+    if (!s) return '';
+    var orig = s;
+    var num = '\\d[\\d,]*?(?:\\.\\d+)?\\s*[KMB]?';
+    var unit = '(?:views?|reactions?|likes?|comments?|shares?)';
+    var sep = '[·•|:\\-–—]';
+    var mid = new RegExp('\\s*' + sep + '\\s*' + num + '\\s*' + unit + '(?=\\s*' + sep + ')', 'gi');
+    s = s.replace(mid, '');
+    var lead = new RegExp('^\\s*(?:' + num + '\\s*' + unit + '\\s*,\\s*)*' + num + '\\s*' + unit + '(?=\\s*(?:' + sep + '|\\d|$))\\s*(?:' + sep + '\\s*)?', 'i');
+    while (lead.test(s)) s = s.replace(lead, '');
+    var trailParen = new RegExp('\\s*\\(\\s*' + num + '\\s*' + unit + '\\s*\\)\\s*$', 'i');
+    var trailSep = new RegExp('\\s*' + sep + '\\s*' + num + '\\s*' + unit + '\\s*$', 'i');
+    var before;
+    do {
+      before = s;
+      s = s.replace(trailParen, '').replace(trailSep, '');
+    } while (s !== before);
+    if (new RegExp('^\\s*' + num + '\\s*' + unit + '\\s*$', 'i').test(s)) s = '';
+    if (s === orig) return s;
+    s = s.replace(/\s{2,}/g, ' ').replace(/^[·•|:\-–—]\s*/, '').replace(/\s*[·•|:\-–—]$/, '').trim();
+    return s;
+  }
+
   // A scraped title can be an error page's junk name ("Error" when a
   // platform blocks datacenter IPs) — never show that as the video's
   // name; fall back to the neutral placeholder instead.
@@ -1035,12 +1034,39 @@
         low === '404 not found' || low === 'access denied' ||
         low === 'forbidden' || low === 'unavailable') return 'video';
     if (/^error\s*[|\-–—]/.test(s)) return 'video';
+    // Strip engagement counts, then re-check: stripping can expose a
+    // junk title underneath ("79K views · Error" -> "Error").
+    s = stripTitleCounts(s);
+    if (!s) return 'video';
+    low = s.toLowerCase();
+    if (low === 'error' || low === 'something went wrong' ||
+        low === 'page not found' || low === 'not found' ||
+        low === '404 not found' || low === 'access denied' ||
+        low === 'forbidden' || low === 'unavailable') return 'video';
+    if (/^error\s*[|\-–—]/.test(s)) return 'video';
     return s;
+  }
+
+  // FILENAME TITLE (2026-11-25, user rule): a downloaded file is named
+  // from the ORIGINAL title or our cleaned title — never a third-party
+  // lane's title. Order: an original /api/meta title first, then the
+  // display title when it came from an original lane, then the
+  // /api/meta title (the platform-derived replacement the rule names),
+  // else the generic name. A third-party /api/info title is never used
+  // directly as a filename.
+  function fileTitle() {
+    var m = String(metaTitle || '').trim();
+    var c = String(currentTitle || '').trim();
+    if (m && m !== 'video' && metaTitleOrigin === 'original') return m;
+    if (c && c !== 'video' && currentTitleOrigin === 'original') return c;
+    if (m && m !== 'video') return m;
+    return 'video';
   }
 
   function renderPreview(data) {
     resetPreviewPlayer();
     currentTitle = cleanTitle(data.title);
+    currentTitleOrigin = data.titleOrigin || 'original';
     currentThumb = data.thumbnail || '';
     titleEl.textContent = currentTitle;
     uploaderEl.textContent = data.uploader ? 'By ' + data.uploader : '';
@@ -1068,6 +1094,12 @@
 
   async function fetchInfo(url) {
     currentUrl = url;
+    // Fresh search: no title from a previous paste may leak into this
+    // video's filename (fileTitle reads these).
+    currentTitle = '';
+    currentTitleOrigin = 'original';
+    metaTitle = '';
+    metaTitleOrigin = 'original';
     var reqId = ++latestReq;
     var renderedForReq = false; // anything at all shown (preview or full result)
     var resultRendered = false; // the FULL result (qualities) shown — a meta
@@ -1150,6 +1182,8 @@
         var data = res && res.data;
         if (reqId !== latestReq || !data || !data.title) return;
         metaDuration = data.duration || 0;
+        metaTitle = cleanTitle(data.title);
+        metaTitleOrigin = data.titleOrigin || 'original';
         if (data.formats && data.formats.length) {
           // The preview already carries this link's qualities (X: the
           // tweet page embeds the direct files, so /api/meta attaches
@@ -1633,7 +1667,7 @@
         var serverSave = function () {
           window.location.href = (currentInfoOrigin || '') + '/api/save?url=' + encodeURIComponent(currentUrl) +
             '&formatId=' + encodeURIComponent(f.id) +
-            '&t=' + encodeURIComponent(currentTitle);
+            '&t=' + encodeURIComponent(fileTitle());
           reset();
         };
         // Open the file in a new tab with NO Referer (same reason as
@@ -1645,7 +1679,7 @@
           a.target = '_blank';
           a.rel = 'noopener';
           a.referrerPolicy = 'no-referrer';
-          a.download = safeFileName(currentTitle, f.ext);
+          a.download = safeFileName(fileTitle(), f.ext);
           document.body.appendChild(a);
           a.click();
           a.remove();
@@ -1658,7 +1692,7 @@
         // platforms, where there IS no server save: the browser then
         // opens the file itself in a new tab.
         var legacy = function () {
-          downloadDirect(f.url, safeFileName(currentTitle, f.ext), function (done, total, bps) {
+          downloadDirect(f.url, safeFileName(fileTitle(), f.ext), function (done, total, bps) {
             btn.textContent = progressText(done, total, bps);
           }).then(function (ok) {
             if (ok) { btn.textContent = 'Saved ✓'; reset(); }
@@ -1673,7 +1707,7 @@
           // a download that used to work. A file over the parallel cap
           // never goes through a whole-file fetch: it opens in a tab
           // (client-side-only) or takes the server stream instead.
-          tryFastDownload(f, data.formats, safeFileName(currentTitle, f.ext), btn).then(function (res) {
+          tryFastDownload(f, data.formats, safeFileName(fileTitle(), f.ext), btn).then(function (res) {
             if (res === 'saved') { btn.textContent = 'Saved ✓'; reset(); }
             else if (res === 'toobig') { if (currentClientSide) openTab(); else serverSave(); }
             else legacy();
@@ -1688,6 +1722,7 @@
 
   function renderResult(data) {
     currentTitle = cleanTitle(data.title);
+    currentTitleOrigin = data.titleOrigin || 'original';
     currentThumb = data.thumbnail || '';
     currentClientSide = !!data.clientSide;
     titleEl.textContent = currentTitle;
