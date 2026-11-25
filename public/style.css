@@ -207,8 +207,10 @@ button.secondary:hover:not(:disabled) { box-shadow: none; background: var(--bord
 .card h3 { font-size: 16px; margin: 20px 0 12px; }
 
 /* Preview player — modern player (Plyr, local bundle). The box is sized
-   from the clip's own ratio by JS (see sizePreviewPlayer in app.js):
-   the video is always shown whole, never cropped or stretched.
+   from the clip's own ratio by JS (see sizePreviewPlayerFromRatio in
+   app.js) — from the thumbnail, which loads fast and has the video's
+   ratio, so the box is right from the preview and never jumps. The
+   video is always shown whole, never cropped or stretched.
    object-fit: contain is the backstop so the frame itself never
    stretches either. The old hover-zoom is gone: a player with controls
    must not zoom under the mouse. */
@@ -218,7 +220,7 @@ button.secondary:hover:not(:disabled) { box-shadow: none; background: var(--bord
 .player .plyr__video-wrapper { border-radius: 12px; }
 .player video { width: 100%; height: 100%; object-fit: contain; background: #0b0f13; display: block; }
 .player img {
-  width: 100%; max-height: 260px; object-fit: contain; border-radius: 12px;
+  width: 100%; height: 100%; object-fit: contain; border-radius: 12px;
   background: #0b0f13; display: block;
 }
 .player.no-video .plyr { display: none; }
@@ -320,7 +322,6 @@ button.secondary:hover:not(:disabled) { box-shadow: none; background: var(--bord
   form.url-form button { flex: 1; }
   .preview { flex-direction: column; }
   .player { flex: none; width: 100%; margin: 0 auto; }
-  .player img { max-height: 240px; }
   .quality-grid { grid-template-columns: repeat(2, 1fr); }
 }
 @media (prefers-reduced-motion: reduce) {

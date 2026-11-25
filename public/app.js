@@ -92,24 +92,39 @@
   var previewSized = false;    // true once the current video was measured
   var previewResizeTimer = null;
 
-  // Size the player box from the video's NATURAL ratio so the clip is
-  // shown whole — never cropped, never stretched — whatever its shape:
-  // 9:16 vertical, 16:9 horizontal, 1:1, 4:5. The box is as wide as
-  // the layout allows and at most ~70vh tall on desktop, ~60vh on a
-  // phone; the width follows from the height, so a vertical clip stays
-  // narrow and tall instead of being squeezed into a wide box.
-  function sizePreviewPlayer() {
-    if (!videoEl || !videoEl.videoWidth || !videoEl.videoHeight || !playerWrap) return;
-    var ratio = videoEl.videoWidth / videoEl.videoHeight;
+  // Size the player box from a ratio (video or thumbnail — the thumbnail
+  // has the same ratio as the video and loads much faster, so the box is
+  // right from the preview instead of jumping when the stream's metadata
+  // finally arrives). The box is as wide as the layout allows and at most
+  // ~70vh tall, so a vertical clip fills the phone's width instead of
+  // sitting in a narrow strip; the video is always shown whole — never
+  // cropped, never stretched — whatever its shape: 9:16, 16:9, 1:1, 4:5.
+  function sizePreviewPlayerFromRatio(ratio) {
+    if (!ratio || !playerWrap) return;
     var availW = playerWrap.parentElement ? playerWrap.parentElement.clientWidth : 0;
     var isPhone = window.innerWidth <= 600;
-    var maxH = Math.round(window.innerHeight * (isPhone ? 0.60 : 0.70));
+    var maxH = Math.round(window.innerHeight * 0.70);
     var w = Math.min(availW, maxH * ratio);
     if (!isPhone) w = Math.min(w, availW * 0.55); // keep room for the meta column
     if (w < 200) w = 200; // Plyr's own minimum width
     playerWrap.style.width = Math.round(w) + 'px';
     playerWrap.style.height = Math.round(w / ratio) + 'px';
     previewSized = true;
+  }
+
+  function sizePreviewPlayer() {
+    if (!videoEl || !videoEl.videoWidth || !videoEl.videoHeight) return;
+    sizePreviewPlayerFromRatio(videoEl.videoWidth / videoEl.videoHeight);
+  }
+
+  // Size from the thumbnail: it loads in under a second and carries the
+  // video's own ratio, so the box is correct from the preview onward and
+  // never jumps when the stream's metadata arrives (the metadata re-size
+  // then lands on the same numbers). No-op until the thumbnail has a
+  // natural size.
+  function sizeFromThumb() {
+    if (!thumbImg || !thumbImg.naturalWidth || !thumbImg.naturalHeight) return;
+    sizePreviewPlayerFromRatio(thumbImg.naturalWidth / thumbImg.naturalHeight);
   }
 
   function setupPreviewPlayer() {
@@ -739,7 +754,16 @@
       videoEl.removeAttribute('src');
       videoEl.style.display = 'none';
     }
-    if (data.thumbnail) { thumbImg.src = data.thumbnail; thumbImg.style.display = ''; }
+    if (data.thumbnail) {
+      thumbImg.src = data.thumbnail; thumbImg.style.display = '';
+      // Size the box from the thumbnail NOW (same ratio as the video):
+      // it loads in under a second, so the box never jumps when the
+      // stream's metadata arrives later. Setting src makes complete
+      // false until the new image loads, so the immediate call only
+      // fires when this thumbnail was already loaded.
+      if (thumbImg.complete && thumbImg.naturalWidth) sizeFromThumb();
+      thumbImg.addEventListener('load', sizeFromThumb, { once: true });
+    }
     else thumbImg.style.display = 'none';
     if (playerWrap) playerWrap.style.display = data.thumbnail ? '' : 'none';
     formatsEl.innerHTML = '<li class="loading">Finding qualities…</li>';
@@ -1006,6 +1030,7 @@
     if (videoEl) {
       if (hasVideo) {
         resetPreviewPlayer();
+        sizeFromThumb(); // keep the preview's size: the box must not shrink back while the stream loads
         videoEl.referrerPolicy = 'no-referrer';
         videoEl.src = data.previewUrl;
         videoEl.poster = data.thumbnail || '';
@@ -1024,6 +1049,7 @@
         };
       } else {
         resetPreviewPlayer();
+        sizeFromThumb(); // thumbnail-only result (e.g. X): keep the preview's size
         videoEl.style.display = 'none';
         if (playerWrap) playerWrap.classList.add('no-video');
         if (data.thumbnail) { thumbImg.src = data.thumbnail; thumbImg.style.display = ''; }
@@ -1141,7 +1167,7 @@
     });
   }
 
-  // Prefill the example link for the platform page, if the field is empty.
-  var example = urlInput.getAttribute('data-example') || '';
-  if (example && !urlInput.value) urlInput.placeholder = 'Try: ' + example;
+  // The guiding text in the link box comes from the HTML placeholder
+  // ("Paste your link here" on the home page, "Paste a TikTok link
+  // here…" on a platform page) — never overwritten with an example URL.
 })();
