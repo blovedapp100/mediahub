@@ -3496,6 +3496,14 @@ async function scrapeDirectInfo(url) {
     }
     return null;
   }
+  // Soft-404: a removed ShareChat post sometimes answers 200 (Render
+  // IPs) with a "Page Not Found" page instead of 410 — the scrape below
+  // then finds no video and the chain burns the yt-dlp rounds before a
+  // 25s 502. Catch it from the page itself so the lookup fails fast
+  // with the removed-post message. A live post never carries this
+  // title (verified: dead page "<title>Page Not Found</title>", live
+  // post a real video title, 0 "no longer available" hits).
+  if (key === 'sharechat' && /<title>\s*Page Not Found\s*<\/title>/i.test(html)) return { dead: true };
   const title = decodeEntities(ogTag(html, 'og:title'));
   const thumb = ogTag(html, 'og:image');
   if (key === 'pinterest') {
