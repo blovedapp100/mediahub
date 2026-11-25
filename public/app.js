@@ -1006,9 +1006,24 @@
     timerEl.innerHTML = 'Ready in <b>' + fmtSecs(seconds) + '</b>';
   }
 
+  // A scraped title can be an error page's junk name ("Error" when a
+  // platform blocks datacenter IPs) — never show that as the video's
+  // name; fall back to the neutral placeholder instead.
+  function cleanTitle(t) {
+    var s = String(t || '').trim();
+    if (!s) return 'video';
+    var low = s.toLowerCase();
+    if (low === 'error' || low === 'something went wrong' ||
+        low === 'page not found' || low === 'not found' ||
+        low === '404 not found' || low === 'access denied' ||
+        low === 'forbidden' || low === 'unavailable') return 'video';
+    if (/^error\s*[|\-–—]/.test(s)) return 'video';
+    return s;
+  }
+
   function renderPreview(data) {
     resetPreviewPlayer();
-    currentTitle = data.title || 'video';
+    currentTitle = cleanTitle(data.title);
     currentThumb = data.thumbnail || '';
     titleEl.textContent = currentTitle;
     uploaderEl.textContent = data.uploader ? 'By ' + data.uploader : '';
@@ -1569,7 +1584,7 @@
   }
 
   function renderResult(data) {
-    currentTitle = data.title || 'video';
+    currentTitle = cleanTitle(data.title);
     currentThumb = data.thumbnail || '';
     currentClientSide = !!data.clientSide;
     titleEl.textContent = currentTitle;
