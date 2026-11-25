@@ -75,13 +75,39 @@ a:hover { text-decoration: underline; }
 }
 .theme-toggle:hover { background: rgba(255,255,255,.28); transform: translateY(-1px); }
 
+/* Extension install button (header) — a plain button on the site, never a
+   popup. Hidden on phones (the extension is for desktop Chrome) and hidden
+   by script when the extension is already installed. */
+.ext-install {
+  background: #fff; color: #0b5e57;
+  border: 1px solid rgba(255,255,255,.6); border-radius: 999px;
+  padding: 6px 14px; font-size: 13px; font-weight: 700; cursor: pointer;
+  flex-shrink: 0; /* header must never squeeze the label below its width */
+  transition: background .2s ease, transform .15s ease;
+}
+.ext-install:hover { background: #e6f4f2; transform: translateY(-1px); }
+@media (max-width: 700px) { .ext-install { display: none !important; } }
+
+/* Slim header on phones: a slim bar, not a tall band. */
+@media (max-width: 700px) {
+  .top { padding: 7px 12px; gap: 8px; }
+}
+
+/* Extension install steps (shown inline after clicking Install) */
+.ext-steps { text-align: left; margin: 16px auto 0; max-width: 620px; }
+.ext-steps h3 { margin: 0 0 8px; font-size: 17px; }
+.ext-steps ol { margin: 0 0 10px; padding-left: 20px; color: var(--muted); font-size: 14px; }
+.ext-steps ol li { margin: 4px 0; }
+.ext-steps code { background: var(--surface-2); padding: 1px 6px; border-radius: 6px; font-size: 13px; }
+.ext-steps p { color: var(--muted); font-size: 13px; margin: 0 0 12px; }
+
 .wrap { max-width: 720px; margin: 0 auto; padding: 20px 16px 40px; }
 
 /* Hero — staggered entrance, living gradient headline */
 .hero { text-align: center; padding: 28px 8px 8px; }
 .hero h1 {
   font-size: clamp(30px, 5.4vw, 46px); line-height: 1.12; letter-spacing: -.03em;
-  margin: 0 0 10px; font-weight: 900;
+  margin: 0 0 20px; font-weight: 900;
   animation: fadeUp .6s cubic-bezier(.22, .61, .36, 1) both;
 }
 .hero h1 .grad {
@@ -288,6 +314,7 @@ button.secondary:hover:not(:disabled) { box-shadow: none; background: var(--bord
 
 @media (max-width: 600px) {
   .hero { padding-top: 18px; }
+  .hero h1 .grad { display: block; }
   form.url-form { flex-wrap: wrap; border-radius: var(--radius); }
   form.url-form input[type="url"] { flex: 1 1 100%; }
   form.url-form button { flex: 1; }
