@@ -800,6 +800,30 @@
     msg.textContent = '';
     result.hidden = true;
     formatsEl.innerHTML = '';
+    // JOINT RENDER (2026-11-25): the preview used to render the moment
+    // /api/meta landed, leaving the visitor staring at "Finding
+    // qualities…" for seconds while /api/info finished — the user asked
+    // for preview + qualities TOGETHER, no waiting after the preview.
+    // So the preview is HELD up to 2s for the info to land with it: if
+    // the info arrives within the fuse, one render shows preview +
+    // qualities together (gap 0); if it does not, the preview shows
+    // anyway at the fuse so a slow link never leaves a blank screen.
+    // (X is unaffected: its preview already carries the qualities and
+    // renders the full result at once, as before.)
+    var heldMeta = null; // preview data waiting for the info (or the fuse)
+    var previewFuseTimer = null;
+    var previewShown = false;
+    function clearPreviewFuse() {
+      if (previewFuseTimer) { clearTimeout(previewFuseTimer); previewFuseTimer = null; }
+    }
+    function showHeldPreview() {
+      if (previewShown || !heldMeta || reqId !== latestReq) return;
+      clearPreviewFuse();
+      previewShown = true;
+      renderedForReq = true;
+      renderPreview(heldMeta);
+      timerShown((Date.now() - timerStart) / 1000);
+    }
     // Stage 1 — fast preview (title + thumbnail) in about a second.
     // At most 2 origins (own + 1 backup): a 404 means "no preview for
     // this link" on every region, so trying more only burns time.
@@ -811,7 +835,6 @@
       .then(function (res) {
         var data = res && res.data;
         if (reqId !== latestReq || !data || !data.title) return;
-        renderedForReq = true;
         metaDuration = data.duration || 0;
         if (data.formats && data.formats.length) {
           // The preview already carries this link's qualities (X: the
@@ -821,21 +844,31 @@
           // This is what makes X robust when Stage 2 stalls in a real
           // browser: the qualities are on screen with the preview
           // (~1s) instead of depending on Stage 2's timers at all.
+          clearPreviewFuse();
           currentInfoOrigin = res.origin;
+          renderedForReq = true;
           resultRendered = true;
           renderResult(data);
           timerDone((Date.now() - timerStart) / 1000);
         } else {
-          renderPreview(data);
-          timerShown((Date.now() - timerStart) / 1000);
+          // Hold the preview for the info (joint render): the info
+          // usually lands within 2s of the preview, and then one
+          // render shows both together. The fuse below releases it
+          // on its own if the info is slow.
+          heldMeta = data;
+          clearPreviewFuse();
+          previewFuseTimer = setTimeout(showHeldPreview, 2000);
         }
       })
       .catch(function () {});
     // Cold start: if nothing has rendered after 4s the service is
     // probably waking up (free tier sleeps after 15 min idle) — say so
     // instead of leaving the "usually shows in ~2s" estimate on screen.
+    // (A held preview does not count as "nothing rendered" for this
+    // message: the fuse will release it within 2s, so the wake-up text
+    // would only flash over it.)
     setTimeout(function () {
-      if (reqId === latestReq && !renderedForReq && timerEl) {
+      if (reqId === latestReq && !renderedForReq && !heldMeta && timerEl) {
         timerEl.innerHTML = 'Waking up the server… first load can take a few seconds, please wait.';
       }
     }, 4000);
@@ -853,15 +886,18 @@
     // the server runs the same lookup in the background (POST /api/job)
     // and this code polls it. The fast path above is untouched: a video
     // that answers in time never starts a job. A job starts only when
-    // the sync lookup is about to time out (12s for known-slow links,
+    // the sync lookup is about to time out (8s for known-slow links,
     // 25s otherwise) or when it already timed out below.
     var jobStarted = false; // a job is running for this request
     var jobStopped = false; // Stage 2 won, or a newer request started
     var jobId = null;
     var jobOrigin = '';
     var jobPollTimer = null;
+    // TikTok is known-slow (its sync lookup usually needs the job),
+    // so it joins the known-slow set: the job starts at the first
+    // timer check instead of waiting out the full 25s.
     function isSlowJobLink() {
-      if (platform === 'Douyin' || platform === 'Kuaishou' ||
+      if (platform === 'TikTok' || platform === 'Douyin' || platform === 'Kuaishou' ||
           platform === 'Moj' || platform === 'ShareChat' || platform === 'Zhihu') return true;
       if (platform === 'YouTube' && metaDuration >= 240) return true;
       return false;
@@ -888,6 +924,9 @@
     function jobShowError(text) {
       if (reqId !== latestReq || jobStopped) return;
       stopTimer();
+      // A held preview must not die with the job: show it so the
+      // visitor still sees the video while the error is explained.
+      showHeldPreview();
       if (!renderedForReq) { clearResult(); msg.textContent = text; }
       else if (!resultRendered) formatsEl.innerHTML = '<li class="loading">' + text + '</li>';
       if (reqId === latestReq) setBusy(false);
@@ -895,17 +934,29 @@
     async function startJobFlow() {
       if (jobStarted || reqId !== latestReq || resultRendered) return;
       jobStarted = true;
+      // Show the progress row NOW, before the job POST: a stalled
+      // origin could hang the POST itself, and without this the visitor
+      // stares at "Finding qualities…" with no sign of work.
+      jobShowProgress(0, 'Getting it ready…');
       var origins;
       try { origins = await getOrigins(); } catch (e) { origins = [location.origin]; }
       origins = orderOriginsByRegion(origins.slice());
       var started = null;
       for (var i = 0; i < Math.min(3, origins.length); i++) {
         try {
-          var r = await fetch(origins[i] + '/api/job', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ url: url }),
-          });
+          // 10s cap per origin: a stalled origin must not hang the job
+          // POST forever (the hang that froze TikTok for minutes).
+          var postCtrl = new AbortController();
+          var postTimer = setTimeout(function () { postCtrl.abort(); }, 10000);
+          var r;
+          try {
+            r = await fetch(origins[i] + '/api/job', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ url: url }),
+              signal: postCtrl.signal,
+            });
+          } finally { clearTimeout(postTimer); }
           var d = await r.json().catch(function () { return null; });
           if (r.ok && d && d.jobId) { started = { origin: origins[i], jobId: d.jobId }; break; }
           if (r.status === 429 || r.status === 400) break; // decided: do not burn other origins
@@ -920,10 +971,14 @@
         if (reqId !== latestReq || jobStopped) return;
         if (Date.now() - jobStart > 320000) { jobShowError(platform + ' is taking too long right now. Please try again.'); return; }
         var pr, pd;
+        // 10s cap per poll: a stalled origin must not hang the poll.
+        var pollCtrl = new AbortController();
+        var pollTimer = setTimeout(function () { pollCtrl.abort(); }, 10000);
         try {
-          pr = await fetch(jobOrigin + '/api/job/' + jobId);
+          pr = await fetch(jobOrigin + '/api/job/' + jobId, { signal: pollCtrl.signal });
           pd = await pr.json().catch(function () { return null; });
         } catch (e) { pd = null; }
+        finally { clearTimeout(pollTimer); }
         if (reqId !== latestReq || jobStopped) return;
         if (!pd) { jobPollTimer = setTimeout(poll, 3000); return; }
         if (pd.status === 'ready' && pd.formats && pd.formats.length) {
@@ -952,15 +1007,134 @@
     // Stage 1's meta (which carries the duration) usually lands in ~1s,
     // but the timer is created before that — deciding at creation time
     // would see duration 0 and always take the 25s branch for YouTube.
-    // At 12s, start the job if the link is known-slow by then; otherwise
-    // wait out the remaining time to 25s and start it then.
+    // At 8s, start the job if the link is known-slow by then; otherwise
+    // wait out the remaining time to 25s and start it then. 8s (not
+    // 12s): with the sync grace gone, a healthy TikTok answers by ~4s,
+    // so at 8s the sync path is known-failed and the job — which
+    // resolves TikTok in <5s — is the fastest rescue.
     function jobTimerDue() {
       if (reqId !== latestReq || resultRendered) return;
       var elapsed = Date.now() - timerStart;
       if (isSlowJobLink() || elapsed >= 25000) { startJobFlow(); return; }
       jobTimer = setTimeout(jobTimerDue, 25000 - elapsed);
     }
-    var jobTimer = setTimeout(jobTimerDue, 12000);
+    var jobTimer = setTimeout(jobTimerDue, 8000);
+    // ---- Progressive quality upgrade (TikTok completeness) -----------
+    // The sync answer is fast but may carry only Best (SSSTik) while
+    // tikwm's HD/SD/Audio are still landing. After a TikTok answer with
+    // fewer than the full 4 formats, two silent routes run in parallel
+    // and whichever delivers a fuller list first swaps the format rows
+    // in place (the preview player is untouched): (1) poll GET
+    // /api/merge — the union the race stores when the other leg lands
+    // (~8s); (2) a background job — long tikwm timeout + 10s grace,
+    // the reliable route (~10-13s). Silent: no progress rows, no
+    // errors; if nothing fuller ever arrives, the visitor keeps the
+    // qualities already shown. Stops on a newer request or when the
+    // full list arrives.
+    var upgradeDone = false;
+    var upgradeTimer = null;
+    var upgradeJobTimer = null;
+    var upgradeJobId = null;
+    var upgradeJobOrigin = '';
+    function upgradeStop() {
+      upgradeDone = true;
+      if (upgradeTimer) { clearTimeout(upgradeTimer); upgradeTimer = null; }
+      if (upgradeJobTimer) { clearTimeout(upgradeJobTimer); upgradeJobTimer = null; }
+      if (upgradeJobId && upgradeJobOrigin) {
+        fetch(upgradeJobOrigin + '/api/job/' + upgradeJobId, { method: 'DELETE' }).catch(function () {});
+        upgradeJobId = null;
+      }
+    }
+    function upgradeSwap(data) {
+      if (reqId !== latestReq || upgradeDone || !data || !Array.isArray(data.formats)) return false;
+      var shown = formatsEl.querySelectorAll('li').length;
+      if (data.formats.length <= shown) return false;
+      renderFormats(data);
+      return true;
+    }
+    function maybeUpgradeQualities(data) {
+      if (platform !== 'TikTok' || !data || !Array.isArray(data.formats)) return;
+      if (data.formats.length >= 4) return; // full set already (Best + HD + SD + Audio)
+      if (reqId !== latestReq) return;
+      var mergeOrigin = currentInfoOrigin || location.origin;
+      var mergeDeadline = Date.now() + 12000;
+      var pollMerge = async function () {
+        if (reqId !== latestReq || upgradeDone) return;
+        if (Date.now() > mergeDeadline) return; // the job below is the remaining route
+        try {
+          var mCtrl = new AbortController();
+          var mTimer = setTimeout(function () { mCtrl.abort(); }, 5000);
+          var r;
+          try {
+            r = await fetch(mergeOrigin + '/api/merge?url=' + encodeURIComponent(url), { signal: mCtrl.signal });
+          } finally { clearTimeout(mTimer); }
+          if (r.ok) {
+            var d = await r.json().catch(function () { return null; });
+            if (d && upgradeSwap(d)) { upgradeStop(); return; }
+          }
+        } catch (e) { /* next poll */ }
+        if (reqId !== latestReq || upgradeDone) return;
+        upgradeTimer = setTimeout(pollMerge, 2000);
+      };
+      pollMerge();
+      // Silent background job: same lookup with no sync cap, so tikwm
+      // gets its 15s timeout and the 10s grace can merge it. Started
+      // at once (the job itself takes ~10s) — the merge poll above
+      // usually wins first when tikwm cooperates quickly.
+      (async function () {
+        if (reqId !== latestReq || upgradeDone) return;
+        var origins;
+        try { origins = await getOrigins(); } catch (e) { origins = [location.origin]; }
+        origins = orderOriginsByRegion(origins.slice());
+        var started = null;
+        for (var i = 0; i < Math.min(3, origins.length); i++) {
+          try {
+            var postCtrl = new AbortController();
+            var postTimer = setTimeout(function () { postCtrl.abort(); }, 10000);
+            var rr;
+            try {
+              rr = await fetch(origins[i] + '/api/job', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url: url }),
+                signal: postCtrl.signal,
+              });
+            } finally { clearTimeout(postTimer); }
+            var dd = await rr.json().catch(function () { return null; });
+            if (rr.ok && dd && dd.jobId) { started = { origin: origins[i], jobId: dd.jobId }; break; }
+            if (rr.status === 429 || rr.status === 400) break;
+          } catch (e) { /* next origin */ }
+          if (reqId !== latestReq || upgradeDone) return;
+        }
+        if (!started) return;
+        upgradeJobOrigin = started.origin;
+        upgradeJobId = started.jobId;
+        var jobStart = Date.now();
+        var poll = async function () {
+          if (reqId !== latestReq) { upgradeStop(); return; }
+          if (upgradeDone) return;
+          if (Date.now() - jobStart > 60000) { upgradeStop(); return; }
+          var pr, pd;
+          var pCtrl = new AbortController();
+          var pTimer = setTimeout(function () { pCtrl.abort(); }, 10000);
+          try {
+            pr = await fetch(upgradeJobOrigin + '/api/job/' + upgradeJobId, { signal: pCtrl.signal });
+            pd = await pr.json().catch(function () { return null; });
+          } catch (e) { pd = null; }
+          finally { clearTimeout(pTimer); }
+          if (reqId !== latestReq) { upgradeStop(); return; }
+          if (upgradeDone) return;
+          if (pd && pd.status === 'ready' && pd.formats && pd.formats.length) {
+            upgradeSwap(pd);
+            upgradeStop(); // job is done either way — nothing fuller left to show
+            return;
+          }
+          if (pd && (pd.status === 'failed' || pr.status === 404)) { upgradeStop(); return; }
+          upgradeJobTimer = setTimeout(poll, 3000);
+        };
+        poll();
+      })();
+    }
     try {
       var infoBudget = new Promise(function (resolve, reject) {
         setTimeout(function () {
@@ -979,16 +1153,22 @@
       ]);
       jobStop(); // Stage 2 won: stop any job polling and free its slot
       if (reqId !== latestReq) return;
+      clearPreviewFuse(); // joint render: the preview was held for this — show both at once
       currentInfoOrigin = res.origin;
       renderedForReq = true;
       resultRendered = true;
       renderResult(res.data);
       timerDone((Date.now() - timerStart) / 1000);
+      maybeUpgradeQualities(res.data);
     } catch (err) {
       if (reqId !== latestReq) return;
       clearTimeout(jobTimer);
       if (jobStarted) return; // the job flow owns the UI now
       stopTimer();
+      // The info failed: no point holding the preview out for the fuse
+      // any longer — show it now so the visitor at least sees the
+      // video while the error is explained below.
+      showHeldPreview();
       // Nothing rendered for this request: clear the old card so no
       // stale video sits under the error. When the preview did render,
       // keep it and show the failure inside the quality list instead.
@@ -1026,66 +1206,9 @@
     }
   }
 
-  function renderResult(data) {
-    currentTitle = data.title || 'video';
-    currentClientSide = !!data.clientSide;
-    titleEl.textContent = currentTitle;
-    uploaderEl.textContent = data.uploader ? 'By ' + data.uploader : '';
-    durationEl.textContent = data.duration ? 'Length: ' + fmtDuration(data.duration) : '';
-    if (noteEl) {
-      if (data.note) { noteEl.textContent = data.note; noteEl.hidden = false; }
-      else noteEl.hidden = true;
-    }
-
-    // Proper preview player: play the source stream when possible,
-    // fall back to the still image if the stream cannot play.
-    var hasVideo = !!(data.previewUrl && videoEl);
-    if (videoEl) {
-      if (hasVideo) {
-        // v3: the result can render TWICE for one link (sync info, then
-        // the background-job result ~60s later). The second render
-        // reset the box and sized it from the (by then loaded) 9:16
-        // cover, while the video's 3:4 re-size never re-fired — setting
-        // the SAME src does not fire loadedmetadata again, and
-        // setupPreviewPlayer() early-returns once Plyr exists. So: if
-        // the stream's metadata is already here, size from the VIDEO
-        // right away; only fall back to the thumbnail while the stream
-        // is still loading (its loadedmetadata listener then overrides
-        // the thumb, as v2 intended).
-        var hadVideoMeta = !!(videoEl.videoWidth && videoEl.videoHeight);
-        resetPreviewPlayer();
-        if (hadVideoMeta) sizePreviewPlayer();
-        else sizeFromThumb(); // keep the preview's size while the stream loads
-        videoEl.referrerPolicy = 'no-referrer';
-        videoEl.src = data.previewUrl;
-        videoEl.poster = data.thumbnail || '';
-        videoEl.style.display = '';
-        thumbImg.style.display = 'none';
-        videoEl.load();
-        setupPreviewPlayer();
-        videoEl.onerror = function () {
-          // The stream cannot play: hide the whole player box (the
-          // Plyr frame would otherwise sit there empty) and fall back
-          // to the still image, exactly like the old player did.
-          pausePreviewPlayer();
-          videoEl.style.display = 'none';
-          if (playerWrap) playerWrap.classList.add('no-video');
-          if (data.thumbnail) { thumbImg.src = data.thumbnail; thumbImg.style.display = ''; }
-        };
-      } else {
-        resetPreviewPlayer();
-        sizeFromThumb(); // thumbnail-only result (e.g. X): keep the preview's size
-        videoEl.style.display = 'none';
-        if (playerWrap) playerWrap.classList.add('no-video');
-        if (data.thumbnail) { thumbImg.src = data.thumbnail; thumbImg.style.display = ''; }
-        else thumbImg.style.display = 'none';
-      }
-    } else if (data.thumbnail) {
-      thumbImg.src = data.thumbnail;
-      thumbImg.style.display = '';
-    }
-    if (playerWrap) playerWrap.style.display = (hasVideo || data.thumbnail) ? '' : 'none';
-
+  // The format rows, extracted so the progressive upgrade can swap
+  // them in place without touching the preview player or scrolling.
+  function renderFormats(data) {
     formatsEl.innerHTML = '';
     data.formats.forEach(function (f, i) {
       var li = document.createElement('li');
@@ -1156,6 +1279,69 @@
       });
       formatsEl.appendChild(li);
     });
+  }
+
+  function renderResult(data) {
+    currentTitle = data.title || 'video';
+    currentClientSide = !!data.clientSide;
+    titleEl.textContent = currentTitle;
+    uploaderEl.textContent = data.uploader ? 'By ' + data.uploader : '';
+    durationEl.textContent = data.duration ? 'Length: ' + fmtDuration(data.duration) : '';
+    if (noteEl) {
+      if (data.note) { noteEl.textContent = data.note; noteEl.hidden = false; }
+      else noteEl.hidden = true;
+    }
+
+    // Proper preview player: play the source stream when possible,
+    // fall back to the still image if the stream cannot play.
+    var hasVideo = !!(data.previewUrl && videoEl);
+    if (videoEl) {
+      if (hasVideo) {
+        // v3: the result can render TWICE for one link (sync info, then
+        // the background-job result ~60s later). The second render
+        // reset the box and sized it from the (by then loaded) 9:16
+        // cover, while the video's 3:4 re-size never re-fired — setting
+        // the SAME src does not fire loadedmetadata again, and
+        // setupPreviewPlayer() early-returns once Plyr exists. So: if
+        // the stream's metadata is already here, size from the VIDEO
+        // right away; only fall back to the thumbnail while the stream
+        // is still loading (its loadedmetadata listener then overrides
+        // the thumb, as v2 intended).
+        var hadVideoMeta = !!(videoEl.videoWidth && videoEl.videoHeight);
+        resetPreviewPlayer();
+        if (hadVideoMeta) sizePreviewPlayer();
+        else sizeFromThumb(); // keep the preview's size while the stream loads
+        videoEl.referrerPolicy = 'no-referrer';
+        videoEl.src = data.previewUrl;
+        videoEl.poster = data.thumbnail || '';
+        videoEl.style.display = '';
+        thumbImg.style.display = 'none';
+        videoEl.load();
+        setupPreviewPlayer();
+        videoEl.onerror = function () {
+          // The stream cannot play: hide the whole player box (the
+          // Plyr frame would otherwise sit there empty) and fall back
+          // to the still image, exactly like the old player did.
+          pausePreviewPlayer();
+          videoEl.style.display = 'none';
+          if (playerWrap) playerWrap.classList.add('no-video');
+          if (data.thumbnail) { thumbImg.src = data.thumbnail; thumbImg.style.display = ''; }
+        };
+      } else {
+        resetPreviewPlayer();
+        sizeFromThumb(); // thumbnail-only result (e.g. X): keep the preview's size
+        videoEl.style.display = 'none';
+        if (playerWrap) playerWrap.classList.add('no-video');
+        if (data.thumbnail) { thumbImg.src = data.thumbnail; thumbImg.style.display = ''; }
+        else thumbImg.style.display = 'none';
+      }
+    } else if (data.thumbnail) {
+      thumbImg.src = data.thumbnail;
+      thumbImg.style.display = '';
+    }
+    if (playerWrap) playerWrap.style.display = (hasVideo || data.thumbnail) ? '' : 'none';
+
+    renderFormats(data);
     result.hidden = false;
     result.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
