@@ -2878,6 +2878,16 @@ async function ogScrapeMeta(url, timeoutMs) {
     // — that is not the video's title, so treat it as no preview
     // rather than flash the wrong name; Stage 2 renders the real one.
     if (clientSideKey(url) === 'kuaishou' && title === '短视频-快手') return null;
+    // Error/block pages (Facebook serves one to datacenter IPs) carry a
+    // junk <title> like "Error" — that is not the video's title, so
+    // treat it as no preview rather than flash "Error" as the video's
+    // name; Stage 2 renders the real title when the info lands.
+    const junkTitle = String(title || '').trim().toLowerCase();
+    if (junkTitle === 'error' || junkTitle === 'something went wrong' ||
+        junkTitle === 'page not found' || junkTitle === 'not found' ||
+        junkTitle === '404 not found' || junkTitle === 'access denied' ||
+        junkTitle === 'forbidden' || junkTitle === 'unavailable' ||
+        /^error\s*[|\-–—]/.test(String(title || '').trim())) return null;
     if (title || img) return { title: title || 'Video', thumbnail: img, uploader: ogTag(html, 'og:site_name') || '', duration: 0 };
     return null;
   } catch { return null; }
