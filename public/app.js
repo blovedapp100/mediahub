@@ -1184,7 +1184,8 @@
     // timer check instead of waiting out the full 25s.
     function isSlowJobLink() {
       if (platform === 'TikTok' || platform === 'Douyin' || platform === 'Kuaishou' ||
-          platform === 'Moj' || platform === 'ShareChat' || platform === 'Zhihu') return true;
+          platform === 'Moj' || platform === 'ShareChat' || platform === 'Zhihu' ||
+          platform === 'Facebook' || platform === 'Instagram') return true;
       if (platform === 'YouTube' && metaDuration >= 240) return true;
       return false;
     }
