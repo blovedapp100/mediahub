@@ -177,6 +177,38 @@
       playerWrap.style.height = '';
       playerWrap.style.aspectRatio = '';
       playerWrap.classList.remove('no-video');
+      // A previous video's poster must not sit over the new preview:
+      // Plyr mirrors the poster into its own .plyr__poster div and
+      // never refreshes it when the src changes directly, so hide it
+      // here; showPreviewPoster() below puts the new one back.
+      var pp = playerWrap.querySelector('.plyr__poster');
+      if (pp) pp.style.display = 'none';
+    }
+  }
+
+  // The poster can be a different crop from the video (TikTok's cover
+  // is 3:4, the clip 9:16), so while paused it letterboxes inside the
+  // box and looks like a broken player — the box itself is the video's
+  // true ratio (sized from its metadata). Once the first frame is
+  // decoded, drop the poster so the paused player shows the video's
+  // own first frame, which always matches the box. Plyr mirrors the
+  // poster into its own .plyr__poster div (background-size: contain),
+  // so removing the attribute alone leaves that div showing the old
+  // crop — hide it too. If the frame never arrives (stream fails),
+  // the poster stays and the error fallback takes over, so this can
+  // never leave a black box. Audio-only keeps its poster (no frame).
+  function clearPreviewPoster() {
+    if (!videoEl || !videoEl.videoWidth || !videoEl.videoHeight) return;
+    videoEl.removeAttribute('poster');
+    var p = playerWrap ? playerWrap.querySelector('.plyr__poster') : null;
+    if (p) p.style.display = 'none';
+  }
+  function showPreviewPoster(url) {
+    if (videoEl && url) videoEl.setAttribute('poster', url);
+    var p = playerWrap ? playerWrap.querySelector('.plyr__poster') : null;
+    if (p && url) {
+      p.style.display = '';
+      p.style.backgroundImage = "url('" + url + "')";
     }
   }
 
@@ -1313,11 +1345,22 @@
         else sizeFromThumb(); // keep the preview's size while the stream loads
         videoEl.referrerPolicy = 'no-referrer';
         videoEl.src = data.previewUrl;
-        videoEl.poster = data.thumbnail || '';
+        showPreviewPoster(data.thumbnail);
         videoEl.style.display = '';
         thumbImg.style.display = 'none';
+        // preload="auto" (not the HTML's "metadata"): the first frame
+        // must be buffered, or the paused player has no frame to show
+        // once the poster is dropped below.
+        videoEl.preload = 'auto';
         videoEl.load();
         setupPreviewPlayer();
+        // Once the first frame is decoded, drop the poster: the paused
+        // player then shows the video's own first frame (never
+        // letterboxed), instead of a cover crop that can differ from
+        // the clip. Re-attached per result; the once flag + the
+        // removeEventListener keep at most one pending listener.
+        videoEl.removeEventListener('loadeddata', clearPreviewPoster);
+        videoEl.addEventListener('loadeddata', clearPreviewPoster, { once: true });
         videoEl.onerror = function () {
           // The stream cannot play: hide the whole player box (the
           // Plyr frame would otherwise sit there empty) and fall back
