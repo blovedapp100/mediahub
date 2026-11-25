@@ -110,7 +110,10 @@
     if (!fromVideo && previewVideoSized) return; // the video's ratio already won
     var availW = playerWrap.parentElement ? playerWrap.parentElement.clientWidth : 0;
     var isPhone = window.innerWidth <= 600;
-    var maxH = Math.round(window.innerHeight * 0.70);
+    // MOBILE-WIDTH FIX: on a phone the 0.70 cap shrank a 9:16 player to
+    // ~74% of the screen (browser chrome eats viewport height). 0.78
+    // keeps the player + title on screen while using the width.
+    var maxH = Math.round(window.innerHeight * (isPhone ? 0.78 : 0.70));
     var w = Math.min(availW, maxH * ratio);
     if (!isPhone) w = Math.min(w, availW * 0.55); // keep room for the meta column
     if (w < 200) w = 200; // Plyr's own minimum width
@@ -179,6 +182,18 @@
         clickToPlay: true,
       });
     } catch (e) { previewPlyr = null; return; }
+    // MOBILE-BLACK FIX: Plyr builds its own .plyr__poster div at init
+    // and only fills it after its own image preload resolves — on a
+    // slow connection the pre-play player sits black meanwhile. The
+    // poster attribute was set before Plyr existed, so re-apply it now
+    // that the div exists: the div gets the image at once (plus the
+    // poster-enabled class, which is what makes it visible at all).
+    var _posterUrl = videoEl.getAttribute('poster');
+    if (_posterUrl) {
+      showPreviewPoster(_posterUrl);
+      var _plyrEl = playerWrap ? playerWrap.querySelector('.plyr') : null;
+      if (_plyrEl) _plyrEl.classList.add('plyr__poster-enabled');
+    }
     videoEl.addEventListener('loadedmetadata', sizePreviewPlayer);
     if (videoEl.readyState >= 1) sizePreviewPlayer();
   }
@@ -219,6 +234,11 @@
   // never leave a black box. Audio-only keeps its poster (no frame).
   function clearPreviewPoster() {
     if (!videoEl || !videoEl.videoWidth || !videoEl.videoHeight) return;
+    // MOBILE-BLACK FIX: if the video is hidden (error fallback, or a
+    // stale preview overwrote the result), the poster is the only
+    // thing that could show — dropping it leaves a black box. Only
+    // clear it when the video is actually on screen.
+    if (videoEl.style.display === 'none' || (typeof getComputedStyle === 'function' && getComputedStyle(videoEl).display === 'none')) return;
     videoEl.removeAttribute('poster');
     var p = playerWrap ? playerWrap.querySelector('.plyr__poster') : null;
     if (p) p.style.display = 'none';
@@ -871,6 +891,11 @@
     }
     function showHeldPreview() {
       if (previewShown || !heldMeta || reqId !== latestReq) return;
+      // MOBILE-BLACK FIX: the info can land BEFORE the meta (parallel
+      // fetches). If the full result already rendered, the preview must
+      // never overwrite it — renderPreview() hides the video and shows
+      // the (clipped) thumbnail, leaving a black player.
+      if (resultRendered) return;
       clearPreviewFuse();
       previewShown = true;
       renderedForReq = true;
@@ -908,6 +933,11 @@
           // usually lands within 2s of the preview, and then one
           // render shows both together. The fuse below releases it
           // on its own if the info is slow.
+          // MOBILE-BLACK FIX: the info may already have rendered
+          // (it can land before the meta). Arming the fuse now would
+          // fire showHeldPreview() 2s later and clobber the finished
+          // result back to the preview (video hidden -> black box).
+          if (resultRendered) return;
           heldMeta = data;
           clearPreviewFuse();
           previewFuseTimer = setTimeout(showHeldPreview, 2000);
