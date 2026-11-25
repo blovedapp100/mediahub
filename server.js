@@ -2581,6 +2581,11 @@ async function ytdlpInfoWithFallbacks(url) {
     // mirror is a RACE side now (raceFirstFull below), not a last
     // resort: whichever of the mirror / own passes returns a FULL list
     // first wins, so a round ends at the first success.
+    // FAST FIRST RENDER (speed fix 2026-11-25): laneStart marks when the
+    // mirror fetch starts, so the degraded-mirror deadline below is
+    // measured from the lane start, not from when the mirror happens
+    // to be checked.
+    const laneStart = Date.now();
     let mirrorBest = null;
     const mirrorDone = withTimeout(mirrorInfo(url), 9000, 'mirror timeout')
       .then((info) => { if (info) mirrorBest = { info, clientArgs: null }; })
@@ -2596,6 +2601,33 @@ async function ytdlpInfoWithFallbacks(url) {
       }
       return null;
     });
+    // FAST FIRST RENDER (speed fix 2026-11-25): a DEGRADED mirror
+    // answer (itag 18 progressive, with sound) that lands within
+    // ~3s of the lane start settles the lookup at once — the visitor
+    // gets a playable preview + the 360p quality in ~2s instead of
+    // waiting ~22s for the own passes. The mirror's own landing
+    // time decides: no fixed 3s sleep is added when the mirror is
+    // already in hand. After the deadline the promise never settles
+    // and the lookup falls through to the existing raceFirstFull
+    // behaviour unchanged. A full mirror answer never resolves here
+    // (it is the raceFirstFull side above). A geo-block rejects
+    // instead, so the geo fast-fail still wins over a degraded
+    // mirror in both paths.
+    const mirrorDegradedP = (async () => {
+      const waited = await Promise.race([
+        mirrorDone.then(() => 'mirror'),
+        geoWatch.then(() => 'geo'),
+        new Promise((r) => setTimeout(() => r('timeout'),
+          Math.max(0, 3000 - (Date.now() - laneStart)))),
+      ]);
+      if (waited === 'geo') geoThrow();
+      if (waited !== 'mirror') return new Promise(() => {});
+      if (mirrorBest && isDegradedInfo(mirrorBest.info)) {
+        mirrorBest.partial = true;
+        return mirrorBest;
+      }
+      return new Promise(() => {});
+    })();
     // Two passes: direct egress first, then the WARP proxy. Direct
     // first, so a host whose own IP works never hides behind the
     // proxy; the proxy only runs when direct fails.
@@ -2668,10 +2700,18 @@ async function ytdlpInfoWithFallbacks(url) {
     // error. The old code used the mirror only after both passes
     // failed (5 clients x 9s + 5 x 12s nominal), so a mirror that
     // answered in ~2s was never reached inside the 25s cap.
-    const winner = await raceFirstFull([
-      runOwnPasses(),
-      mirrorFullP,
-    ], 500);
+    // FAST FIRST RENDER: the race below is itself raced against
+    // mirrorDegradedP — a degraded mirror that landed within ~3s of
+    // the lane start returns at once (partial: true) instead of
+    // waiting out the own passes; the frontend then upgrades it in
+    // place via a background job.
+    const winner = await Promise.race([
+      raceFirstFull([
+        runOwnPasses(),
+        mirrorFullP,
+      ], 500),
+      mirrorDegradedP,
+    ]);
     // PREVIEW SOUND (2026-11-25): the winner's list can be DASH-only
     // (yt-dlp pairs "133+140" carry only a video-only URL), so
     // previewUrl() picks a silent stream while the quality is labelled
@@ -2679,30 +2719,94 @@ async function ytdlpInfoWithFallbacks(url) {
     // progressive (video+audio) format must be prepended so the
     // preview has sound — and it also appears as a real extra quality
     // in the list (a real file with sound, not a fake entry).
-    // Sources, in order: the own android fallback (itag 18) if it
-    // already ran, else the mirror result (Piped progressive
+    // DIAGNOSIS (2026-11-25, video 2ptQ0Z1deuA): the prepend missed
+    // because NEITHER source had a progressive format in hand — the
+    // own default client returned a FULL list (53 formats, zero
+    // progressive, no format 18 at all), so the android client never
+    // ran and ownFallback stayed null; and the Piped mirror answered
+    // 500 (SignInConfirmNotBot / LOGIN_REQUIRED), so mirrorBest was
+    // null too. The winner's previewUrl then fell through to the
+    // highest direct video-only stream (itag 315/401, silent). The
+    // android client DOES return itag 18 (360p, avc1+mp4a) for this
+    // video when run directly — so the third source below runs one
+    // bounded android pass when nothing in hand has a progressive
+    // format. Sources, in order: the own android fallback (itag 18)
+    // if it already ran, else the mirror result (Piped progressive
     // videoStreams) — mirrorDone is awaited here, but it started in
     // parallel with the race and carries a 9s cap, so by the time a
-    // slow own-passes winner resolves it has already settled.
+    // slow own-passes winner resolves it has already settled — else
+    // a single android-client pass (12s cap, direct egress only).
+    // If no source yields a progressive stream, the preview ships
+    // as-is (never a faked with-sound preview).
+    const findProg = (list) => (Array.isArray(list) ? list : [])
+      .filter((f) => f && f.url && isDirectFileUrl(f.url) && !isManifestFormat(f) && f.vcodec && f.vcodec !== 'none' && f.acodec && f.acodec !== 'none')
+      .sort((a, b) => ((b.height || heightFromUrl(b.url) || 0) - (a.height || heightFromUrl(a.url) || 0)))[0] || null;
+    const hasProgFormat = (list) => (Array.isArray(list) ? list : [])
+      .some((f) => f && f.url && f.vcodec && f.vcodec !== 'none' && f.acodec && f.acodec !== 'none');
+    const fetchAndroidProg = async () => {
+      if (geoProbeBlocked) geoThrow();
+      try {
+        const raced = await Promise.race([
+          ytdlpJson(url, 12000, ['--extractor-args', 'youtube:player_client=android'], false).then((info) => ({ info })),
+          geoWatch.then(() => ({ geo: true })),
+        ]);
+        if (raced.geo) geoThrow();
+        if (geoProbeBlocked) geoThrow();
+        return findProg(raced.info && raced.info.formats);
+      } catch (e) {
+        if (e && e.geoBlocked) throw e;
+        return null;
+      }
+    };
+    // Prepend the best progressive format found in any source to a
+    // format list that has none. Returns the (possibly new) list.
+    const ensureProgressive = async (formats) => {
+      if (hasProgFormat(formats)) return formats;
+      let prog = (ownFallback && ownFallback.info) ? findProg(ownFallback.info.formats) : null;
+      if (!prog) {
+        await mirrorDone;
+        if (mirrorBest && mirrorBest.info) prog = findProg(mirrorBest.info.formats);
+      }
+      if (!prog) prog = await fetchAndroidProg();
+      return prog ? [prog, ...formats] : formats;
+    };
+    // LIMITED LIST (speed fix 2026-11-25, merge review): a winner that
+    // arrives via the slow path can still be a thin list — e.g. the
+    // android client's handful of formats, or the mirror's list when
+    // it lands after the 3s fast deadline and raceFirstFull accepts
+    // it as "full" (isDegradedInfo only catches lists with zero
+    // video-only AND zero audio-only formats, so a thin list that
+    // happens to hold one of each passes as full). A full own list
+    // has 20+ formats up to 1080p/2160p; a thin list has < 8 formats
+    // and/or tops out below 720p. Marking such a list partial is safe:
+    // the frontend upgrades it silently, and if the job finds nothing
+    // fuller the list simply stays (upgradeSwap only swaps a strictly
+    // longer list). Without this, a slow-path thin list would never
+    // upgrade and the video's higher qualities would never appear.
+    const isLimitedList = (formats) => {
+      const list = Array.isArray(formats) ? formats : [];
+      if (list.length < 8) return true;
+      let maxH = 0;
+      for (const f of list) {
+        const h = (f && (f.height || heightFromUrl(f.url))) || 0;
+        if (h > maxH) maxH = h;
+      }
+      return maxH < 720;
+    };
     if (winner) {
       const wf = Array.isArray(winner.info && winner.info.formats) ? winner.info.formats : [];
-      const hasProg = wf.some((f) => f && f.url && f.vcodec && f.vcodec !== 'none' && f.acodec && f.acodec !== 'none');
-      if (!hasProg) {
-        const findProg = (list) => (Array.isArray(list) ? list : [])
-          .filter((f) => f && f.url && isDirectFileUrl(f.url) && !isManifestFormat(f) && f.vcodec && f.vcodec !== 'none' && f.acodec && f.acodec !== 'none')
-          .sort((a, b) => ((b.height || heightFromUrl(b.url) || 0) - (a.height || heightFromUrl(a.url) || 0)))[0] || null;
-        let prog = (ownFallback && ownFallback.info) ? findProg(ownFallback.info.formats) : null;
-        if (!prog) {
-          await mirrorDone;
-          if (mirrorBest && mirrorBest.info) prog = findProg(mirrorBest.info.formats);
-        }
-        if (prog) winner.info.formats = [prog, ...wf];
-      }
+      winner.info.formats = await ensureProgressive(wf);
+      if (!winner.partial && isLimitedList(winner.info.formats)) winner.partial = true;
       return winner;
     }
     await mirrorDone;
     if (mirrorBest && (!ownFallback || infoScore(mirrorBest.info) > infoScore(ownFallback.info))) ownFallback = mirrorBest;
-    if (ownFallback) return ownFallback;
+    if (ownFallback) {
+      const of = Array.isArray(ownFallback.info && ownFallback.info.formats) ? ownFallback.info.formats : [];
+      ownFallback.info.formats = await ensureProgressive(of);
+      if (isDegradedInfo(ownFallback.info) || isLimitedList(ownFallback.info.formats)) ownFallback.partial = true;
+      return ownFallback;
+    }
     const err = new Error('Could not read this link. The video may be private, removed, or the site is blocking us.');
     err.detail = lastDetail;
     if (isGeoBlocked(lastDetail)) err.geoBlocked = true;
@@ -5185,7 +5289,29 @@ app.post('/api/meta', rateLimit('meta', 30, 60000), async (req, res) => {
   // per paste from the scrape).
   const scrapeP = clientSideKey(url) === 'x' ? scrapeDirectInfo(url).catch(() => null) : null;
   const meta = await fastMeta(url);
-  if (!meta) return res.status(404).json({ error: 'No preview available yet.' });
+  if (!meta) {
+    // X (speed fix 2026-11-25): fastMeta can return null (its og
+    // scrape finds no title/thumbnail) even when the tweet-page
+    // scrape landed with formats — return the scrape as the preview
+    // instead of 404ing. The scrape is awaited here with its existing
+    // 2.5s cap; it started in parallel with fastMeta above, so this
+    // usually costs nothing extra.
+    if (scrapeP) {
+      const scraped = await Promise.race([scrapeP, new Promise((ok) => setTimeout(() => ok(null), 2500))]);
+      if (scraped && Array.isArray(scraped.formats) && scraped.formats.length) {
+        return res.json({
+          title: scraped.title || 'X video',
+          thumbnail: scraped.thumbnail || '',
+          uploader: scraped.uploader || '',
+          duration: scraped.duration || 0,
+          previewUrl: scraped.previewUrl || '',
+          formats: scraped.formats,
+          clientSide: true,
+        });
+      }
+    }
+    return res.status(404).json({ error: 'No preview available yet.' });
+  }
   if (scrapeP) {
     const scraped = await Promise.race([scrapeP, new Promise((ok) => setTimeout(() => ok(null), 2500))]);
     if (scraped && Array.isArray(scraped.formats) && scraped.formats.length) {
@@ -5227,6 +5353,12 @@ try {
   // so start it alongside the own branch; ytChain awaits it first.
   const ydPrefetch = isYouTube(url) ? ytdownloaderTech(url, 24000).catch(() => null) : null;
   let result = null;
+  // Partial (degraded mirror) YouTube answer: ytdlpInfoWithFallbacks
+  // marks its winner with partial: true when the fast first render
+  // fires — carried onto the response body below (and onto the /api/job
+  // ready response, which reuses this body) so the frontend can
+  // upgrade it in place via a background job. Never cached.
+  let infoPartial = false;
   // No-stream tracking (TikTok only): tikwm's own code, and whether
   // yt-dlp's verdict was "no video formats found" — see the no-stream
   // comment at the `if (!info)` throw below.
@@ -5707,6 +5839,7 @@ try {
           : ytdlpInfoWithFallbacks(url);
         const res = await ownP;
         info = res.info;
+        if (res.partial) infoPartial = true;
         rawClientSet(url, res.clientArgs);
         rawProxySet(url, res.viaProxy);
       } catch (e) {
@@ -5845,6 +5978,11 @@ try {
       };
     }
   }
+  // FAST FIRST RENDER (speed fix 2026-11-25): a degraded/partial
+  // YouTube answer carries top-level partial: true in the /api/info
+  // body (and in the /api/job ready body, which reuses it) so the
+  // frontend can recognise it and upgrade it silently.
+  if (infoPartial && result) result.partial = true;
   // Sohu: signed URLs (see above) — never store the result.
   // A degraded YouTube result (android-only, e.g. just format 18)
   // must NOT be cached for 10 minutes either: it would show every
@@ -5856,7 +5994,7 @@ try {
   const ytDegraded = isYouTube(url) && Array.isArray(result && result.formats) &&
     !result.formats.some((f) => String(f.id || '').includes('+')) &&
     !result.formats.some((f) => f.label === 'Audio only');
-  if (noCacheKey !== 'sohu' && !ytDegraded) cacheSet(url, result);
+  if (noCacheKey !== 'sohu' && !ytDegraded && !infoPartial) cacheSet(url, result);
   return { status: 200, body: result };
 } catch (e) {
   if (e.geoBlocked) {
