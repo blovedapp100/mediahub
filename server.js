@@ -350,6 +350,59 @@ function cacheSet(url, data) {
   infoCache.set(cacheKey(url), { at: Date.now(), data });
 }
 
+// ---- progressive TikTok merge store (2026-11-25) --------------------------
+// The sync path returns the fast win at once (grace 0) so the first
+// quality shows in ~3s — but the other resolver leg keeps running, and
+// when it lands the UNION (Best + HD + SD + Audio) is stored here for
+// up to 90s. The frontend polls GET /api/merge and swaps the fuller
+// list in when it appears. Only public video info (title/thumbnail/
+// formats) — the same kind of data the info cache holds, keyed by the
+// pasted URL, never per-visitor. Signed URLs are minutes-fresh, so a
+// 90s TTL is far inside their life.
+const MERGE_TTL_MS = 90 * 1000;
+const MERGE_MAX = 500;
+const mergeStore = new Map(); // url -> { at, data }
+function mergeStoreSet(url, data) {
+  if (mergeStore.size >= MERGE_MAX) {
+    const first = mergeStore.keys().next().value;
+    if (first !== undefined) mergeStore.delete(first);
+  }
+  mergeStore.set(url, { at: Date.now(), data });
+}
+function mergeStoreGet(url) {
+  const e = mergeStore.get(url);
+  if (!e) return null;
+  if (Date.now() - e.at > MERGE_TTL_MS) { mergeStore.delete(url); return null; }
+  return e.data;
+}
+// Union of the two TikTok resolver answers: SSSTik's Best first, then
+// tikwm's HD/SD/Audio (dedup by format id). Never invents a format —
+// a row appears only when its lane actually returned it.
+function mergeTikTokInfos(ssInfo, twInfo) {
+  if (!ssInfo && !twInfo) return null;
+  const base = ssInfo || twInfo;
+  const seen = new Set();
+  const formats = [];
+  for (const info of [ssInfo, twInfo]) {
+    for (const f of (info && info.formats) || []) {
+      if (!f || !f.id || seen.has(f.id)) continue;
+      seen.add(f.id);
+      formats.push(f);
+    }
+  }
+  if (!formats.length) return null;
+  return {
+    title: base.title || 'Video',
+    thumbnail: base.thumbnail || '',
+    duration: base.duration || 0,
+    uploader: base.uploader || '',
+    previewUrl: base.previewUrl || '',
+    formats,
+    clientSide: true,
+    note: '',
+  };
+}
+
 // Raw info (with direct stream URLs) for /api/save: the public result
 // above drops the URLs, but a save can stream a direct URL instead of
 // running yt-dlp a second time — which matters when yt-dlp only answers
@@ -435,6 +488,32 @@ setInterval(() => {
 
 // ---- TikTok via the free tikwm API (primary), yt-dlp as fallback -----------
 
+// Short-link resolution cache (2026-11-25): a short code always maps
+// to the same canonical video URL, so the 301 resolve (~1.3s) is paid
+// once per short link, not on every paste — repeat pastes (retries
+// after a 502, the same viral link pasted again) skip it entirely.
+// Only SUCCESSFUL resolves are cached (the canonical /video/ URL); a
+// failed resolve returns the original URL uncached, so a transient
+// failure retries next time instead of sticking for 24h. Bounded
+// (2,000 entries, 24h TTL) so a long-lived process cannot grow
+// without limit.
+const SHORT_RESOLVE_CACHE = new Map(); // shortUrl -> { value, at }
+const SHORT_RESOLVE_TTL_MS = 24 * 60 * 60 * 1000;
+const SHORT_RESOLVE_MAX = 2000;
+function shortResolveCacheGet(url) {
+  const hit = SHORT_RESOLVE_CACHE.get(url);
+  if (!hit) return null;
+  if (Date.now() - hit.at > SHORT_RESOLVE_TTL_MS) { SHORT_RESOLVE_CACHE.delete(url); return null; }
+  return hit.value;
+}
+function shortResolveCacheSet(url, value) {
+  if (SHORT_RESOLVE_CACHE.size >= SHORT_RESOLVE_MAX) {
+    const oldest = SHORT_RESOLVE_CACHE.keys().next().value;
+    if (oldest !== undefined) SHORT_RESOLVE_CACHE.delete(oldest);
+  }
+  SHORT_RESOLVE_CACHE.set(url, { value, at: Date.now() });
+}
+
 // Short TikTok links (tiktok.com/t/<code> — the form the app shares
 // when a user taps "Share" in TikTok) cost yt-dlp an extra redirect hop,
 // which pushes its round-1 attempts past the 8s timeout: locally the
@@ -448,6 +527,8 @@ async function resolveTikTokShort(url) {
     const u = new URL(url);
     if (!/tiktok\.com$/.test(u.hostname.toLowerCase())) return url;
     if (!/^\/t\/[^/]+\/?$/.test(u.pathname)) return url;
+    const cached = shortResolveCacheGet(url);
+    if (cached) return cached;
     let current = url;
     for (let hop = 0; hop < 3; hop++) {
       const ctrl = new AbortController();
@@ -461,7 +542,7 @@ async function resolveTikTokShort(url) {
         if (!loc) return url;
         const abs = new URL(loc, current).href;
         if (!/tiktok\.com$/.test(new URL(abs).hostname.toLowerCase())) return url;
-        if (abs.includes('/video/')) return abs;
+        if (abs.includes('/video/')) { shortResolveCacheSet(url, abs); return abs; }
         current = abs;
       } catch { return url; } finally { clearTimeout(timer); }
     }
@@ -799,7 +880,10 @@ async function fbChain(url, budgetLeft) {
 
 async function igChain(url, budgetLeft) {
   return runChain([
-    [(t) => instapdownInfo(url, t), 20000],
+    // instapdown is down (402 DEPLOYMENT_DISABLED, 2026-11-25) — keep
+    // it first with a 5s cap so a return costs nothing, but a hang
+    // cannot eat the chain's budget.
+    [(t) => instapdownInfo(url, t), 5000],
     [(t) => curlxInfo(url, t), 20000],
     [(t) => freeapiInfo(url, t), 15000],
   ], budgetLeft);
@@ -2703,7 +2787,24 @@ async function fastMeta(url) {
   if (host === 'reddit.com' || host.endsWith('.reddit.com')) {
     jobs.push(oembedMeta('https://www.reddit.com/oembed?url=' + encodeURIComponent(url), 2500));
   }
-  jobs.push(ogScrapeMeta(url, 3500));
+  if (isTikTok(url)) {
+    // TikTok meta (2026-11-25, verified): the page scrape is useless
+    // for TikTok — datacenter IPs get a shell page ("TikTok - Make
+    // Your Day", no og:title, no og:image), so meta 404'd or returned
+    // the generic title with an EMPTY thumbnail, and TikTok's oEmbed
+    // carries no thumbnail_url either. The preview's real title +
+    // cover come from SSSTik's poster instead (~2.7s, inside the 4s
+    // meta budget). Deduped with the info race's SSSTik call (see
+    // ssstikInfo), so the parallel meta+info fire costs one POST.
+    // The og leg is skipped for TikTok: its generic title is worse
+    // than no preview (the info answer carries the real title).
+    jobs.push(ssstikInfo(url, 3500).then((info) => {
+      if (!info || !info.thumbnail) return null;
+      return { title: info.title || 'Video', thumbnail: info.thumbnail, uploader: info.uploader || '', duration: info.duration || 0 };
+    }).catch(() => null));
+  } else {
+    jobs.push(ogScrapeMeta(url, 3500));
+  }
   // First non-null answer wins; give up after 4s so /api/meta never
   // keeps the preview waiting. Every job swallows its own errors.
   const out = await Promise.race([
@@ -3377,7 +3478,24 @@ async function scrapeDirectInfo(url) {
   const key = clientSideKey(url);
   if (key === 'tumblr') return scrapeTumblr(url);
   const html = await fetchPageHtml(url);
-  if (!html) return null;
+  if (!html) {
+    // The page did not load at all — distinguish "post removed"
+    // (404/410) from a slow/blocked fetch, so a removed post fails
+    // fast with a clear message instead of burning the yt-dlp rounds.
+    // The probe runs ONLY on this failure path, so live posts cost
+    // nothing extra. A 403/challenge or a timeout is NOT dead — the
+    // fallbacks below may still read the video.
+    if (key === 'sharechat' || key === 'pinterest') {
+      try {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 5000);
+        const r = await fetch(url, { signal: ctrl.signal, method: 'HEAD', redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36' } });
+        clearTimeout(timer);
+        if (r.status === 404 || r.status === 410) return { dead: true };
+      } catch { /* fall through to the fallbacks */ }
+    }
+    return null;
+  }
   const title = decodeEntities(ogTag(html, 'og:title'));
   const thumb = ogTag(html, 'og:image');
   if (key === 'pinterest') {
@@ -3452,6 +3570,52 @@ async function scrapeDirectInfo(url) {
     return { title: title || 'X video', thumbnail: thumb, duration: Math.round(durMs / 1000) || 0, uploader: handle, previewUrl: formats[0].url, formats };
   }
   return null;
+}
+
+// Pinterest widget API (the platform's own public no-key API — the same
+// data the pin page embeds, as ~6 KB of JSON instead of a 1.35 MB page).
+// The pin page is challenged/slow from datacenter IPs (live 502 in
+// 16.5s), while widgets.pinterest.com answers the same video URL. Own
+// extraction, not a third-party resolver: it returns Pinterest's own
+// video file. Picks the best mp4 from the pin's story pages (V_720P
+// first) or its videos object; HLS (.m3u8) is skipped — the visitor
+// downloads one mp4 file, never a playlist.
+async function pinterestPidgetsInfo(url, timeoutMs = 8000) {
+  const m = String(url || '').match(/pinterest\.com\/pin\/(\d+)/);
+  let pinId = m ? m[1] : '';
+  if (!pinId) {
+    // pin.it short link: resolve the redirect to the canonical pin URL.
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 5000);
+      const r = await fetch(url, { signal: ctrl.signal, redirect: 'manual', headers: { 'User-Agent': 'Mozilla/5.0' } });
+      clearTimeout(timer);
+      const loc = r.headers.get('location') || '';
+      pinId = (loc.match(/pinterest\.com\/pin\/(\d+)/) || [])[1] || '';
+    } catch { return null; }
+  }
+  if (!pinId) return null;
+  const j = await fetchJsonTimeout('https://widgets.pinterest.com/v3/pidgets/pins/info/?pin_ids=' + pinId, timeoutMs);
+  const pin = j && Array.isArray(j.data) && j.data[0];
+  if (!pin) return null;
+  const mp4s = [];
+  const takeList = (list) => {
+    if (!list) return;
+    for (const v of Object.values(list)) {
+      const u = v && v.url;
+      if (u && /\.mp4(\?|$)/i.test(u)) mp4s.push({ url: u, h: v.height || 0 });
+    }
+  };
+  takeList(pin.videos && pin.videos.video_list);
+  const pages = (pin.story_pin_data && pin.story_pin_data.pages) || [];
+  for (const page of pages) for (const b of (page.blocks || [])) takeList(b.video && b.video.video_list);
+  if (!mp4s.length) return null;
+  mp4s.sort((a, b) => b.h - a.h);
+  const video = mp4s[0].url;
+  const title = (decodeEntities(pin.description || '').slice(0, 120)) || 'Pinterest video';
+  const imgs = pin.images || {};
+  const thumb = (imgs['564x'] && imgs['564x'].url) || (imgs['236x'] && imgs['236x'].url) || '';
+  return { title, thumbnail: thumb, duration: 0, uploader: '', previewUrl: video, formats: [directFormat(video)] };
 }
 
 // yt-dlp fallback for ShareChat / Snapchat when the page scrape finds no
@@ -3627,12 +3791,38 @@ async function ssstikToken() {
     return ssstikTt.value || '';
   } catch { return ssstikTt.value || ''; } finally { clearTimeout(timer); }
 }
+// Token warm-up (2026-11-25): the token fetch costs ~1.1-1.4s of the
+// first TikTok paste after idle (cold), ~0s warm (10-min cache). The
+// keep-alive ping keeps this process awake, so refresh the token every
+// 8 min in the background and TikTok answers stay on the fast path.
+// One cheap homepage GET per 8 min; a failure just leaves the old
+// token (or none) and ssstikInfo fetches it lazily as before.
+ssstikToken().catch(() => {});
+setInterval(() => { ssstikToken().catch(() => {}); }, 8 * 60 * 1000).unref();
 function ssstikDuration(s) {
   const m = String(s || '').trim().match(/^(?:(\d+):)?(\d{1,2}):(\d{2})$/);
   if (!m) return 0;
   return (m[1] ? parseInt(m[1], 10) * 3600 : 0) + parseInt(m[2], 10) * 60 + parseInt(m[3], 10);
 }
+// In-flight dedupe for SSSTik (2026-11-25): the frontend fires /api/meta
+// and /api/info in parallel, and both now resolve TikTok through SSSTik
+// — without dedupe the same link would POST twice at once (extra load
+// on SSSTik, and a self-inflicted rate limit). Concurrent calls for one
+// URL share a single fetch; the shared fetch runs at least 7s (the info
+// race's cap) so a short-timeout caller cannot abort the leg the info
+// race is waiting on — the caller just stops waiting at its own cap.
+const ssstikInflight = new Map(); // url -> Promise
 async function ssstikInfo(url, timeoutMs = 15000) {
+  const existing = ssstikInflight.get(url);
+  if (existing) return existing;
+  const p = ssstikInfoFresh(url, Math.max(timeoutMs, 7000));
+  ssstikInflight.set(url, p);
+  const clear = () => { if (ssstikInflight.get(url) === p) ssstikInflight.delete(url); };
+  p.then(clear, clear);
+  return p;
+}
+
+async function ssstikInfoFresh(url, timeoutMs = 15000) {
   // SSSTik resolves any public TikTok URL — Series or normal — and
   // races alongside own extraction + tikwm in /api/info (speed fix
   // 2026-11-24); it is the only route that reads Series videos, so
@@ -4916,37 +5106,50 @@ try {
   let tiktokOwnAttempted = false;
   if (isTikTok(url)) {
     tiktokOwnAttempted = true;
-    // CAPPED RACE + GRACE WINDOW (2026-11-24): own/tikwm/SSSTik start
-    // together at t=0 and the first non-null answer wins — but on the
-    // SYNC path a win AFTER 8s never counts. Live evidence (22:48 PKT):
-    // the same normal link answered 3.2s (SSSTik won) and twice ~18s (a
-    // slow leg won after SSSTik was slow that moment) — past the
-    // frontend's 10s per-origin budget, so the visitor never saw
-    // those answers. The 8s cap takes whatever is ready by then;
-    // nothing ready means the honest timeout error below (the
-    // frontend retries the next origin). The old freeapi fall-through
-    // is gone on the sync path for the same reason: it needs ~11s, so
-    // it could only ever push the total to ~18s. On the JOB path the
-    // cap does not apply and freeapi still runs (see below).
-    // GRACE WINDOW: SSSTik is fast but returns a single format;
-    // tikwm (HD/SD/audio) usually lands ~2s later (measured:
-    // SSSTik ~3.6s, tikwm ~5.5s). After an SSSTik win, wait up to
-    // 3s — bounded by the 8s cap on the sync path — for tikwm; if it
-    // arrives, its formats are appended to the SSSTik answer. If it
-    // does not, the SSSTik answer goes out unchanged. (Spec said ~2s;
-    // 2s merged only 4/6 SSSTik wins — the gap is sometimes 2-3s —
-    // so the window is 3s; Series ~7.5s, still <10s.) Series videos
-    // never merge (tikwm cannot parse them) but the wait still
-    // applies — ~7-8s total, inside the cap. Own still wins whenever it
-    // answers first (clean IP: warm ~4.5s), so own-first holds in
-    // practice; on a blocked IP own never answers at all. Losers
-    // keep running in the background and are killed by their own
-    // timeouts (same as the YouTube geo race's yt-dlp client).
+    // CAPPED RACE + GRACE WINDOW (2026-11-24, revised 2026-11-25):
+    // own/tikwm/SSSTik start together at t=0 and the first non-null
+    // answer wins — but on the SYNC path a win AFTER 8s never counts.
+    // Live evidence (22:48 PKT): the same normal link answered 3.2s
+    // (SSSTik won) and twice ~18s (a slow leg won after SSSTik was
+    // slow that moment) — past the frontend's 10s per-origin budget,
+    // so the visitor never saw those answers. The 8s cap takes
+    // whatever is ready by then; nothing ready means the honest
+    // timeout error below (the frontend retries the next origin).
+    // The old freeapi fall-through is gone on the sync path for the
+    // same reason: it needs ~11s, so it could only ever push the
+    // total to ~18s. On the JOB path the cap does not apply and
+    // freeapi still runs (see below).
+    // PARALLEL START (2026-11-25): the short-link resolve used to run
+    // serially in the /api/info handler BEFORE this race (~1.3s on a
+    // short link) — but only tikwm needs the canonical URL (verified
+    // 2026-11-25: tikwm hangs on short URLs, 15s timeout, no answer).
+    // SSSTik resolves short links itself (verified: POST 200 in 2.6s
+    // on the short URL, correct video id) and yt-dlp reaches its
+    // verdict on the short URL too (9.5s, inside the 13s cap — the
+    // no-stream verdict below still works). So SSSTik + own start at
+    // t=0 on the pasted URL while the (cache-backed) resolve runs
+    // alongside; tikwm starts on the canonical URL the moment the
+    // resolve lands. On a repeat paste the resolve is a cache hit
+    // (~0ms) and nothing changes.
+    // GRACE WINDOW (2026-11-25, measured): 0 on the sync path, 3s on
+    // the job path. The grace waited up to 3s after an SSSTik win for
+    // tikwm's HD/SD/audio — but measured locally 2026-11-25 (3/3
+    // SSSTik wins) tikwm lands ~5s AFTER SSSTik (2.7s vs 7.9s), so the
+    // grace merged 0 times and only ever delayed the answer by the
+    // full 3s (5.7s instead of 2.7s). The visitor asked for speed
+    // first: the fast win goes out immediately. The merge code below
+    // still runs when tikwm already settled with a value, and the job
+    // path keeps the 3s grace — the visitor already waited there, and
+    // the merged list is worth it. (Spec said ~2s; 2s merged only
+    // 4/6 SSSTik wins in Nov — the gap is sometimes 2-3s — so the
+    // window was 3s; Series ~7.5s, still <10s. That tuning is now
+    // moot on the sync path: the gap is really ~5s, not 2-3s.)
     // Timeout notes (measured 2026-11-24, this VM): tikwm's own
     // processed_time is ~5.5s, so its old 5s cap aborted a working
     // resolver — the race cap is 8s, still inside the 10s budget
     // when it is the only answer. SSSTik's token fetch is ~1.4s
-    // cold (~0s warm, 10-min cache) + ~3s POST, so 7s.
+    // cold (~0s warm, 10-min cache, warmed in the background — see
+    // ssstikToken below) + ~3s POST, so 7s.
     // Sync path only: applyTikTokCap is true when lookupInfo runs on
     // the 25s sync budget (timeoutMs 25000). The job path (300s
     // budget) skips the cap — a slow winner is still a win there —
@@ -4954,8 +5157,20 @@ try {
     // start (handler top / job.createdAt), so the cap counts the
     // short-link resolve too (1.5-6s, measured).
     const TIKTOK_RACE_CAP_MS = 8000;
-    const TIKTOK_GRACE_MS = 3000; // ~2s spec, tuned to 3s: measured gap SSSTik-win -> tikwm-arrival is usually <=2s but sometimes 2-3s; 3s catches those, Series still ~7.5s (<10s budget), normal merged returns at tikwm arrival anyway.
     const applyTikTokCap = timeoutMs <= 25000;
+    // GRACE (2026-11-25, measured): 0 on the sync path, 10s on the job
+    // path. The sync grace is 0 because tikwm lands ~5s after SSSTik
+    // (2.7s vs 7.9s measured) — a 3s grace merged 0 times and only
+    // delayed the answer; the fast win goes out at once and the merge
+    // arrives progressively (see the merge store below). The job path
+    // keeps a LONG grace (10s): the visitor already waited there, the
+    // job has no 8s cap, and tikwm lands at ~8-10s when it cooperates
+    // — the job is the completeness route, so it waits for the merge.
+    const TIKTOK_GRACE_MS = applyTikTokCap ? 0 : 10000;
+    // Resolve runs alongside the race (see the PARALLEL START note
+    // above): SSSTik + own use the pasted URL at once; tikwm waits for
+    // the canonical URL because it hangs on short links.
+    const resolveP = resolveTikTokShort(url);
     const ownP = withTimeout(ytdlpInfoWithFallbacks(url), 13000, 'own TikTok extraction timed out')
       .then((r) => ({ kind: 'own', value: r }))
       .catch((e) => {
@@ -4966,7 +5181,7 @@ try {
         if (isNoFormats(e.detail)) ytdlpNoFormats = true;
         return { kind: 'own', value: null };
       });
-    const twP = tikwmInfoDetailed(url, 8000)
+    const twP = resolveP.then((canonical) => tikwmInfoDetailed(canonical, applyTikTokCap ? 8000 : 15000))
       .then((tw) => { tikwmCode = tw.code; return { kind: 'tw', value: tw.info }; });
     // Track tikwm's outcome separately so the grace window below can
     // use it even when tikwm settled before SSSTik won — or is still
@@ -5001,6 +5216,24 @@ try {
     }
     const winner = await firstP;
     if (capTimer) clearTimeout(capTimer);
+    // Progressive merge (2026-11-25): the fast win goes out at once
+    // (sync grace is 0), but the other resolver leg keeps running;
+    // when it lands, the union (Best + HD/SD/Audio) is stored in the
+    // merge store for the frontend to pick up via GET /api/merge.
+    // Only the two resolver legs are merged here — own (yt-dlp) has
+    // its own answer shape and goes through the generic build when it
+    // wins. The store only ever holds MORE formats than the answer
+    // already sent, never fewer.
+    if (winner && (winner.kind === 'ss' || winner.kind === 'tw')) {
+      const mergeParts = {};
+      mergeParts[winner.kind] = winner.value;
+      const tryStoreMerge = () => {
+        const merged = mergeTikTokInfos(mergeParts.ss, mergeParts.tw);
+        if (merged && merged.formats.length > (winner.value.formats || []).length) mergeStoreSet(url, merged);
+      };
+      ssP.then((c) => { if (c && c.value) { mergeParts.ss = c.value; tryStoreMerge(); } }).catch(() => {});
+      twP.then((c) => { if (c && c.value) { mergeParts.tw = c.value; tryStoreMerge(); } }).catch(() => {});
+    }
     if (winner && winner.kind === 'own') {
       tiktokOwn = winner.value;
     } else if (winner && winner.kind === 'tw') {
@@ -5010,11 +5243,12 @@ try {
       result = winner.value;
     } else if (winner && winner.kind === 'ss') {
       // SSSTik answered first (usually Series, or a fast normal) —
-      // signed token URL, never cached. Grace window: wait up to 3s
-      // (bounded by the 8s race cap on the sync path) for tikwm's
-      // HD/SD/audio; if they arrive, append them to the SSSTik
-      // answer. If not, the SSSTik answer goes out unchanged: no
-      // extra delay, no failure.
+      // signed token URL, never cached. Grace window: on the SYNC
+      // path the grace is 0 (see above — the fast win goes out at
+      // once, the merge arrives progressively via the merge store);
+      // on the JOB path it is 10s, waiting for tikwm's HD/SD/audio
+      // to merge in. The merge below still applies when tikwm
+      // already settled with a value.
       const graceMs = applyTikTokCap
         ? Math.min(TIKTOK_GRACE_MS, Math.max(0, TIKTOK_RACE_CAP_MS - (Date.now() - reqStart)))
         : TIKTOK_GRACE_MS;
@@ -5134,13 +5368,25 @@ try {
       // try it before the page scrape.
       if (scrapeKey === 'tumblr') result = await tumblrReadInfo(url, 8000);
       if (!result) result = await scrapeDirectInfo(url);
-      // ShareChat / Snapchat / Pinterest / X: when the page embeds no
-      // usable file, try yt-dlp once before giving up — it reads
-      // og:video and the platform extractors where the scrape cannot.
-      // (Per-link fallback, own route.) Moj has no yt-dlp extractor
-      // and Tumblr already falls through to the full yt-dlp block
-      // below, so neither is listed here.
-      if (!result && (scrapeKey === 'sharechat' || scrapeKey === 'snapchat' || scrapeKey === 'pinterest' || scrapeKey === 'x')) {
+      // A removed/private post (page answers 404/410): fail fast with
+      // a clear message — 404 is terminal, so the frontend does not
+      // waste its backup-origin retries on a post no region can read.
+      if (result && result.dead) return { status: 404, body: { error: 'This post is no longer available — it was removed or made private.' } };
+      // Pinterest: the pin page is challenged/slow from datacenter IPs
+      // (live 502) — the widget API above returns the same mp4 as
+      // ~6 KB of JSON. yt-dlp is skipped for Pinterest: it only ever
+      // returns HLS manifests, which buildDirectFormats drops, so the
+      // two 12s rounds were pure waste.
+      if (!result && scrapeKey === 'pinterest') {
+        result = await pinterestPidgetsInfo(url, Math.min(8000, budgetLeft()));
+      }
+      // ShareChat / Snapchat / X: when the page embeds no usable file,
+      // try yt-dlp once before giving up — it reads og:video and the
+      // platform extractors where the scrape cannot. (Per-link
+      // fallback, own route.) Moj has no yt-dlp extractor and Tumblr
+      // already falls through to the full yt-dlp block below, so
+      // neither is listed here.
+      if (!result && (scrapeKey === 'sharechat' || scrapeKey === 'snapchat' || scrapeKey === 'x')) {
         result = await ytdlpDirectFallback(url);
       }
       // X chain (verified 2026-11-24, PROBE.md in social-fallbacks/):
@@ -5304,7 +5550,18 @@ try {
       rawProxySet(url, tiktokOwn.viaProxy);
     } else if (!tiktokOwnAttempted) {
       try {
-        const res = await ytdlpInfoWithFallbacks(url);
+        // Instagram: yt-dlp's two parallel attempts (plain + iPhone UA)
+        // take ~11s alone but ~17s+ under CPU contention, and the 20s
+        // round then leaves the chain no budget — the call 502s even
+        // though curl-x/freeapi answer in ~3.5s each. Cap the own leg
+        // at 14s for Instagram (observed own successes are 10-11s) so
+        // a slow own leg falls through to the chain instead of starving
+        // it. The timeout only rejects the race — the underlying
+        // process ends on its own 20s round cap.
+        const ownP = isInstagram(url)
+          ? withTimeout(ytdlpInfoWithFallbacks(url), 14000, 'own Instagram extraction timed out')
+          : ytdlpInfoWithFallbacks(url);
+        const res = await ownP;
         info = res.info;
         rawClientSet(url, res.clientArgs);
         rawProxySet(url, res.viaProxy);
@@ -5482,10 +5739,14 @@ app.post('/api/info', rateLimit('info', 30, 60000), async (req, res) => {
   if (!url || !(await validateUserUrl(url))) {
     return res.status(400).json({ error: 'Please paste a valid video link from TikTok, Douyin, Facebook, Instagram, YouTube, X, Bluesky, Tumblr, Twitch, Pinterest, Moj, ShareChat, LinkedIn, Snapchat, Tencent Video, Kuaishou, Haokan, Pear Video, Zhihu, Sohu, Vimeo, Streamable, Kwai, SoundCloud, Mixcloud, Odysee, BitChute, PeerTube, VK, OK.ru or Kick.' });
   }
-  // TikTok short links: resolve the 301 to the canonical video URL
-  // first (see resolveTikTokShort) so every stage below — cache,
-  // tikwm, yt-dlp — works on the fast form.
-  if (isTikTok(url)) url = await resolveTikTokShort(url);
+  // TikTok short links: NO serial resolve here any more (2026-11-25).
+  // The resolve used to block the whole lookup (~1.3s on a short
+  // link) before any extraction started. It now runs inside
+  // lookupInfo's TikTok branch, in parallel with the race (SSSTik +
+  // own start at t=0 on the pasted URL; tikwm starts on the canonical
+  // URL when the resolve lands). The cache lookup below keys on the
+  // pasted URL — harmless for TikTok, whose signed-URL results are
+  // never cached anyway (own-wins cache under the pasted URL).
   // Douyin: signed CDN URLs live ~5 min, shorter than the 10-min info
   // cache — never serve a cached Douyin result, and never store one.
   // Kuaishou: same treatment — its signed CDN URLs have no visible
@@ -5510,6 +5771,21 @@ app.post('/api/info', rateLimit('info', 30, 60000), async (req, res) => {
     console.error('info timed out:', platformOf(url));
     return res.status(502).json({ error: 'This link is taking too long to read. Please try again.' });
   }
+});
+
+// ---- Progressive TikTok merge (GET /api/merge?url=...) --------------------
+// After a fast Best-only answer, the other resolver leg may still land
+// with HD/SD/Audio — the race stores the union in the merge store (see
+// lookupInfo). The frontend polls this light endpoint for up to ~12s
+// and swaps the fuller list in when it appears. 404 means "nothing
+// extra yet" (not an error) — the visitor keeps the qualities already
+// shown. No lookup runs here, so it is cheap; own bucket (30/min).
+app.get('/api/merge', rateLimit('merge', 30, 60000), async (req, res) => {
+  const url = String(req.query.url || '').trim();
+  if (!url) return res.status(400).json({ error: 'Please paste a valid video link.' });
+  const merged = mergeStoreGet(url);
+  if (!merged) return res.status(404).json({ error: 'No extra qualities yet.' });
+  return res.json(merged);
 });
 
 // ---- Background jobs: slow videos (POST /api/job, GET /api/job/:id) ----
@@ -5694,10 +5970,20 @@ app.get('/api/save', rateLimit('save', 10, 60000), async (req, res) => {
   if (isClientSideOnly(url)) {
     return res.status(400).json({ error: 'This video saves straight from your browser — use the Save button on the page.' });
   }
-  // Series files (id 'best') never download through the server
-  // either: the visitor's browser opens the file in a new tab instead.
-  if (formatId === 'best') {
-    return res.status(400).json({ error: 'This video saves straight from your browser — use the Save button on the page.' });
+  // Series / SSSTik Best (ids 'best' and 'ssstik-best' — the live site
+  // has served both across origins since the id was renamed): the file
+  // lives on tikcdn.io, which only serves browsers (non-browser UAs get
+  // 204), so the server cannot stream it. Hand off instead: resolve
+  // the direct link and redirect the visitor's browser to it — the
+  // browser downloads the file itself, exactly like the Save button
+  // does. (This used to 400 by design; a direct /api/save link for
+  // this file now downloads instead of erroring. If the link cannot be
+  // resolved right now, the honest 502 below stands.)
+  if (formatId === 'best' || formatId === 'ssstik-best') {
+    const ssi = await ssstikInfo(url, 10000);
+    const file = ssi && Array.isArray(ssi.formats) && ssi.formats[0] && ssi.formats[0].url;
+    if (!file) return res.status(502).json({ error: 'This clip is not available right now. Please try again.' });
+    return res.redirect(302, file);
   }
   if (!formatId || !/^[A-Za-z0-9+._-]{1,64}$/.test(formatId)) {
     return res.status(400).json({ error: 'Invalid quality choice.' });
