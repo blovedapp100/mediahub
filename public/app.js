@@ -133,9 +133,29 @@
   // never jumps when the stream's metadata arrives (the metadata re-size
   // then lands on the same numbers). No-op until the thumbnail has a
   // natural size.
-  function sizeFromThumb() {
-    if (!thumbImg || !thumbImg.naturalWidth || !thumbImg.naturalHeight) return;
-    sizePreviewPlayerFromRatio(thumbImg.naturalWidth / thumbImg.naturalHeight);
+  // X-LETTERBOX FIX: thumbImg may still hold the PREVIOUS search's image
+  // (its src is only replaced when the stream errors or the preview
+  // renders), so sizing from it locks the box to the old clip's ratio —
+  // permanent when the new stream never delivers metadata (the X mp4
+  // 403s, so loadedmetadata never fires to correct it). Pass the
+  // CURRENT link's thumbnail URL: when thumbImg already holds that exact
+  // (loaded) image, size from it at once; otherwise preload it in a
+  // throwaway Image and size when it lands. The currentThumb check in
+  // the load callback drops a late image from an older search.
+  var currentThumb = '';
+  function sizeFromThumb(url) {
+    if (typeof url !== 'string' || !url) url = thumbImg ? thumbImg.src : '';
+    if (!url) return;
+    if (thumbImg && thumbImg.src === url && thumbImg.naturalWidth && thumbImg.naturalHeight) {
+      sizePreviewPlayerFromRatio(thumbImg.naturalWidth / thumbImg.naturalHeight);
+      return;
+    }
+    var img = new Image();
+    img.onload = function () {
+      if (url !== currentThumb) return; // a newer search superseded this one
+      if (img.naturalWidth && img.naturalHeight) sizePreviewPlayerFromRatio(img.naturalWidth / img.naturalHeight);
+    };
+    img.src = url;
   }
 
   function setupPreviewPlayer() {
@@ -791,6 +811,7 @@
   function renderPreview(data) {
     resetPreviewPlayer();
     currentTitle = data.title || 'video';
+    currentThumb = data.thumbnail || '';
     titleEl.textContent = currentTitle;
     uploaderEl.textContent = data.uploader ? 'By ' + data.uploader : '';
     durationEl.textContent = data.duration ? 'Length: ' + fmtDuration(data.duration) : '';
@@ -1315,6 +1336,7 @@
 
   function renderResult(data) {
     currentTitle = data.title || 'video';
+    currentThumb = data.thumbnail || '';
     currentClientSide = !!data.clientSide;
     titleEl.textContent = currentTitle;
     uploaderEl.textContent = data.uploader ? 'By ' + data.uploader : '';
@@ -1339,10 +1361,18 @@
         // right away; only fall back to the thumbnail while the stream
         // is still loading (its loadedmetadata listener then overrides
         // the thumb, as v2 intended).
-        var hadVideoMeta = !!(videoEl.videoWidth && videoEl.videoHeight);
+        // X-LETTERBOX FIX: only trust the video's metadata when it
+        // belongs to THIS video. After a previous search the element
+        // still reports the OLD clip's dimensions until the new stream's
+        // resource selection resets them, and sizing from them locks the
+        // box to the old clip's ratio. currentSrc matches only on the
+        // double-render of the SAME link (v3's case), where the metadata
+        // really is this video's.
+        var hadVideoMeta = !!(videoEl.videoWidth && videoEl.videoHeight) &&
+          videoEl.currentSrc === data.previewUrl;
         resetPreviewPlayer();
         if (hadVideoMeta) sizePreviewPlayer();
-        else sizeFromThumb(); // keep the preview's size while the stream loads
+        else sizeFromThumb(data.thumbnail); // size from THIS link's thumbnail
         videoEl.referrerPolicy = 'no-referrer';
         videoEl.src = data.previewUrl;
         showPreviewPoster(data.thumbnail);
@@ -1369,10 +1399,17 @@
           videoEl.style.display = 'none';
           if (playerWrap) playerWrap.classList.add('no-video');
           if (data.thumbnail) { thumbImg.src = data.thumbnail; thumbImg.style.display = ''; }
+          // X-LETTERBOX FIX: the failed stream never delivered metadata,
+          // so the box may still carry a stale size (from the previous
+          // clip, or the hidden-state 200px clamp): re-size it from this
+          // link's thumbnail. Only when the video has no dimensions at
+          // all — if metadata arrived, the box is already the video's
+          // own ratio and the thumbnail must not override it.
+          if (!videoEl.videoWidth) { previewVideoSized = false; sizeFromThumb(data.thumbnail); }
         };
       } else {
         resetPreviewPlayer();
-        sizeFromThumb(); // thumbnail-only result (e.g. X): keep the preview's size
+        sizeFromThumb(data.thumbnail); // thumbnail-only result: size from THIS link's thumbnail
         videoEl.style.display = 'none';
         if (playerWrap) playerWrap.classList.add('no-video');
         if (data.thumbnail) { thumbImg.src = data.thumbnail; thumbImg.style.display = ''; }
