@@ -2672,7 +2672,34 @@ async function ytdlpInfoWithFallbacks(url) {
       runOwnPasses(),
       mirrorFullP,
     ], 500);
-    if (winner) return winner;
+    // PREVIEW SOUND (2026-11-25): the winner's list can be DASH-only
+    // (yt-dlp pairs "133+140" carry only a video-only URL), so
+    // previewUrl() picks a silent stream while the quality is labelled
+    // "With sound" (the pair's audio lives in a separate file). A
+    // progressive (video+audio) format must be prepended so the
+    // preview has sound — and it also appears as a real extra quality
+    // in the list (a real file with sound, not a fake entry).
+    // Sources, in order: the own android fallback (itag 18) if it
+    // already ran, else the mirror result (Piped progressive
+    // videoStreams) — mirrorDone is awaited here, but it started in
+    // parallel with the race and carries a 9s cap, so by the time a
+    // slow own-passes winner resolves it has already settled.
+    if (winner) {
+      const wf = Array.isArray(winner.info && winner.info.formats) ? winner.info.formats : [];
+      const hasProg = wf.some((f) => f && f.url && f.vcodec && f.vcodec !== 'none' && f.acodec && f.acodec !== 'none');
+      if (!hasProg) {
+        const findProg = (list) => (Array.isArray(list) ? list : [])
+          .filter((f) => f && f.url && isDirectFileUrl(f.url) && !isManifestFormat(f) && f.vcodec && f.vcodec !== 'none' && f.acodec && f.acodec !== 'none')
+          .sort((a, b) => ((b.height || heightFromUrl(b.url) || 0) - (a.height || heightFromUrl(a.url) || 0)))[0] || null;
+        let prog = (ownFallback && ownFallback.info) ? findProg(ownFallback.info.formats) : null;
+        if (!prog) {
+          await mirrorDone;
+          if (mirrorBest && mirrorBest.info) prog = findProg(mirrorBest.info.formats);
+        }
+        if (prog) winner.info.formats = [prog, ...wf];
+      }
+      return winner;
+    }
     await mirrorDone;
     if (mirrorBest && (!ownFallback || infoScore(mirrorBest.info) > infoScore(ownFallback.info))) ownFallback = mirrorBest;
     if (ownFallback) return ownFallback;
