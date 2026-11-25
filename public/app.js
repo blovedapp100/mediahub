@@ -854,6 +854,55 @@
     var lastErr = null;
     var geoFails = 0;
     var answered = 0;
+    if (opts && opts.parallel) {
+      // RACE all origins at once; the fastest healthy region wins.
+      // (2026-11-25: serial order let a slow main — 26s 502 — plus a
+      // hung backup eat the 45s stage budget before the fast EU origin
+      // (1.8s) was ever tried, so YouTube showed only its thumbnail
+      // and never played. A 4xx is NOT terminal mid-race: another
+      // region may still answer ok; it only becomes the thrown error
+      // when no origin succeeds at all.)
+      var ctrls = list.map(function () { return new AbortController(); });
+      var timers = ctrls.map(function (c) { return setTimeout(function () { c.abort(); }, timeoutMs); });
+      var winner = null;
+      var doneCount = 0;
+      await new Promise(function (resolve) {
+        list.forEach(function (origin, idx) {
+          fetch(origin + path, Object.assign({}, options, { signal: ctrls[idx].signal }))
+            .then(function (r) { return r.json().catch(function () { return null; }).then(function (data) { return { r: r, data: data }; }); })
+            .then(function (o) {
+              doneCount++;
+              if (o && o.data && o.r.ok && !winner) {
+                winner = { data: o.data, origin: origin };
+                ctrls.forEach(function (c, j) { if (j !== idx) c.abort(); });
+                resolve();
+              } else {
+                if (o && o.data && !o.r.ok) {
+                  answered++;
+                  if (o.data.geoBlocked) geoFails++;
+                  var e = new Error(o.data.error || 'Something went wrong.');
+                  if (o.data.geoBlocked) e.geoBlocked = true;
+                  if (o.data.noStream) e.noStream = true;
+                  if (o.r.status >= 400 && o.r.status < 500) e._terminal = true;
+                  lastErr = e;
+                } else if (!o || !o.data) {
+                  lastErr = new Error('Something went wrong.');
+                }
+                if (doneCount === list.length) resolve();
+              }
+            })
+            .catch(function (e) {
+              doneCount++;
+              lastErr = e;
+              if (doneCount === list.length) resolve();
+            });
+        });
+      });
+      timers.forEach(function (t) { clearTimeout(t); });
+      if (winner) return winner;
+      if (answered && geoFails === answered && lastErr) lastErr.geoBlocked = true;
+      throw lastErr || new Error('Something went wrong.');
+    }
     for (var i = 0; i < list.length; i++) {
       var ctrl = new AbortController();
       var timer = setTimeout(function () { ctrl.abort(); }, timeoutMs);
@@ -1385,7 +1434,7 @@
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url: url }),
-        }, 27000, 3, { regionDiverse: true }),
+        }, 27000, 3, { regionDiverse: true, parallel: true }),
         infoBudget,
       ]);
       jobStop(); // Stage 2 won: stop any job polling and free its slot
