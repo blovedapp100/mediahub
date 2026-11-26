@@ -475,6 +475,13 @@ function attachPreviewStream(result, url) {
 async function streamThrough(res, streamUrl, title, ext, contentType, isPreview, ua) {
   const r = await fetch(streamUrl, { headers: { 'User-Agent': ua || 'Mozilla/5.0' } });
   if (!r.ok || !r.body) return false;
+  // COLD-LINK FIX (2026-11-26): a stale/dead upstream URL can answer
+  // with an error JSON (YT-A: {"error":"That quality is not
+  // available…","available":[360]}) instead of a video file. Never
+  // stream an error page as if it were the video — return false so
+  // the caller falls through to a fresh resolve / a clear 502.
+  const ct = (r.headers.get('content-type') || '').toLowerCase();
+  if (ct.includes('json') || ct.includes('text/html')) return false;
   if (isPreview) setPreviewHeaders(res, contentType);
   else setDownloadHeaders(res, title, ext, contentType);
   const reader = r.body.getReader();
@@ -3438,7 +3445,13 @@ async function ytdlpInfoWithFallbacks(url, opts = {}) {
 function decodeEntities(s) {
   return String(s || '')
     .replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
-    .replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    // Numeric entities (hex &#xb7; and decimal &#183;) — Facebook
+    // titles arrive with them (&#xb7; for ·, &#x1f431; for the cat
+    // emoji). Without this, stripTitleCounts cannot match the ·
+    // separator and the view/reaction counts stay in the title.
+    .replace(/&#x([0-9a-fA-F]+);/g, (m, h) => { try { return String.fromCodePoint(parseInt(h, 16)); } catch { return m; } })
+    .replace(/&#(\d+);/g, (m, d) => { try { return String.fromCodePoint(parseInt(d, 10)); } catch { return m; } });
 }
 
 // TITLE CLEANER (2026-11-25, user rule): a video's displayed title must
@@ -3492,7 +3505,11 @@ function stripTitleCounts(t) {
 // 'third-party' at their return points.
 function cleanBodyTitle(body) {
   if (!body || typeof body.title !== 'string') return body;
-  body.title = stripTitleCounts(body.title) || 'Video';
+  // COLD-LINK FIX (2026-11-26): decode entities BEFORE stripping
+  // counts, so a title like "1.7M views &#xb7; 10K reactions |
+  // Funny cats…" is cleaned on the FIRST render instead of showing
+  // dirty and cleaning up seconds later.
+  body.title = stripTitleCounts(decodeEntities(body.title)) || 'Video';
   if (!body.titleOrigin) body.titleOrigin = 'original';
   return body;
 }
@@ -4474,7 +4491,13 @@ async function scrapeDirectInfo(url) {
     const pool = own.length ? own : mine;
     const byRes = new Map();
     for (const u of pool) {
-      const m = u.match(/\/vid\/(\d+)x(\d+)\//);
+      // COLD-LINK FIX (2026-11-26): newer X posts embed the amplify
+      // copy (/vid/avc1/320x568/) instead of ext_tw_video
+      // (/vid/1280x720/). The old regex only matched the ext_tw_video
+      // shape, so every amplify variant mapped to height 0 and the
+      // byRes map collapsed all four resolutions into one "Best"
+      // row (direct-0). Accept the optional avc1/ segment.
+      const m = u.match(/\/vid\/(?:avc1\/)?(\d+)x(\d+)\//);
       const h = m ? Number(m[2]) : 0;
       if (!byRes.has(h) || u.length < byRes.get(h).length) byRes.set(h, u);
     }
@@ -5964,6 +5987,11 @@ try {
       // fall through to the generic build + cache below.
       tikwmNoInfo = false;
       winner.value.titleOrigin = 'third-party'; // tikwm title — never a filename
+      // COLD-LINK FIX (2026-11-26): a thin tikwm answer (<4 formats)
+      // means tikwm failed on THIS origin (it returns 4 on SG). Mark
+      // it partial so the frontend still starts the upgrade job and
+      // the list can grow to Best+HD+SD+Audio instead of sticking at 1.
+      if ((winner.value.formats || []).length < 4) winner.value.partial = true;
       result = winner.value;
     } else if (winner && winner.kind === 'ss') {
       // SSSTik answered first (usually Series, or a fast normal) —
@@ -5984,6 +6012,7 @@ try {
       if (twOutcome && twOutcome.value) {
         const merged = winner.value;
         merged.formats = [...(merged.formats || []), ...twOutcome.value.formats];
+        if ((merged.formats || []).length < 4) merged.partial = true; // still thin — upgrade can add the rest
         merged.titleOrigin = 'third-party'; // SSSTik/tikwm title — never a filename
         // 1s start: cache the signed URL (4 min, inside its ~5 min life)
         // so /api/save 302s at once instead of re-resolving SSSTik.
@@ -5991,6 +6020,10 @@ try {
         return { status: 200, body: merged };
       }
       winner.value.titleOrigin = 'third-party'; // SSSTik title — never a filename
+      // COLD-LINK FIX (2026-11-26): SSSTik alone is 1 format — mark
+      // it partial so the frontend starts the upgrade job instead of
+      // treating Best-only as the complete list.
+      winner.value.partial = true;
       rawCacheSet(url, winner.value, CHAIN_CACHE_TTL_MS);
       return { status: 200, body: winner.value };
     } else {
@@ -6526,7 +6559,23 @@ try {
     // remaining budget is ~0-4s, so these lanes fire mainly when own
     // fails FAST (see REPORT.md).
     if (!info && isYouTube(url)) {
-      const yt = await ytChain(url, budgetLeft, ydPrefetch, chocPrefetch);
+      let yt = await ytChain(url, budgetLeft, ydPrefetch, chocPrefetch);
+      // YT-A RESILIENCE (2026-11-26, cold-link fix): when the chain
+      // returns a THIN list on the JOB path (no sync cap — timeoutMs
+      // is the 300s job budget), YT-A may be rate-limiting right now
+      // and recover after ~60s (documented 2026-11-26). Wait once and
+      // re-resolve YT-A; if the fresh resolve is fuller, use the
+      // union. Bounded (one retry, job path only) — a thin list that
+      // does not recover is still returned, marked partial.
+      if (yt && chainListIsThin(yt.formats) && timeoutMs > 60000 && budgetLeft() > 90000) {
+        await new Promise((ok) => setTimeout(ok, 60000));
+        try {
+          const fresh = await ytdownloaderTech(url, 20000);
+          if (fresh && Array.isArray(fresh.formats) && fresh.formats.length > (yt.formats || []).length) {
+            yt = mergeChainAnswers([yt, fresh]);
+          }
+        } catch {}
+      }
       if (yt) {
         yt.titleOrigin = 'third-party';
         attachChainPreview(yt, url);
@@ -6640,7 +6689,12 @@ try {
   const ytDegraded = isYouTube(url) && Array.isArray(result && result.formats) &&
     !result.formats.some((f) => String(f.id || '').includes('+')) &&
     !result.formats.some((f) => f.label === 'Audio only');
-  if (noCacheKey !== 'sohu' && !ytDegraded && !infoPartial) cacheSet(url, result);
+  // COLD-LINK FIX (2026-11-26): a thin TikTok answer (partial, <4
+  // formats) must not be locked in for 10 minutes — the next paste
+  // would re-serve the 1-format list instead of re-running the lookup
+  // (which can now reach a woken SG and return all 4).
+  const ttThin = isTikTok(url) && result && result.partial;
+  if (noCacheKey !== 'sohu' && !ytDegraded && !infoPartial && !ttThin) cacheSet(url, result);
   return { status: 200, body: result };
 } catch (e) {
   if (e.geoBlocked) {
@@ -6954,8 +7008,16 @@ app.get('/api/save', rateLimit('save', 10, 60000), async (req, res) => {
       let relayed = false;
       try { relayed = await streamThrough(res, saveFmt.url, title, rExt, rType, false, relayUa(formatId)); } catch (e) { console.error('title relay failed:', scrub(e.message)); }
       if (relayed) return;
-      if (!res.headersSent) return res.redirect(302, saveFmt.url);
-      return;
+      // COLD-LINK FIX (2026-11-26): the cached URL for TikTok Best
+      // (SSSTik, ~5 min life) and for YT-A qualities (yd-, which
+      // YT-A can withdraw when it degrades to 360p-only) may be
+      // expired/dead. A 302 to it hands the browser the CDN's own
+      // filename (ssstik.io_....mp4) or YT-A's error JSON. Fall
+      // through to the fresh-resolve branches below instead of
+      // redirecting — they re-resolve and relay with the title.
+      if (formatId === 'best' || formatId === 'ssstik-best' || formatId.startsWith('yd-')) { /* fall through to a fresh resolve */ }
+      else if (!res.headersSent) return res.redirect(302, saveFmt.url);
+      else return;
     }
   }
   // PREVIEW RELAY (single formats): stream the CACHED format URL
@@ -7061,7 +7123,11 @@ app.get('/api/save', rateLimit('save', 10, 60000), async (req, res) => {
   // the right .jpg; only the server fallback is affected.
   if (formatId.startsWith('fa-') || formatId.startsWith('xc-') || formatId.startsWith('sr-') || formatId.startsWith('cx-') || formatId.startsWith('ip-') || formatId.startsWith('yd-') || formatId.startsWith('ym-') || formatId.startsWith('ch-') || formatId.startsWith('cb-') || formatId.startsWith('kw-') || formatId.startsWith('bc-') || formatId === 'sc-mp3' || formatId.startsWith('vk-') || formatId.startsWith('ok-')) {
     const streamUrl = await chainStreamUrl(url, formatId);
-    if (!streamUrl) return res.status(502).json({ error: 'This clip is not available right now. Please try again.' });
+    // COLD-LINK FIX (2026-11-26): a fresh resolve that no longer
+    // contains this YT-A quality means YT-A withdrew it (it is
+    // currently 360p-only) — say so plainly instead of redirecting
+    // the visitor to YT-A's error JSON.
+    if (!streamUrl) return res.status(502).json({ error: formatId.startsWith('yd-') ? 'That quality is not available for this video right now. Please try 360p instead.' : 'This clip is not available right now. Please try again.' });
     const ext = formatId === 'fa-audio' || formatId === 'sr-audio' || formatId === 'sc-mp3' ? 'mp3' : formatId === 'ch-audio' || formatId === 'yd-audio' ? 'm4a' : 'mp4';
     // VK / OK.ru (step 15h): full Chrome UA — the bare UA gets a 400.
     const saveUa = (formatId.startsWith('vk-') || formatId.startsWith('ok-'))
