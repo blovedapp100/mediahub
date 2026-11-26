@@ -279,6 +279,93 @@ function safeTitle(t, fallback) {
   return s || fallback || 'video';
 }
 
+// ORIGINAL TITLE + NO DUPLICATE TITLE (2026-11-26, user rules): the
+// downloaded file is named from the video's ORIGINAL title, and the
+// title appears exactly once in the name — never repeated, and never
+// the same generic name for two different videos.
+// - dedupeTitle: collapse a title that repeats itself ("Title | Title",
+//   "Title - Title", "Title Title") to one copy, and strip a trailing
+//   media extension the platform left in the title ("Title.mp4") so the
+//   filename does not become "Title.mp4.mp4". Only EXACT repeats are
+//   collapsed — a caption that merely reuses a word or a hashtag
+//   ("Black Photo Trend #BlackPhotoTrend") is left untouched.
+// - isGenericTitle: a title that is not a video title at all — the
+//   generic fallback ("video"), a bare platform/site name ("Twitch",
+//   "TikTok", "Instagram" — every clip from that platform would share
+//   the same filename), or a bare word like "Download"/"Watch".
+// - isAuthorNameTitle: a display name followed only by (@handle) — a
+//   profile/author name, not a video title (Bluesky's og:title is the
+//   author's name; the post caption is the video's title). "Name
+//   (@handle) on X" does NOT match (trailing words) and is kept.
+// - videoShortId: a short id for the video, from its own URL (YouTube
+//   v=, TikTok /video/<id>, IG shortcode, FB/X id, last path segment),
+//   else the first 8 hex of the URL's SHA-256 — so two different
+//   videos never share a filename when no real title exists.
+const GENERIC_TITLES = new Set(['video', 'twitch', 'tiktok', 'instagram', 'facebook', 'youtube', 'x', 'twitter', 'pinterest', 'sharechat', 'moj', 'douyin', 'kuaishou', 'zhihu', 'sohu', 'bluesky', 'reddit', 'tumblr', 'dailymotion', 'vimeo', 'rumble', 'kick', 'vk', 'okru', 'soundcloud', 'likee', 'kwai', 'streamable', 'threads', 'linkedin', 'snapchat', 'tencent', 'haokan', 'pear', 'download', 'watch']);
+function isGenericTitle(t) {
+  const s = String(t || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
+  return !s || GENERIC_TITLES.has(s);
+}
+function isAuthorNameTitle(t) {
+  return /^\s*[^@\n]+?\(\s*@[^)\s]+\s*\)\s*$/.test(String(t || ''));
+}
+function dedupeTitle(t) {
+  let s = String(t || '').trim();
+  if (!s) return s;
+  s = s.replace(/\.(mp4|mp3|m4a|webm|mov|mkv)\s*$/i, '').trim();
+  const sep = '\\s*[·•|:;\\-–—]\\s*';
+  const m = s.match(new RegExp('^(.+?)' + sep + '\\1$', 'i'));
+  if (m) s = m[1].trim();
+  else {
+    const m2 = s.match(/^(.+?)\s+\1$/i);
+    if (m2 && m2[1].trim().length >= 3) s = m2[1].trim();
+  }
+  return s.replace(/\s+/g, ' ').trim();
+}
+function videoShortId(u) {
+  try {
+    const parsed = new URL(String(u || ''));
+    const host = parsed.hostname.toLowerCase();
+    if (host.includes('youtube.com') || host === 'youtu.be') {
+      const v = parsed.searchParams.get('v');
+      if (v && /^[A-Za-z0-9_-]{6,20}$/.test(v)) return v.slice(0, 11);
+    }
+    const segs = parsed.pathname.split('/').filter(Boolean);
+    const skip = new Set(['video', 'videos', 'reel', 'reels', 'watch', 'shorts', 'status', 'statuses', 'pin', 'clip', 'clips', 'post', 'posts', 'p', 'tv', 'v', 'embed']);
+    for (let i = segs.length - 1; i >= 0; i--) {
+      const s = decodeURIComponent(segs[i]).replace(/\.[a-z0-9]+$/i, '');
+      if (/^[A-Za-z0-9_-]{5,32}$/.test(s) && !skip.has(s.toLowerCase())) return s;
+    }
+  } catch {}
+  return crypto.createHash('sha256').update(String(u || '')).digest('hex').slice(0, 8);
+}
+// Filename title for /api/save: the frontend's `t` (its fileTitle) when
+// it is a real video title; else the /api/info title cached for this
+// link (the video's own title — /api/meta is 404 for most links, and
+// the info title is third-party-relayed for TikTok/IG/YT-long but is
+// still the platform's own title, not a third-party brand); else a
+// generic name with the video's own short id, so two different videos
+// never share "video.mp4".
+function saveTitle(req, url) {
+  const fromT = dedupeTitle(stripTitleCounts(req.query.t || req.query.title || ''));
+  if (fromT && !isGenericTitle(fromT)) return safeTitle(fromT);
+  try {
+    const cached = rawCacheGet(url);
+    const ct = cached && cached.title ? dedupeTitle(stripTitleCounts(cached.title)) : '';
+    if (ct && !isGenericTitle(ct)) return safeTitle(ct);
+  } catch {}
+  return safeTitle('video-' + videoShortId(url));
+}
+
+// User-Agent for a title relay fetch: VK / OK.ru need a full Chrome UA
+// (the bare UA gets a 400 — same rule as the chain save branch); every
+// other host takes the plain UA.
+function relayUa(formatId) {
+  return (String(formatId || '').startsWith('vk-') || String(formatId || '').startsWith('ok-'))
+    ? 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+    : 'Mozilla/5.0';
+}
+
 // Build a Content-Disposition value Node.js will never reject: the plain
 // filename is ASCII-only (emoji / non-Latin chars dropped), and the real
 // title travels percent-encoded in filename* (RFC 5987). A raw emoji in a
@@ -371,7 +458,11 @@ function attachPreviewStream(result, url) {
   const single = withSound.filter((f) => String(f.id || '').indexOf('+') === -1);
   const pool = single.length ? single : withSound;
   pool.sort((a, b) => heightOf(a) - heightOf(b));
-  const pick = pool[0];
+  // YT-LONG FULL LIST (2026-11-26): with a full YT-A list the smallest
+  // with-sound format is 144p — too blurry for a preview. Prefer the
+  // smallest format at 360p or above (fast to start, watchable); fall
+  // back to the smallest overall when nothing reaches 360p.
+  const pick = pool.find((f) => heightOf(f) >= 360) || pool[0];
   if (!pick || !pick.id) return;
   result.previewStream = previewRelayUrl(url, pick.id, result.title);
 }
@@ -381,8 +472,8 @@ function attachPreviewStream(result, url) {
 // falls back to the yt-dlp save. Headers are only set after the fetch
 // succeeds, so a failed attempt commits nothing. isPreview serves the
 // file as inline video (preview relay) instead of a download.
-async function streamThrough(res, streamUrl, title, ext, contentType, isPreview) {
-  const r = await fetch(streamUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+async function streamThrough(res, streamUrl, title, ext, contentType, isPreview, ua) {
+  const r = await fetch(streamUrl, { headers: { 'User-Agent': ua || 'Mozilla/5.0' } });
   if (!r.ok || !r.body) return false;
   if (isPreview) setPreviewHeaders(res, contentType);
   else setDownloadHeaders(res, title, ext, contentType);
@@ -1128,12 +1219,21 @@ async function fetchTextTimeout(url, timeoutMs, headers) {
   } catch { return null; } finally { clearTimeout(timer); }
 }
 
-// ytdownloader.tech — POST /api/resolve {url} -> one merged mp4, capped
-// at 360p (240p for the zoo video, 360p for the 8-min video). If the
-// format is not pre-prepared, POST /api/prepare + poll ?job= until
-// saveUrl. Fastest YT lane (resolve ~1.5s for a short video, ~20s for
-// a long one). 429s carry retry-after — a 429 just returns null here
+// ytdownloader.tech — POST /api/resolve {url} -> the FULL list in one
+// call: 8 merged mp4s (2160p down to 144p, all with sound) + m4a audio
+// (itag 140, 128 kbps). Measured 2026-11-26: resolve ~1.5s (warm) to
+// ~3.5s (fresh video), and ALL prepared views are ready with saveUrls
+// — even for a video never resolved before. The old code took only
+// j.video[0] (the highest format) and threw the rest away, so the
+// first list was 1 format (yd-2160). Now the whole resolve response
+// is used: each format's saveUrl comes from prepared.views
+// ('video:<height>' / 'm4a:140'). A format whose view is not ready is
+// prepared in parallel (same /api/prepare flow, bounded by the
+// remaining budget); formats that never become ready are omitted and
+// the caller marks the answer partial so the upgrade job can fill
+// them in. 429s carry retry-after — a 429 just returns null here
 // (postJsonTimeout returns null on !ok) and the chain moves on.
+// No cookies, no login.
 async function ytdownloaderTech(url, timeoutMs) {
   const vid = youtubeId(url);
   if (!vid) return null;
@@ -1143,29 +1243,66 @@ async function ytdownloaderTech(url, timeoutMs) {
   const j = await postJsonTimeout('https://ytdownloader.tech/api/resolve',
     { url: 'https://www.youtube.com/watch?v=' + vid }, Math.max(2000, Math.min(left(), 30000)), H);
   if (!j || !Array.isArray(j.video) || !j.video.length) return null;
-  const v = j.video[0];
-  const view = j.prepared && j.prepared.views && j.prepared.views['video:' + v.formatId];
-  let saveUrl = view && view.status === 'ready' ? view.saveUrl : null;
-  if (!saveUrl) {
+  const views = (j.prepared && j.prepared.views) || {};
+  const full = (saveUrl) => (saveUrl && saveUrl.startsWith('/')) ? 'https://ytdownloader.tech' + saveUrl : saveUrl;
+  // Prepare one missing format (the flow the old code used for
+  // video[0]): POST /api/prepare + poll ?job= until saveUrl. Returns
+  // the saveUrl or null. Bounded by the shared deadline.
+  const prepareOne = async (formatId, media) => {
     const p = await postJsonTimeout('https://ytdownloader.tech/api/prepare',
-      { videoId: vid, formatId: String(v.formatId), media: 'video' }, Math.max(2000, Math.min(left(), 30000)), H);
+      { videoId: vid, formatId: String(formatId), media }, Math.max(2000, Math.min(left(), 30000)), H);
     if (!p || !p.job) return null;
     while (left() > 4000) {
       await new Promise((ok) => setTimeout(ok, 3000));
       if (left() < 3000) break;
       const q = await fetchJsonHeaders('https://ytdownloader.tech/api/prepare?job=' + encodeURIComponent(p.job),
         Math.max(2000, Math.min(left(), 30000)), { 'User-Agent': 'Mozilla/5.0', Referer: 'https://ytdownloader.tech/', Accept: 'application/json' });
-      if (q && q.saveUrl) { saveUrl = q.saveUrl; break; }
+      if (q && q.saveUrl) return q.saveUrl;
       if (q && q.error) return null;
     }
-  }
-  if (!saveUrl) return null;
-  const full = saveUrl.startsWith('/') ? 'https://ytdownloader.tech' + saveUrl : saveUrl;
-  const h = parseInt(v.height, 10) || 0;
-  return {
-    title: j.title || vid,
-    formats: [{ id: 'yd-' + (h || v.formatId), label: h ? h + 'p' : 'Video', ext: 'mp4', url: full }],
+    return null;
   };
+  const formats = [];
+  const missing = [];
+  for (const v of j.video) {
+    const h = parseInt(v.height, 10) || 0;
+    const view = views['video:' + v.formatId];
+    const saveUrl = view && view.status === 'ready' ? view.saveUrl : null;
+    if (saveUrl) {
+      formats.push({ id: 'yd-' + (h || v.formatId), label: h ? h + 'p' : 'Video', ext: 'mp4', hasAudio: true, filesize: v.sizeBytes || 0, note: 'With sound', url: full(saveUrl) });
+    } else {
+      missing.push({ kind: 'video', formatId: String(v.formatId), media: 'video', height: h, sizeBytes: v.sizeBytes || 0 });
+    }
+  }
+  // Audio (m4a itag 140, 128 kbps) — its prepared view is 'm4a:140'.
+  const audioView = views['m4a:140'];
+  const audioUrl = audioView && audioView.status === 'ready' ? audioView.saveUrl : null;
+  if (audioUrl) {
+    formats.push({ id: 'yd-audio', label: 'Audio only', ext: 'm4a', hasAudio: true, filesize: 0, note: 'Sound only', url: full(audioUrl) });
+  } else if (j.m4a && j.m4a.formatId) {
+    missing.push({ kind: 'audio', formatId: String(j.m4a.formatId), media: 'm4a', height: 0, sizeBytes: 0 });
+  }
+  // Prepare the missing ones in parallel (bounded by the deadline).
+  // The resolve usually returns everything ready, so this rarely runs.
+  if (missing.length && left() > 5000) {
+    const done = await Promise.all(missing.map(async (m) => {
+      const saveUrl = await prepareOne(m.formatId, m.media);
+      return saveUrl ? { ...m, saveUrl } : null;
+    }));
+    for (const pm of done) {
+      if (!pm || !pm.saveUrl) continue;
+      if (pm.kind === 'audio') {
+        formats.push({ id: 'yd-audio', label: 'Audio only', ext: 'm4a', hasAudio: true, filesize: 0, note: 'Sound only', url: full(pm.saveUrl) });
+      } else {
+        formats.push({ id: 'yd-' + (pm.height || pm.formatId), label: pm.height ? pm.height + 'p' : 'Video', ext: 'mp4', hasAudio: true, filesize: pm.sizeBytes || 0, note: 'With sound', url: full(pm.saveUrl) });
+      }
+    }
+  }
+  if (!formats.length) return null;
+  // Highest first (2160p down), audio last — the order the list shows.
+  const hOf = (f) => { const m = String(f.label || '').match(/(\d{3,4})p/); return m ? parseInt(m[1], 10) : 0; };
+  formats.sort((a, b) => ((b.label === 'Audio only') - (a.label === 'Audio only')) || (hOf(b) - hOf(a)));
+  return { title: j.title || vid, formats };
 }
 
 // y2mate.gs via eta.etacloud.org — one merged mp4 at the best available
@@ -2893,44 +3030,48 @@ async function ytdlpInfoWithFallbacks(url, opts = {}) {
       if (!fastPartial || !ydPrefetchOpt) return new Promise(() => {});
       const r = await ydPrefetchOpt;
       if (!r || !Array.isArray(r.formats) || !r.formats.length || !r.formats[0].url) return new Promise(() => {});
-      // YT-LONG FIX (2026-11-26): YT-A's single-format answer must
-      // not win the race over choc's FULL list just by being ~0.5s
-      // faster (measured: YT-A won a cold run at ~1.5s and the first
-      // list was 1 format). Give choc a 1.5s grace to land after YT-A
-      // before settling: choc (~2s) usually lands inside it, so the
-      // first list is the full list; when choc is down/slow the grace
-      // expires and YT-A settles alone. The grace is ONE-SIDED (only
-      // ydFastP waits) so the two sides can never deadlock — choc
-      // settles the moment it resolves.
-      if (chocPrefetchOpt) {
-        const chocWon = await Promise.race([
-          chocPrefetchOpt.then((x) => (x && Array.isArray(x.formats) && x.formats.length) ? 'choc' : 'no'),
-          new Promise((ok) => setTimeout(() => ok('grace'), 1500)),
-        ]).catch(() => 'no');
-        if (chocWon === 'choc') return new Promise(() => {}); // choc wins — chocFastP settles it
-      }
-      const f = r.formats[0];
-      const h = parseInt(String(f.label || '').replace(/[^0-9]/g, ''), 10) || 0;
+      // YT-LONG FULL LIST (2026-11-26): the 1.5s choc grace is GONE.
+      // It existed because YT-A's answer was a THIN 1-format list and
+      // choc's was FULL — YT-A had to wait so choc could win. Now
+      // ytdownloaderTech returns the FULL list itself (8 merged mp4s
+      // + audio), so YT-A settles immediately with it; the grace only
+      // cost 1.5s on every first list. (Choc is blocked from Render
+      // anyway, so the grace never paid off live.) If choc happens to
+      // resolve first on a clean IP, chocFastP still settles with its
+      // list and the upgrade job adds YT-A.
+      // Convert ALL of YT-A's formats to info formats (not just the
+      // first) so the first list is the full list. partial is set by
+      // the same bar as isLimitedList/chainListIsThin (< 8 formats or
+      // max height < 720p); a full list is not partial, so the
+      // frontend does not start the upgrade job for it.
+      const infoFormats = r.formats.filter((f) => f && f.url).map((f) => {
+        const isAudio = String(f.id || '') === 'yd-audio' || String(f.label || '') === 'Audio only';
+        const h = isAudio ? 0 : (parseInt(String(f.label || '').replace(/[^0-9]/g, ''), 10) || 0);
+        return {
+          format_id: String(f.id || ('yd-' + (h || 'video'))),
+          ext: isAudio ? (f.ext || 'm4a') : 'mp4',
+          height: h,
+          width: 0,
+          fps: 0,
+          vcodec: isAudio ? 'none' : 'avc1',
+          acodec: 'mp4a',
+          url: f.url,
+          filesize: f.filesize || 0,
+          filesize_approx: f.filesize || 0,
+          tbr: 0,
+        };
+      });
+      if (!infoFormats.length) return new Promise(() => {});
+      const maxH = Math.max(0, ...infoFormats.map((x) => x.height || 0));
+      const isFull = infoFormats.length >= 8 && maxH >= 720;
       const info = {
         title: r.title || 'Video',
         thumbnail: '',
         duration: 0,
         uploader: '',
-        formats: [{
-          format_id: String(f.id || ('yd-' + (h || 'video'))),
-          ext: 'mp4',
-          height: h,
-          width: 0,
-          fps: 0,
-          vcodec: 'avc1',
-          acodec: 'mp4a',
-          url: f.url,
-          filesize: 0,
-          filesize_approx: 0,
-          tbr: 0,
-        }],
+        formats: infoFormats,
       };
-      return { info, clientArgs: null, viaProxy: false, partial: true };
+      return { info, clientArgs: null, viaProxy: false, partial: !isFull };
     })();
     // YT-LONG FIX (2026-11-26): the choc (Invidious) metadata was
     // pre-started alongside the own branch in lookupInfo but never
@@ -2961,8 +3102,24 @@ async function ytdlpInfoWithFallbacks(url, opts = {}) {
       if (!fastPartial || !chocPrefetchOpt) return new Promise(() => {});
       const r = await chocPrefetchOpt;
       if (!r || !Array.isArray(r.formats) || !r.formats.length) return new Promise(() => {});
+      // YT-LONG FULL LIST (2026-11-26): YT-A now returns the FULL list
+      // itself (8 merged mp4s with sound + audio), which is the better
+      // first list (with sound, not partial) than choc's video-only
+      // list. Give YT-A a 1.5s grace to land after choc before
+      // settling: YT-A (~2s) usually lands inside it, so the first
+      // list is YT-A's full list; when YT-A is down/slow the grace
+      // expires and choc settles alone. The grace is ONE-SIDED (only
+      // chocFastP waits) so the two sides can never deadlock — YT-A
+      // settles the moment it resolves.
+      if (ydPrefetchOpt) {
+        const ydWon = await Promise.race([
+          ydPrefetchOpt.then((x) => (x && Array.isArray(x.formats) && x.formats.length) ? 'yd' : 'no'),
+          new Promise((ok) => setTimeout(() => ok('grace'), 1500)),
+        ]).catch(() => 'no');
+        if (ydWon === 'yd') return new Promise(() => {}); // YT-A wins — ydFastP settles it
+      }
       // Settles the moment choc resolves (no grace — the grace lives
-      // one-sided in ydFastP so the two sides can never deadlock).
+      // one-sided in chocFastP so the two sides can never deadlock).
       return { info: { ...r, chainAnswer: true }, clientArgs: null, viaProxy: false, partial: true, skipProgRescue: true };
     })();
     // Two passes: direct egress first, then the WARP proxy. Direct
@@ -5705,15 +5862,19 @@ try {
     // short-link resolve too (1.5-6s, measured).
     const TIKTOK_RACE_CAP_MS = 8000;
     const applyTikTokCap = timeoutMs <= 25000;
-    // GRACE (2026-11-25, measured): 0 on the sync path, 10s on the job
-    // path. The sync grace is 0 because tikwm lands ~5s after SSSTik
-    // (2.7s vs 7.9s measured) — a 3s grace merged 0 times and only
-    // delayed the answer; the fast win goes out at once and the merge
-    // arrives progressively (see the merge store below). The job path
-    // keeps a LONG grace (10s): the visitor already waited there, the
-    // job has no 8s cap, and tikwm lands at ~8-10s when it cooperates
-    // — the job is the completeness route, so it waits for the merge.
-    const TIKTOK_GRACE_MS = applyTikTokCap ? 0 : 10000;
+    // GRACE (2026-11-26, TikTok all-qualities fix): 10s on BOTH paths.
+    // The sync grace was 0 (2026-11-25, measured): tikwm landed ~5s
+    // after SSSTik, so a 3s grace merged 0 times and only delayed the
+    // answer. That is no longer true: tikwm now takes ~10-12s (and the
+    // sync cap below aborted it at 8s, so the merge never landed in
+    // time either). The user asked for ALL qualities together in the
+    // first list, so the sync path now waits for tikwm like the job
+    // path does. The wait is self-limiting: it only runs while tikwm
+    // is still in flight (twOutcome undefined) — if tikwm already
+    // failed, the answer goes out at once with no delay. Series
+    // videos (tikwm never answers for them) pay the wait and still
+    // return 1 format; that is the cost of completeness here.
+    const TIKTOK_GRACE_MS = 10000;
     // Resolve runs alongside the race (see the PARALLEL START note
     // above): SSSTik + own use the pasted URL at once; tikwm waits for
     // the canonical URL because it hangs on short links.
@@ -5722,11 +5883,14 @@ try {
     // measured): it never won (0/4 standalone, 0/4 in-race) and its 3
     // concurrent yt-dlp processes starve the race on this VM's 1.5
     // CPUs, so the 8s cap fired 4/4 with own on and SSSTik answered
-    // 3/4 with it off. SSSTik alone is the first list; tikwm runs in
-    // the background for the merge. JOB PATH: own races as before
-    // (no cap, no contention with a first list) and supplies the
-    // no-stream verdict. tiktokOwnAttempted stays true on both paths
-    // so the generic block below never re-runs yt-dlp for TikTok.
+    // 3/4 with it off. SSSTik usually wins the race, but the first
+    // list now WAITS for tikwm (grace above) so it carries the union
+    // (Best + HD/SD/Audio) instead of Best alone; tikwm keeps running
+    // in the background for the merge store either way. JOB PATH: own
+    // races as before (no cap, no contention with a first list) and
+    // supplies the no-stream verdict. tiktokOwnAttempted stays true
+    // on both paths so the generic block below never re-runs yt-dlp
+    // for TikTok.
     const ownP = applyTikTokCap ? null : withTimeout(ytdlpInfoWithFallbacks(url), 13000, 'own TikTok extraction timed out')
       .then((r) => ({ kind: 'own', value: r }))
       .catch((e) => {
@@ -5737,7 +5901,7 @@ try {
         if (isNoFormats(e.detail)) ytdlpNoFormats = true;
         return { kind: 'own', value: null };
       });
-    const twP = resolveP.then((canonical) => tikwmInfoDetailed(canonical, applyTikTokCap ? 8000 : 15000))
+    const twP = resolveP.then((canonical) => tikwmInfoDetailed(canonical, 15000))
       .then((tw) => { tikwmCode = tw.code; return { kind: 'tw', value: tw.info }; });
     // Track tikwm's outcome separately so the grace window below can
     // use it even when tikwm settled before SSSTik won — or is still
@@ -5803,15 +5967,17 @@ try {
       result = winner.value;
     } else if (winner && winner.kind === 'ss') {
       // SSSTik answered first (usually Series, or a fast normal) —
-      // signed token URL, never cached. Grace window: on the SYNC
-      // path the grace is 0 (see above — the fast win goes out at
-      // once, the merge arrives progressively via the merge store);
-      // on the JOB path it is 10s, waiting for tikwm's HD/SD/audio
-      // to merge in. The merge below still applies when tikwm
-      // already settled with a value.
-      const graceMs = applyTikTokCap
-        ? Math.min(TIKTOK_GRACE_MS, Math.max(0, TIKTOK_RACE_CAP_MS - (Date.now() - reqStart)))
-        : TIKTOK_GRACE_MS;
+      // signed token URL, never cached. Grace window (2026-11-26,
+      // TikTok all-qualities fix): 10s on BOTH paths, waiting for
+      // tikwm's HD/SD/audio to merge in so the first list carries
+      // all 4 formats together. The old sync grace was 0 (the fast
+      // win went out at once and the merge arrived progressively) —
+      // that is what the user just reported. The wait is capped by
+      // the race cap no longer: the 8s cap bounds the RACE, not the
+      // grace, and bounding the grace by it (min(0, 8000-elapsed))
+      // cut the wait to ~5s, before tikwm lands (~10s). The merge
+      // below still applies when tikwm already settled with a value.
+      const graceMs = TIKTOK_GRACE_MS;
       if (twOutcome === undefined && graceMs > 0) {
         await Promise.race([twDoneP, new Promise((ok) => setTimeout(ok, graceMs))]);
       }
@@ -6150,14 +6316,91 @@ try {
           });
         const first = await firstNonNull([ownP, chainP]);
         if (first && raceWinnerKind === 'chain') {
-          // Chain won: first list now (the own leg keeps running in
-          // the background; its result is discarded — the upgrade job
-          // re-runs the lookup for the full list).
-          first.titleOrigin = 'third-party'; // fbChain/igChain title — never a filename
-          first.partial = true;
-          return { status: 200, body: first };
-        }
-        if (first && raceWinnerKind === 'own') {
+          if (isInstagram(url)) {
+            // INSTAGRAM — ALL QUALITIES TOGETHER (2026-11-26): the
+            // chain's first list is thin (curl-x, 1 format "Video")
+            // while the own leg returns the full list (Best + 1920p +
+            // 1280p + Audio). Cold first list was 1 format on EU
+            // (3.4s) and on a fresh local process (3.4s); the own leg
+            // returns 4 formats in ~7-10s from Render (live job +
+            // SG origin). The user wants all qualities together in
+            // the first list, so wait for the own leg (already
+            // running, 14s cap) and prefer its full list; fall back
+            // to the chain's thin answer only if own fails. Time
+            // cost: first list ~7-10s (over the 5s rule) — the full
+            // IG list cannot be computed faster from Render; no chain
+            // lane returns it (curl-x 1, freeapi times out,
+            // instapdown 1). Facebook is NOT changed: the chain's 2
+            // formats (xcasper, with audio) ARE the full list and are
+            // better than own's video-only hd/sd.
+            const own = await ownP.catch(() => null);
+            if (own) {
+              info = own.info;
+              if (own.partial) infoPartial = true;
+              rawClientSet(url, own.clientArgs);
+              rawProxySet(url, own.viaProxy);
+            } else {
+              first.titleOrigin = 'third-party';
+              first.partial = true;
+              return { status: 200, body: first };
+            }
+          } else {
+            // FACEBOOK — ALL QUALITIES TOGETHER (2026-11-26): the
+            // chain's first list is thin (xcasper HD+SD, 2 formats)
+            // while the own leg returns the fuller list (DASH tiers as
+            // merged video+audio pairs + Audio only). The user tested
+            // it himself: 2 first, the rest later via the upgrade job
+            // (live job on EU/SG returns 6: HD/SD video-only +
+            // 2560p/1920p/1280p merged + Audio; main returns 2 because
+            // own fails there). So wait for the own leg (already
+            // running) and return the UNION: the chain's with-sound
+            // single files first, then own's merged pairs + Audio
+            // only. Own's video-only HD/SD rows are dropped — the
+            // chain's with-sound HD/SD are the same files with sound,
+            // so a silent duplicate of a with-sound row must never
+            // show. The wait is capped by the remaining sync budget
+            // (up to ~20s): own takes 5s on EU but 15-20s on this VM
+            // for a 57-min video (two concurrent yt-dlp attempts share
+            // 1.5 CPUs), so a 15s cap misses it locally — the union
+            // must wait out the full budget. If own fails, times out,
+            // or adds nothing, fall back to the chain's thin answer
+            // (partial:true) so the upgrade job still runs. Time cost:
+            // first list ~8s live (EU's own is fast) but up to ~23s
+            // when own is slow — over the 5s rule; the full FB list
+            // cannot be computed faster, the DASH tiers only come from
+            // own. The union is the full list, so no partial flag (no
+            // upgrade job); the fallback keeps partial:true.
+            const ownCap = Math.min(20000, Math.max(3000, budgetLeft()));
+            const own = await withTimeout(ownP, ownCap, 'own Facebook extraction timed out').catch(() => null);
+            if (own && own.info) {
+              const ownRows = buildFormats(own.info, { facebookVideoOnly: true });
+              const ownExtra = ownRows.filter((f) => {
+                if (!f) return false;
+                if (!f.hasAudio && (String(f.id || '').toLowerCase() === 'hd' || String(f.id || '').toLowerCase() === 'sd')) return false;
+                return true;
+              });
+              const seen = new Set((first.formats || []).map((f) => String(f && f.id)));
+              const union = (first.formats || []).slice();
+              for (const f of ownExtra) {
+                if (!seen.has(String(f.id))) { seen.add(String(f.id)); union.push(f); }
+              }
+              if (union.length > (first.formats || []).length) {
+                rawClientSet(url, own.clientArgs);
+                rawProxySet(url, own.viaProxy);
+                first.formats = union;
+                first.titleOrigin = 'third-party'; // fbChain title — never a filename
+                if (own.partial) first.partial = true;
+                else delete first.partial;
+                return { status: 200, body: first };
+              }
+            }
+            // Own failed/timed out or added nothing — chain's thin
+            // answer, the upgrade job still runs.
+            first.titleOrigin = 'third-party'; // fbChain/igChain title — never a filename
+            first.partial = true;
+            return { status: 200, body: first };
+          }
+        } else if (first && raceWinnerKind === 'own') {
           info = first.info;
           if (first.partial) infoPartial = true;
           rawClientSet(url, first.clientArgs);
@@ -6649,12 +6892,12 @@ function clientSideNote(url, info) {
 app.get('/api/save', rateLimit('save', 10, 60000), async (req, res) => {
   const url = String(req.query.url || '').trim();
   const formatId = String(req.query.formatId || '').trim();
-  // Filename title (user rule 2026-11-25): the frontend sends the
-  // platform-derived file title (see fileTitle() in app.js — /api/meta
-  // title first, else an original-lane title, else 'video'); clean it
-  // again here so a direct /api/save call with a counted or
-  // third-party title still gets a clean filename.
-  const title = safeTitle(stripTitleCounts(req.query.t || req.query.title) || 'video');
+  // Filename title (user rules 2026-11-25/26): the ORIGINAL title — the
+  // frontend's fileTitle when it is a real video title, else the
+  // /api/info title cached for this link, else "video-<id>" so two
+  // different videos never share "video.mp4". Counts are stripped and
+  // a repeated title is collapsed to one copy (see saveTitle).
+  const title = saveTitle(req, url);
   // PREVIEW RELAY (YT-long fix 2026-11-26): preview=1 streams the
   // file as inline video (no redirect, no Content-Disposition) so a
   // <video> element can play a URL that is unplayable cross-origin
@@ -6695,7 +6938,25 @@ app.get('/api/save', rateLimit('save', 10, 60000), async (req, res) => {
         || ((formatId === 'best' || formatId === 'ssstik-best')
           ? rawForSave.formats.find((f) => f && f.url) : null)
       : null;
-    if (saveFmt && isRedirectSafeUrl(saveFmt.url)) return res.redirect(302, saveFmt.url);
+    if (saveFmt && isRedirectSafeUrl(saveFmt.url)) {
+      // ORIGINAL TITLE (2026-11-26, user decision — title name wins over
+      // the fast 302): a bare 302 hands the browser the CDN's filename
+      // (ssstik.io_....mp4, video.mp4, Instagram.mp4), so the title
+      // filename is lost. Stream the file through the server instead,
+      // with Content-Disposition carrying the original title (same
+      // streamThrough the preview relay uses). Cost: the download starts
+      // when the server's fetch answers (~0.5–3s TTFB) instead of
+      // instantly, and the bytes pass through the server. If the relay
+      // cannot fetch, fall back to the 302 so the file still downloads
+      // (with the CDN's name).
+      const rExt = String(saveFmt.ext || 'mp4').toLowerCase();
+      const rType = rExt === 'mp3' ? 'audio/mpeg' : rExt === 'm4a' ? 'audio/mp4' : rExt === 'webm' ? 'video/webm' : 'video/mp4';
+      let relayed = false;
+      try { relayed = await streamThrough(res, saveFmt.url, title, rExt, rType, false, relayUa(formatId)); } catch (e) { console.error('title relay failed:', scrub(e.message)); }
+      if (relayed) return;
+      if (!res.headersSent) return res.redirect(302, saveFmt.url);
+      return;
+    }
   }
   // PREVIEW RELAY (single formats): stream the CACHED format URL
   // straight through with video headers — no re-resolve (the YT-A
@@ -6719,19 +6980,22 @@ app.get('/api/save', rateLimit('save', 10, 60000), async (req, res) => {
     }
   }
   // Series / SSSTik Best (ids 'best' and 'ssstik-best' — the live site
-  // has served both across origins since the id was renamed): the file
-  // lives on tikcdn.io, which only serves browsers (non-browser UAs get
-  // 204), so the server cannot stream it. Hand off instead: resolve
-  // the direct link and redirect the visitor's browser to it — the
-  // browser downloads the file itself, exactly like the Save button
-  // does. (This used to 400 by design; a direct /api/save link for
-  // this file now downloads instead of erroring. If the link cannot be
-  // resolved right now, the honest 502 below stands.)
+  // has served both across origins since the id was renamed): resolve
+  // the direct link, then relay it through the server with the original
+  // title filename instead of redirecting to tikcdn (which names it
+  // ssstik.io_....mp4). tikcdn DOES answer a server fetch (proven
+  // 2026-11-26: HTTP 200, full file, plain UA — the old "browsers only,
+  // server gets 204" note was stale). Fall back to the 302 if the relay
+  // cannot fetch, so the file still downloads.
   if (formatId === 'best' || formatId === 'ssstik-best') {
     const ssi = await ssstikInfo(url, 10000);
     const file = ssi && Array.isArray(ssi.formats) && ssi.formats[0] && ssi.formats[0].url;
     if (!file) return res.status(502).json({ error: 'This clip is not available right now. Please try again.' });
-    return res.redirect(302, file);
+    try {
+      if (await streamThrough(res, file, title, 'mp4', 'video/mp4', false)) return;
+    } catch (e) { console.error('best relay failed:', scrub(e.message)); }
+    if (!res.headersSent) return res.redirect(302, file);
+    return;
   }
   if (!formatId || !/^[A-Za-z0-9+._-]{1,64}$/.test(formatId)) {
     return res.status(400).json({ error: 'Invalid quality choice.' });
@@ -6798,7 +7062,7 @@ app.get('/api/save', rateLimit('save', 10, 60000), async (req, res) => {
   if (formatId.startsWith('fa-') || formatId.startsWith('xc-') || formatId.startsWith('sr-') || formatId.startsWith('cx-') || formatId.startsWith('ip-') || formatId.startsWith('yd-') || formatId.startsWith('ym-') || formatId.startsWith('ch-') || formatId.startsWith('cb-') || formatId.startsWith('kw-') || formatId.startsWith('bc-') || formatId === 'sc-mp3' || formatId.startsWith('vk-') || formatId.startsWith('ok-')) {
     const streamUrl = await chainStreamUrl(url, formatId);
     if (!streamUrl) return res.status(502).json({ error: 'This clip is not available right now. Please try again.' });
-    const ext = formatId === 'fa-audio' || formatId === 'sr-audio' || formatId === 'sc-mp3' ? 'mp3' : formatId === 'ch-audio' ? 'm4a' : 'mp4';
+    const ext = formatId === 'fa-audio' || formatId === 'sr-audio' || formatId === 'sc-mp3' ? 'mp3' : formatId === 'ch-audio' || formatId === 'yd-audio' ? 'm4a' : 'mp4';
     // VK / OK.ru (step 15h): full Chrome UA — the bare UA gets a 400.
     const saveUa = (formatId.startsWith('vk-') || formatId.startsWith('ok-'))
       ? 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
