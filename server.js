@@ -15,6 +15,44 @@ const PORT = process.env.PORT || 3000;
 const YTDLP = process.env.YTDLP_PATH || 'yt-dlp';
 
 app.use(express.json({ limit: '64kb' }));
+// ---- visit counter ---------------------------------------------------------
+// Lightweight, in-memory page-view counter for the 6-hourly views report.
+// Counts ONLY real browser visits to the homepage (GET /) and landing pages
+// (GET /<platform-slug>). Never counts API routes, /api/stats itself,
+// /sitemap.xml, /robots.txt, static assets, or bot/crawler/keep-alive
+// user-agents. No cookies, no IPs, no personal data, no I/O per request.
+// LIMIT: counts live only in memory - a Render restart resets them. The
+// 6-hourly views cron keeps the persistent total in its own log, so a
+// reset loses at most the views since the last cron read.
+function pktDate() {
+  // Asia/Karachi is UTC+5 all year (Pakistan has no daylight saving).
+  return new Date(Date.now() + 5 * 3600 * 1000).toISOString().slice(0, 10);
+}
+const VISIT_STATS = { date: pktDate(), today: 0, total: 0 };
+function statsRollover() {
+  const d = pktDate();
+  if (d !== VISIT_STATS.date) { VISIT_STATS.date = d; VISIT_STATS.today = 0; }
+}
+// User-agents that are never a real visitor: search-engine and social
+// crawlers, headless/automation tools, HTTP libraries, uptime monitors.
+const BOT_UA = /bot|crawl|spider|slurp|headless|puppeteer|playwright|selenium|phantomjs|curl|wget|python|go-http|node-fetch|axios|httpclient|okhttp|pingdom|uptimerobot|statuscake|monitor|render|facebookexternalhit|twitterbot|linkedinbot|slackbot|telegrambot|whatsapp|googlebot|bingbot|duckduckbot|yandexbot|baiduspider|sogou|exabot|facebot|ia_archiver|semrush|ahrefs|mj12bot|petalbot|bytespider/i;
+function isBotUA(ua) {
+  return !ua || BOT_UA.test(ua);
+}
+function isPagePath(p) {
+  if (p === '/') return true;
+  if (p[0] !== '/' || p.indexOf('/', 1) !== -1) return false;
+  return Object.prototype.hasOwnProperty.call(PLATFORMS, p.slice(1));
+}
+app.use((req, res, next) => {
+  if (req.method === 'GET' && isPagePath(req.path) && !isBotUA(req.headers['user-agent'] || '')) {
+    statsRollover();
+    VISIT_STATS.today += 1;
+    VISIT_STATS.total += 1;
+  }
+  next();
+});
+
 app.use(express.static(path.join(__dirname, 'public'), {
   maxAge: '1h', etag: true,
   setHeaders: (res, filePath) => {
@@ -5408,7 +5446,7 @@ const PLATFORMS = {
     title: 'YouTube Video Downloader — Save YouTube Videos in HD | Save Video',
     description: 'YouTube video downloader: paste a YouTube link, preview the video and save it in 1080p, 720p, 480p or 360p with sound, or as audio only. Free, no account, works on phone and PC.',
     h1: 'YouTube videos in every quality',
-    intro: 'A free YouTube video downloader that keeps it simple: paste a YouTube link, see the video preview with every available quality, and save the one you want. No account, no software to install, and it works on your phone, tablet and PC.',
+    intro: 'A free online YouTube video downloader that keeps it simple: paste a YouTube link, see the video preview with every available quality, and save the one you want — download YouTube videos without any software. No account, no software to install, and it works on your phone, tablet and PC.',
     example: 'https://www.youtube.com/watch?v=2ptQ0Z1deuA',
     faq: [
       ['Is the YouTube video downloader free?', 'Yes. You can use the YouTube video downloader here for free, with no account and no software to install.'],
@@ -5416,6 +5454,8 @@ const PLATFORMS = {
       ['Do I need a YouTube account?', 'No. Just paste the public video link — no login is needed on either side.'],
       ['Does it work on my phone?', 'Yes. The YouTube video downloader works in any modern mobile browser on Android and iPhone, as well as on desktop.'],
       ['Can I save private YouTube videos?', 'No. Only public videos can be read. Private, deleted or age-restricted videos will not work.'],
+      ['How do I download a YouTube video?', 'Copy the video link, paste it here and tap Get Video. Downloading starts in seconds. You can download YouTube videos in HD or as audio, free, with no account and no app to install. This YouTube downloader is free and works on any phone or PC.'],
+      ['Can I download a YouTube video to MP4?', 'Yes. Pick any quality and the video saves as an MP4 file with sound, ready to play on any phone or computer. This free YouTube video downloader online needs no software and no account — just paste the link.'],
     ],
   },
   tiktok: {
@@ -5432,6 +5472,8 @@ const PLATFORMS = {
       ['What qualities are available?', 'TikTok videos are usually offered in HD and SD, plus an audio-only option. The quality always matches the original upload.'],
       ['Do I need a TikTok account?', 'No. Paste any public TikTok link and go.'],
       ['Does it work on iPhone and Android?', 'Yes — it works in any modern mobile browser.'],
+      ['How do I download a TikTok video?', 'Copy the video link, paste it here and tap Get Video. Downloading starts in seconds. You can download TikTok videos in HD or as audio, free, with no account and no app to install. This TikTok downloader is free and works on any phone or PC.'],
+      ['How do I download TikTok videos without watermark?', 'Copy the video link, paste it here and tap Get Video. When TikTok provides a clean version of the video, this TikTok video downloader without watermark gives you the clean HD file. If only the watermarked version exists, that is what is offered.'],
     ],
   },
   douyin: {
@@ -5448,6 +5490,7 @@ const PLATFORMS = {
       ['What qualities are available?', 'Douyin serves the video as an MP4 with sound, in the quality it was uploaded — usually 720p or 1080p.'],
       ['Do I need a Douyin account?', 'No. Only the public video link is needed.'],
       ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+      ['How do I download a Douyin video?', 'Copy the video link, paste it here and tap Get Video. Downloading starts in seconds. You can download Douyin videos in HD or as audio, free, with no account and no app to install. This Douyin downloader is free and works on any phone or PC.'],
     ],
   },
   facebook: {
@@ -5464,6 +5507,8 @@ const PLATFORMS = {
       ['What qualities are available?', 'Public Facebook videos usually offer HD and SD with sound, plus an audio-only option.'],
       ['Do I need a Facebook account?', 'No. Only the public video link is needed.'],
       ['Can I save private Facebook videos?', 'No. Only public videos can be read.'],
+      ['How do I download a Facebook video?', 'Copy the video link, paste it here and tap Get Video. Downloading starts in seconds. You can download Facebook videos in HD or as audio, free, with no account and no app to install. This Facebook downloader (FB video downloader) is free and works on any phone or PC.'],
+      ['Can I download Facebook videos on Android or iPhone?', 'Yes. Open this page in Chrome on Android or Safari on iPhone, paste the Facebook link and download the video. You get an MP4 with sound and no watermark, in HD or SD.'],
     ],
   },
   instagram: {
@@ -5472,7 +5517,7 @@ const PLATFORMS = {
     title: 'Instagram Video Downloader — Save Instagram Reels & Videos in HD | Save Video',
     description: 'Instagram video downloader: paste an Instagram reel or video link, preview it and save it in HD with sound. Free, no account, works on phone and PC.',
     h1: 'Instagram reels & videos in every quality',
-    intro: 'A free Instagram video downloader for reels and videos: paste the link, preview the clip, and save it in HD with sound. No account, no app to install.',
+    intro: 'A free Instagram video downloader (also called an IG downloader or Insta downloader) for reels and videos: paste the link, preview the clip, and save it in HD with sound as an MP4. No account, no app to install.',
     example: 'https://www.instagram.com/reel/',
     faq: [
       ['Is the Instagram video downloader free?', 'Yes — free, with no account and nothing to install.'],
@@ -5480,6 +5525,8 @@ const PLATFORMS = {
       ['What qualities are available?', 'Instagram reels and videos are usually offered in HD with sound, plus an audio-only option.'],
       ['Do I need an Instagram account?', 'No. Only the public post link is needed.'],
       ['Can I save private Instagram posts?', 'No. Only public posts can be read.'],
+      ['How do I download an Instagram video?', 'Copy the video link, paste it here and tap Get Video. Downloading starts in seconds. You can download Instagram videos in HD or as audio, free, with no account and no app to install. This Instagram downloader is free and works on any phone or PC. It is also an Instagram reel downloader - download Instagram reels in HD.'],
+      ['How do I download Instagram reels as MP4?', 'Copy the reel link, paste it here and tap Get Video. Every Instagram reels download MP4 keeps the picture and sound together in one file, in the quality Instagram serves.'],
     ],
   },
   twitter: {
@@ -5488,7 +5535,7 @@ const PLATFORMS = {
     title: 'Twitter Video Downloader — Save X Videos in HD | Save Video',
     description: 'Twitter video downloader: paste an X (Twitter) video link, preview it and save it in HD with sound. Free, no account, works on phone and PC.',
     h1: 'X videos in every quality',
-    intro: 'A free Twitter video downloader for X videos: paste the post link, preview the clip, and save it in HD with sound. No account needed.',
+    intro: 'A free X video downloader (Twitter video downloader) for X videos: paste the post link, preview the clip, and save it in HD with sound. No account needed.',
     example: 'https://x.com/Eminem/status/943590594491772928',
     faq: [
       ['Is the Twitter video downloader free?', 'Yes — free, with no account and nothing to install.'],
@@ -5496,6 +5543,8 @@ const PLATFORMS = {
       ['Do I need an X account?', 'No. Only the public post link is needed.'],
       ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
       ['Can I save private X videos?', 'No. Only public posts can be read.'],
+      ['How do I download an X video?', 'Copy the video link, paste it here and tap Get Video. Downloading starts in seconds. You can download X videos in HD or as audio, free, with no account and no app to install. This X downloader is free and works on any phone or PC. It is a Twitter video downloader - download Twitter video in HD.'],
+      ['How do I save a Twitter video to my phone?', 'Copy the post link in the X app, open this page in your phone browser, paste the link and tap Get Video. Pick a quality and the Twitter video to MP4 download saves straight to your phone, with sound.'],
     ],
   },
   bluesky: {
@@ -5512,6 +5561,7 @@ const PLATFORMS = {
       ['Do I need a Bluesky account?', 'No. Only the public post link is needed.'],
       ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
       ['Can I save private Bluesky posts?', 'No. Only public posts can be read.'],
+      ['How do I download a Bluesky video?', 'Copy the video link, paste it here and tap Get Video. Downloading starts in seconds. You can download Bluesky videos in HD or as audio, free, with no account and no app to install. This Bluesky downloader is free and works on any phone or PC.'],
     ],
   },
   tumblr: {
@@ -5528,6 +5578,7 @@ const PLATFORMS = {
       ['What qualities are available?', 'Tumblr serves the original MP4 as uploaded, with sound — usually 720p or 1080p.'],
       ['Do I need a Tumblr account?', 'No. Only the public post link is needed.'],
       ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+      ['How do I download a Tumblr video?', 'Copy the video link, paste it here and tap Get Video. Downloading starts in seconds. You can download Tumblr videos in HD or as audio, free, with no account and no app to install. This Tumblr downloader is free and works on any phone or PC.'],
     ],
   },
   twitch: {
@@ -5544,6 +5595,7 @@ const PLATFORMS = {
       ['What qualities are available?', 'Clips are offered up to 1080p with sound, exactly as Twitch serves them.'],
       ['Do I need a Twitch account?', 'No. Only the public clip link is needed.'],
       ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+      ['How do I download a Twitch video?', 'Copy the video link, paste it here and tap Get Video. Downloading starts in seconds. You can download Twitch videos in HD or as audio, free, with no account and no app to install. This Twitch downloader is free and works on any phone or PC.'],
     ],
   },
   pinterest: {
@@ -5560,6 +5612,7 @@ const PLATFORMS = {
       ['Do I need a Pinterest account?', 'No. Only the public pin link is needed.'],
       ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
       ['Can I save private Pinterest pins?', 'No. Only public pins can be read.'],
+      ['How do I download a Pinterest video?', 'Copy the video link, paste it here and tap Get Video. Downloading starts in seconds. You can download Pinterest videos in HD or as audio, free, with no account and no app to install. This Pinterest downloader is free and works on any phone or PC.'],
     ],
   },
   moj: {
@@ -5576,6 +5629,7 @@ const PLATFORMS = {
       ['Do I need a Moj account?', 'No. Only the public video link is needed.'],
       ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
       ['Can I save private Moj videos?', 'No. Only public videos can be read.'],
+      ['How do I download a Moj video?', 'Copy the video link, paste it here and tap Get Video. Downloading starts in seconds. You can download Moj videos in HD or as audio, free, with no account and no app to install. This Moj downloader is free and works on any phone or PC.'],
     ],
   },
   sharechat: {
@@ -5592,6 +5646,7 @@ const PLATFORMS = {
       ['Do I need a ShareChat account?', 'No. Only the public video link is needed.'],
       ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
       ['Can I save private ShareChat videos?', 'No. Only public videos can be read.'],
+      ['How do I download a ShareChat video?', 'Copy the video link, paste it here and tap Get Video. Downloading starts in seconds. You can download ShareChat videos in HD or as audio, free, with no account and no app to install. This ShareChat downloader is free and works on any phone or PC.'],
     ],
   },
   linkedin: {
@@ -5608,6 +5663,7 @@ const PLATFORMS = {
       ['Do I need a LinkedIn account?', 'No. Only the public post link is needed.'],
       ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
       ['Can I save private LinkedIn posts?', 'No. Only public posts can be read.'],
+      ['How do I download a LinkedIn video?', 'Copy the video link, paste it here and tap Get Video. Downloading starts in seconds. You can download LinkedIn videos in HD or as audio, free, with no account and no app to install. This LinkedIn downloader is free and works on any phone or PC.'],
     ],
   },
   snapchat: {
@@ -5624,6 +5680,7 @@ const PLATFORMS = {
       ['What qualities are available?', 'Spotlight videos are served as MP4 files with sound, in the quality they were uploaded.'],
       ['Do I need a Snapchat account?', 'No. Only the public Spotlight link is needed.'],
       ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+      ['How do I download a Snapchat video?', 'Copy the video link, paste it here and tap Get Video. Downloading starts in seconds. You can download Snapchat videos in HD or as audio, free, with no account and no app to install. This Snapchat downloader is free and works on any phone or PC.'],
     ],
   },
   tencent: {
@@ -5640,6 +5697,7 @@ const PLATFORMS = {
       ['What qualities are available?', 'Tencent Video serves its videos as MP4 files with sound, in the quality the video was uploaded — usually 480p or lower. VIP-only videos cannot be saved.'],
       ['Do I need a Tencent Video account?', 'No. Only the public video link is needed.'],
       ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+      ['How do I download a Tencent video?', 'Copy the video link, paste it here and tap Get Video. Downloading starts in seconds. You can download Tencent videos in HD or as audio, free, with no account and no app to install. This Tencent downloader is free and works on any phone or PC.'],
     ],
   },
   kuaishou: {
@@ -5656,6 +5714,7 @@ const PLATFORMS = {
       ['What qualities are available?', 'Kuaishou serves its videos as MP4 files with sound, in the quality they were uploaded — usually 720p.'],
       ['Do I need a Kuaishou account?', 'No. Only the public video link is needed.'],
       ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+      ['How do I download a Kuaishou video?', 'Copy the video link, paste it here and tap Get Video. Downloading starts in seconds. You can download Kuaishou videos in HD or as audio, free, with no account and no app to install. This Kuaishou downloader is free and works on any phone or PC.'],
     ],
   },
   haokan: {
@@ -5672,6 +5731,7 @@ const PLATFORMS = {
       ['What qualities are available?', 'Haokan offers SD, HD, Super clear, 1080p and 2K as MP4 files with sound, depending on the video.'],
       ['Do I need a Haokan account?', 'No. Only the public video link is needed.'],
       ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+      ['How do I download a Haokan video?', 'Copy the video link, paste it here and tap Get Video. Downloading starts in seconds. You can download Haokan videos in HD or as audio, free, with no account and no app to install. This Haokan downloader is free and works on any phone or PC.'],
     ],
   },
   pear: {
@@ -5688,6 +5748,7 @@ const PLATFORMS = {
       ['What qualities are available?', 'Pear Video serves its videos as MP4 files with sound, in the quality they were uploaded.'],
       ['Do I need a Pear Video account?', 'No. Only the public video link is needed.'],
       ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+      ['How do I download a Pear video?', 'Copy the video link, paste it here and tap Get Video. Downloading starts in seconds. You can download Pear videos in HD or as audio, free, with no account and no app to install. This Pear downloader is free and works on any phone or PC.'],
     ],
   },
   zhihu: {
@@ -5704,6 +5765,7 @@ const PLATFORMS = {
       ['What qualities are available?', 'Zhihu offers 480p, 720p and 1080p as MP4 files with sound, depending on the video.'],
       ['Do I need a Zhihu account?', 'No. Only the public video link is needed.'],
       ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+      ['How do I download a Zhihu video?', 'Copy the video link, paste it here and tap Get Video. Downloading starts in seconds. You can download Zhihu videos in HD or as audio, free, with no account and no app to install. This Zhihu downloader is free and works on any phone or PC.'],
     ],
   },
   sohu: {
@@ -5720,6 +5782,194 @@ const PLATFORMS = {
       ['What qualities are available?', 'Sohu offers its videos as MP4 files with sound, in the quality the video was uploaded.'],
       ['Do I need a Sohu account?', 'No. Only the public video link is needed.'],
       ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+      ['How do I download a Sohu video?', 'Copy the video link, paste it here and tap Get Video. Downloading starts in seconds. You can download Sohu videos in HD or as audio, free, with no account and no app to install. This Sohu downloader is free and works on any phone or PC.'],
+    ],
+  },
+  vimeo: {
+    name: 'Vimeo',
+    keyword: 'Vimeo video downloader',
+    title: 'Vimeo Video Downloader — Save Vimeo Videos in HD | Save Video',
+    description: 'Vimeo video downloader: paste a Vimeo link, preview the video and save it as MP4 with sound in up to 1080p. Free, no account, works on phone and PC.',
+    h1: 'Vimeo videos in every quality',
+    intro: 'A free Vimeo video downloader: paste the video link, preview the clip, and save it as MP4 with sound in the quality it was uploaded — up to 1080p. No account, no app to install.',
+    example: 'https://vimeo.com/76979871',
+    faq: [
+      ['Is the Vimeo video downloader free?', 'Yes — free, with no account and nothing to install.'],
+      ['What qualities are available?', 'Vimeo serves its videos as progressive MP4 files with sound, usually from 240p up to 1080p, depending on the upload.'],
+      ['Do I need a Vimeo account?', 'No. Only the public video link is needed.'],
+      ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+      ['Can I save private Vimeo videos?', 'No. Only public videos can be read. Password-protected or private videos will not work.'],
+      ['How do I download a Vimeo video?', 'Copy the video link, paste it here and tap Get Video. Downloading starts in seconds. You can download Vimeo videos in HD or as audio, free, with no account and no app to install. This Vimeo downloader is free and works on any phone or PC.'],
+    ],
+  },
+  streamable: {
+    name: 'Streamable',
+    keyword: 'Streamable video downloader',
+    title: 'Streamable Video Downloader — Save Streamable Videos as MP4 | Save Video',
+    description: 'Streamable video downloader: paste a Streamable link, preview the video and save it as MP4 with sound. Free, no account, works on phone and PC.',
+    h1: 'Streamable videos in every quality',
+    intro: 'A free Streamable video downloader: paste the link, preview the clip, and save it as MP4 with sound. Works with public Streamable video links. No account, no app to install.',
+    example: 'https://streamable.com/',
+    faq: [
+      ['Is the Streamable video downloader free?', 'Yes — free, with no account and nothing to install.'],
+      ['What qualities are available?', 'Streamable serves its videos as MP4 files with sound, usually 720p and a 360p mobile version.'],
+      ['Do I need a Streamable account?', 'No. Only the public video link is needed.'],
+      ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+      ['Can I save private Streamable videos?', 'No. Only public videos can be read.'],
+      ['How do I download a Streamable video?', 'Copy the video link, paste it here and tap Get Video. Downloading starts in seconds. You can download Streamable videos in HD or as audio, free, with no account and no app to install. This Streamable downloader is free and works on any phone or PC.'],
+    ],
+  },
+  kwai: {
+    name: 'Kwai',
+    keyword: 'Kwai video downloader',
+    title: 'Kwai Video Downloader — Save Kwai Videos as MP4 | Save Video',
+    description: 'Kwai video downloader: paste a Kwai video link, preview it and save it as MP4 with sound. Free, no account, works on phone and PC.',
+    h1: 'Kwai videos in every quality',
+    intro: 'A free Kwai video downloader: paste the video link, preview the clip, and save it as MP4 with sound. Kwai is the international version of Kuaishou, so the same short-video links work here. No account, no app to install.',
+    example: 'https://www.kwai.com/',
+    faq: [
+      ['Is the Kwai video downloader free?', 'Yes — free, with no account and nothing to install.'],
+      ['Which Kwai links work?', 'Kwai video links (kwai.com) work, including short share links.'],
+      ['What qualities are available?', 'Kwai serves its videos as MP4 files with sound, in the quality they were uploaded — usually 720p.'],
+      ['Do I need a Kwai account?', 'No. Only the public video link is needed.'],
+      ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+      ['How do I download a Kwai video?', 'Copy the video link, paste it here and tap Get Video. Downloading starts in seconds. You can download Kwai videos in HD or as audio, free, with no account and no app to install. This Kwai downloader is free and works on any phone or PC.'],
+    ],
+  },
+  soundcloud: {
+    name: 'SoundCloud',
+    keyword: 'SoundCloud downloader',
+    title: 'SoundCloud Downloader — Save SoundCloud Tracks as MP3 | Save Video',
+    description: 'SoundCloud downloader: paste a SoundCloud track link and save the audio as MP3. Free, no account, works on phone and PC.',
+    h1: 'SoundCloud tracks in every quality',
+    intro: 'A free SoundCloud downloader: paste the track link and save the audio as MP3. SoundCloud is audio-only, so you get the track sound — not a video file. No account, no app to install.',
+    example: 'https://soundcloud.com/',
+    faq: [
+      ['Is the SoundCloud downloader free?', 'Yes — free, with no account and nothing to install.'],
+      ['What format do I get?', 'SoundCloud tracks are saved as audio (MP3/M4A), since SoundCloud hosts music and audio, not video.'],
+      ['What qualities are available?', 'SoundCloud serves its audio in 96k and 160k streams; you get the best quality the track offers.'],
+      ['Do I need a SoundCloud account?', 'No. Only the public track link is needed.'],
+      ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+      ['How do I download a SoundCloud track?', 'Copy the track link, paste it here and tap Get Video. Downloading starts in seconds. You can download SoundCloud tracks as MP3, free, with no account and no app to install. This SoundCloud downloader is free and works on any phone or PC.'],
+    ],
+  },
+  mixcloud: {
+    name: 'Mixcloud',
+    keyword: 'Mixcloud downloader',
+    title: 'Mixcloud Downloader — Save Mixcloud Audio as MP3 | Save Video',
+    description: 'Mixcloud downloader: paste a Mixcloud link and save the audio as MP3. Free, no account, works on phone and PC.',
+    h1: 'Mixcloud audio in every quality',
+    intro: 'A free Mixcloud downloader for DJ mixes and radio shows: paste the link and save the audio as MP3. Mixcloud is audio-only, so you get the mix sound — not a video file. No account, no app to install.',
+    example: 'https://www.mixcloud.com/',
+    faq: [
+      ['Is the Mixcloud downloader free?', 'Yes — free, with no account and nothing to install.'],
+      ['What format do I get?', 'Mixcloud shows are saved as audio (MP3), since Mixcloud hosts DJ mixes and radio, not video.'],
+      ['What qualities are available?', 'Mixcloud audio is served at 64k; you get the full mix as one audio file.'],
+      ['Do I need a Mixcloud account?', 'No. Only the public show link is needed.'],
+      ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+      ['How do I download a Mixcloud track?', 'Copy the track link, paste it here and tap Get Video. Downloading starts in seconds. You can download Mixcloud tracks as MP3, free, with no account and no app to install. This Mixcloud downloader is free and works on any phone or PC.'],
+    ],
+  },
+  odysee: {
+    name: 'Odysee',
+    keyword: 'Odysee video downloader',
+    title: 'Odysee Video Downloader — Save Odysee Videos as MP4 | Save Video',
+    description: 'Odysee video downloader: paste an Odysee video link, preview it and save it as MP4 with sound. Free, no account, works on phone and PC.',
+    h1: 'Odysee videos in every quality',
+    intro: 'A free Odysee video downloader: paste the video link, preview the clip, and save it as MP4 with sound. Works with public Odysee videos. No account, no app to install.',
+    example: 'https://odysee.com/',
+    faq: [
+      ['Is the Odysee video downloader free?', 'Yes — free, with no account and nothing to install.'],
+      ['What qualities are available?', 'Odysee serves its videos as MP4 files with sound, in the quality they were uploaded.'],
+      ['Do I need an Odysee account?', 'No. Only the public video link is needed.'],
+      ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+      ['Can I save private Odysee videos?', 'No. Only public videos can be read.'],
+      ['How do I download an Odysee video?', 'Copy the video link, paste it here and tap Get Video. Downloading starts in seconds. You can download Odysee videos in HD or as audio, free, with no account and no app to install. This Odysee downloader is free and works on any phone or PC.'],
+    ],
+  },
+  bitchute: {
+    name: 'BitChute',
+    keyword: 'BitChute video downloader',
+    title: 'BitChute Video Downloader — Save BitChute Videos as MP4 | Save Video',
+    description: 'BitChute video downloader: paste a BitChute video link, preview it and save it as MP4 with sound. Free, no account, works on phone and PC.',
+    h1: 'BitChute videos in every quality',
+    intro: 'A free BitChute video downloader: paste the video link, preview the clip, and save it as MP4 with sound. Works with public BitChute videos. No account, no app to install.',
+    example: 'https://www.bitchute.com/',
+    faq: [
+      ['Is the BitChute video downloader free?', 'Yes — free, with no account and nothing to install.'],
+      ['What qualities are available?', 'BitChute serves its videos as MP4 files with sound, in the quality they were uploaded.'],
+      ['Do I need a BitChute account?', 'No. Only the public video link is needed.'],
+      ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+      ['Can I save private BitChute videos?', 'No. Only public videos can be read.'],
+      ['How do I download a BitChute video?', 'Copy the video link, paste it here and tap Get Video. Downloading starts in seconds. You can download BitChute videos in HD or as audio, free, with no account and no app to install. This BitChute downloader is free and works on any phone or PC.'],
+    ],
+  },
+  peertube: {
+    name: 'PeerTube',
+    keyword: 'PeerTube video downloader',
+    title: 'PeerTube Video Downloader — Save PeerTube Videos as MP4 | Save Video',
+    description: 'PeerTube video downloader: paste a PeerTube video link, preview it and save it as MP4 with sound. Free, no account, works on phone and PC.',
+    h1: 'PeerTube videos in every quality',
+    intro: 'A free PeerTube video downloader: paste the video link, preview the clip, and save it as MP4 with sound. PeerTube is federated, so videos from any public PeerTube instance work. No account, no app to install.',
+    example: 'https://peertube.tv/',
+    faq: [
+      ['Is the PeerTube video downloader free?', 'Yes — free, with no account and nothing to install.'],
+      ['Which PeerTube instances work?', 'Any public PeerTube instance — paste a video link from the instance that hosts it.'],
+      ['What qualities are available?', 'PeerTube serves its videos as MP4 files with sound, in the quality they were uploaded.'],
+      ['Do I need a PeerTube account?', 'No. Only the public video link is needed.'],
+      ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+      ['How do I download a PeerTube video?', 'Copy the video link, paste it here and tap Get Video. Downloading starts in seconds. You can download PeerTube videos in HD or as audio, free, with no account and no app to install. This PeerTube downloader is free and works on any phone or PC.'],
+    ],
+  },
+  vk: {
+    name: 'VK',
+    keyword: 'VK video downloader',
+    title: 'VK Video Downloader — Save VK Videos as MP4 | Save Video',
+    description: 'VK video downloader: paste a VK video link, preview it and save it as MP4 with sound. Free, no account, works on phone and PC.',
+    h1: 'VK videos in every quality',
+    intro: 'A free VK video downloader: paste the video link, preview the clip, and save it as MP4 with sound. Works with public VK videos from vk.com and vkvideo.ru. No account, no app to install.',
+    example: 'https://vk.com/',
+    faq: [
+      ['Is the VK video downloader free?', 'Yes — free, with no account and nothing to install.'],
+      ['What qualities are available?', 'VK serves its videos as MP4 files with sound, in the quality they were uploaded.'],
+      ['Do I need a VK account?', 'No. Only the public video link is needed.'],
+      ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+      ['Can I save private VK videos?', 'No. Only public videos can be read.'],
+      ['How do I download a VK video?', 'Copy the video link, paste it here and tap Get Video. Downloading starts in seconds. You can download VK videos in HD or as audio, free, with no account and no app to install. This VK downloader is free and works on any phone or PC.'],
+    ],
+  },
+  ok: {
+    name: 'OK.ru',
+    keyword: 'OK.ru video downloader',
+    title: 'OK.ru Video Downloader — Save OK.ru Videos as MP4 | Save Video',
+    description: 'OK.ru video downloader: paste an OK.ru video link, preview it and save it as MP4 with sound. Free, no account, works on phone and PC.',
+    h1: 'OK.ru videos in every quality',
+    intro: 'A free OK.ru video downloader: paste the video link, preview the clip, and save it as MP4 with sound. Works with public OK.ru videos. No account, no app to install.',
+    example: 'https://ok.ru/',
+    faq: [
+      ['Is the OK.ru video downloader free?', 'Yes — free, with no account and nothing to install.'],
+      ['What qualities are available?', 'OK.ru serves its videos as MP4 files with sound, in the quality they were uploaded.'],
+      ['Do I need an OK.ru account?', 'No. Only the public video link is needed.'],
+      ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+      ['Can I save private OK.ru videos?', 'No. Only public videos can be read.'],
+      ['How do I download an OK.ru video?', 'Copy the video link, paste it here and tap Get Video. Downloading starts in seconds. You can download OK.ru videos in HD or as audio, free, with no account and no app to install. This OK.ru downloader is free and works on any phone or PC.'],
+    ],
+  },
+  kick: {
+    name: 'Kick',
+    keyword: 'Kick clip downloader',
+    title: 'Kick Clip Downloader — Save Kick Clips as MP4 | Save Video',
+    description: 'Kick clip downloader: paste a Kick clip link, preview it and save the clip as MP4 with sound. Free, no account, works on phone and PC.',
+    h1: 'Kick clips in every quality',
+    intro: 'A free Kick clip downloader: paste the clip link, preview it, and save the clip as MP4 with sound. Works with public Kick clips. No account, no app to install.',
+    example: 'https://kick.com/',
+    faq: [
+      ['Is the Kick clip downloader free?', 'Yes — free, with no account and nothing to install.'],
+      ['Can I save full Kick streams (VODs)?', 'Full streams are delivered as segmented streams with no single file to save — only short clips can be saved as MP4.'],
+      ['What qualities are available?', 'Kick clips are offered with sound, in the quality the clip was saved.'],
+      ['Do I need a Kick account?', 'No. Only the public clip link is needed.'],
+      ['Does it work on my phone?', 'Yes — it works in any modern mobile browser on Android and iPhone.'],
+      ['How do I download a Kick clip?', 'Copy the clip link, paste it here and tap Get Video. Downloading starts in seconds. You can download Kick clips free, with no account and no app to install. This Kick downloader is free and works on any phone or PC.'],
     ],
   },
 };
@@ -5746,6 +5996,11 @@ function renderLanding(platform, req) {
     '<details><summary>' + q + '</summary><p>' + a + '</p></details>').join('\n');
   const chips = Object.keys(PLATFORMS).map((k) =>
     '<a class="chip' + (k === platform ? ' active' : '') + '" href="/' + k + '">' + PLATFORMS[k].name + '</a>').join('\n');
+  // Footer platform links: generated from the same list, so the footer
+  // never goes stale when a platform is added (2026-11-26: it listed
+  // only 15 of the 31 platforms).
+  const footerLinks = Object.keys(PLATFORMS).map((k) =>
+    '<a href="/' + k + '">' + PLATFORMS[k].name + '</a>').join(' · ');
   return landingTemplate
     .replaceAll('{{TITLE}}', p.title)
     .replaceAll('{{DESCRIPTION}}', p.description)
@@ -5756,6 +6011,7 @@ function renderLanding(platform, req) {
     .replaceAll('{{EXAMPLE}}', p.example)
     .replaceAll('{{FAQ_HTML}}', faqHtml)
     .replaceAll('{{FAQ_JSON}}', JSON.stringify(faqJsonLd(p.faq)))
+    .replaceAll('{{FOOTER_LINKS}}', footerLinks)
     .replaceAll('{{CHIPS}}', chips);
 }
 
@@ -5764,6 +6020,11 @@ function renderLanding(platform, req) {
 app.get('/api/config', rateLimit('config', 30, 60000), (req, res) => res.json({ backupOrigins: BACKUP_ORIGINS, backupOrigin: BACKUP_ORIGINS[0] || null }));
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
+
+app.get('/api/stats', (req, res) => {
+  statsRollover();
+  res.json({ today: VISIT_STATS.today, total: VISIT_STATS.total, date: VISIT_STATS.date });
+});
 
 app.get('/robots.txt', (req, res) => {
   const host = req.get('host') || ''; const base = (host.endsWith('.onrender.com') ? 'https://' : req.protocol + '://') + host;
@@ -5780,7 +6041,7 @@ app.get('/sitemap.xml', (req, res) => {
     urls.join('\n') + '\n</urlset>');
 });
 
-app.get('/:platform(youtube|tiktok|douyin|facebook|instagram|twitter|bluesky|tumblr|twitch|pinterest|moj|sharechat|linkedin|snapchat|tencent|kuaishou|haokan|pear|zhihu|sohu)', (req, res) => {
+app.get('/:platform(youtube|tiktok|douyin|facebook|instagram|twitter|bluesky|tumblr|twitch|pinterest|moj|sharechat|linkedin|snapchat|tencent|kuaishou|haokan|pear|zhihu|sohu|vimeo|streamable|kwai|soundcloud|mixcloud|odysee|bitchute|peertube|vk|ok|kick)', (req, res) => {
   res.type('text/html').send(renderLanding(req.params.platform, req));
 });
 
