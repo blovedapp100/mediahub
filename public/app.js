@@ -40,6 +40,14 @@
   var playerWrap = document.getElementById('player');
   var videoEl = document.getElementById('previewVideo');
   var thumbImg = document.getElementById('thumb');
+  // COLD-LINK FIX (2026-11-26): a thumbnail that fails to load (cold
+  // FB preview) must not sit as a broken-image icon — hide it. The
+  // YT hqdefault is exempt: it has its own mqdefault fallback (set in
+  // fetchInfo), so hiding it on the first error would kill that.
+  if (thumbImg) thumbImg.addEventListener('error', function () {
+    if (thumbImg.src && /i\.ytimg\.com\/vi\/[^/]+\/hqdefault\.jpg$/.test(thumbImg.src)) return;
+    thumbImg.style.display = 'none';
+  });
   var titleEl = document.getElementById('title');
   var uploaderEl = document.getElementById('uploader');
   var durationEl = document.getElementById('duration');
@@ -133,7 +141,12 @@
   var currentThumb = '';
   function sizeFromThumb(url) {
     if (typeof url !== 'string' || !url) url = thumbImg ? thumbImg.src : '';
-    if (!url) return;
+    // COLD-LINK FIX (2026-11-26): a missing/failed thumbnail must not
+    // leave the player box at 0 height — the YouTube play button then
+    // has no clickable area (invisible, clicks "covered"). Fall back
+    // to a 16:9 box; the stream's metadata corrects the ratio when it
+    // arrives, and YouTube (the lazy-preview case) is 16:9 anyway.
+    if (!url) { sizePreviewPlayerFromRatio(16 / 9); return; }
     if (thumbImg && thumbImg.src === url && thumbImg.naturalWidth && thumbImg.naturalHeight) {
       sizePreviewPlayerFromRatio(thumbImg.naturalWidth / thumbImg.naturalHeight);
       return;
@@ -142,6 +155,10 @@
     img.onload = function () {
       if (url !== currentThumb) return; // a newer search superseded this one
       if (img.naturalWidth && img.naturalHeight) sizePreviewPlayerFromRatio(img.naturalWidth / img.naturalHeight);
+    };
+    img.onerror = function () {
+      if (url !== currentThumb) return;
+      sizePreviewPlayerFromRatio(16 / 9);
     };
     img.src = url;
   }
@@ -190,6 +207,17 @@
   // A new preview must never inherit the old one's size or player box.
   function resetPreviewPlayer() {
     pausePreviewPlayer();
+    // AUDIO LEAK FIX (2026-11-26): pausePreviewPlayer only pauses
+    // previewPlyr, which is null — Plyr is not shipped in this build
+    // — so a playing <video> kept playing (audio) over the next
+    // link's preview. Pause the raw element and clear its source so
+    // the old clip stops dead before the new preview is shown.
+    // onerror is cleared first so the reset load() cannot trip the
+    // previous preview's error handler.
+    if (videoEl) {
+      try { videoEl.pause(); } catch (e) {}
+      try { videoEl.onerror = null; videoEl.removeAttribute('src'); videoEl.load(); } catch (e) {}
+    }
     previewSized = false;
     previewVideoSized = false;
     clearPosterStallTimer();
@@ -310,7 +338,9 @@
       b.textContent = '▶';
       // Inline styles (no style.css change): a centred play disc
       // over the still image.
-      b.style.cssText = 'position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:64px;height:64px;border-radius:50%;border:0;background:rgba(0,0,0,0.65);color:#fff;font-size:26px;line-height:1;cursor:pointer;z-index:3;';
+      // COLD-LINK FIX (2026-11-26): z-index 10 + pointer-events so
+      // the button is always above the still image and clickable.
+      b.style.cssText = 'position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:64px;height:64px;border-radius:50%;border:0;background:rgba(0,0,0,0.65);color:#fff;font-size:26px;line-height:1;cursor:pointer;z-index:10;pointer-events:auto;';
       b.addEventListener('click', loadYouTubePreview);
       playerWrap.appendChild(b);
     }
@@ -1073,7 +1103,12 @@
 
   function timerShown(seconds) {
     if (!timerEl) return;
-    timerEl.innerHTML = 'Video shown in <b>' + fmtSecs(seconds) + '</b> — getting qualities…';
+    // COLD-LINK FIX (2026-11-26): do NOT freeze a smaller intermediate
+    // number ("Video shown in 2.7s") — the user then sees it jump to a
+    // bigger "Ready in 5.9s" and reads the timer as unstable. Keep the
+    // running elapsed display (the .elapsed span the interval updates)
+    // counting until timerDone sets the final number.
+    timerEl.innerHTML = 'Video shown — getting qualities… <b class="elapsed">' + fmtSecs(seconds) + '</b>';
   }
 
   function timerDone(seconds) {
@@ -1114,12 +1149,24 @@
     return s;
   }
 
+  // Decode HTML entities (&#xb7; &#x1f431; &amp; …) so a title that
+  // arrives entity-encoded can be cleaned on the FIRST render.
+  function decodeHtmlEntities(s) {
+    var t = document.createElement('textarea');
+    t.innerHTML = String(s || '');
+    return t.value;
+  }
+
   // A scraped title can be an error page's junk name ("Error" when a
   // platform blocks datacenter IPs) — never show that as the video's
   // name; fall back to the neutral placeholder instead.
   function cleanTitle(t) {
     var s = String(t || '').trim();
     if (!s) return 'video';
+    // COLD-LINK FIX (2026-11-26): decode entities BEFORE stripping
+    // counts — "1.7M views &#xb7; 10K reactions | Funny cats…" only
+    // cleans once &#xb7; becomes the literal · separator.
+    s = decodeHtmlEntities(s);
     var low = s.toLowerCase();
     if (low === 'error' || low === 'something went wrong' ||
         low === 'page not found' || low === 'not found' ||
@@ -1235,6 +1282,10 @@
 
   async function fetchInfo(url) {
     currentUrl = url;
+    // AUDIO LEAK FIX (2026-11-26): a new search must stop the
+    // previous preview at once — its audio kept playing over the
+    // next link's preview while the new info was still loading.
+    resetPreviewPlayer();
     // Fresh search: no title from a previous paste may leak into this
     // video's filename (fileTitle reads these).
     currentTitle = '';
@@ -1590,68 +1641,99 @@
     // has not tapped play yet, the pending preview URL is updated to
     // it — so the tap plays with sound. A video already playing is
     // never swapped mid-play.
-    // Job creation uses orderOriginsForJob (backups first, own origin
-    // last — speed fix 1c); the 10s per-origin cap and the 429/400
-    // early-break are unchanged.
+    // COLD-LINK FIX (2026-11-26): the old job stopped at the FIRST
+    // origin that accepted a job — for TikTok that is often EU or
+    // main, whose tikwm returns 1 format, so the list never grew even
+    // though SG's tikwm returns all 4 (verified live 2026-11-26: SG
+    // job 4 formats in 9s, EU/main job 1). And a sleeping backup
+    // (~50s cold start) made the 10s job-creation POST time out, so
+    // no job was created there at all. Now: try origins in order
+    // (backups first, orderOriginsForJob); a timed-out backup POST is
+    // retried once with a 45s timeout (the first POST woke the
+    // service); each job is polled to ready, and only a FULLER list
+    // (upgradeSwap true) stops the loop — a thin job result moves on
+    // to the next origin. Total cap 180s, stops on a newer request.
     async function startUpgradeJob() {
       if (reqId !== latestReq || upgradeDone) return;
       var origins;
       try { origins = await getOrigins(); } catch (e) { origins = [location.origin]; }
       origins = orderOriginsForJob(origins.slice());
-      var started = null;
-      for (var i = 0; i < Math.min(3, origins.length); i++) {
+      var upgradeStart = Date.now();
+      var postJob = async function (origin, timeoutMs) {
+        var postCtrl = new AbortController();
+        var postTimer = setTimeout(function () { postCtrl.abort(); }, timeoutMs);
         try {
-          var postCtrl = new AbortController();
-          var postTimer = setTimeout(function () { postCtrl.abort(); }, 10000);
-          var rr;
-          try {
-            rr = await fetch(origins[i] + '/api/job', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ url: url }),
-              signal: postCtrl.signal,
-            });
-          } finally { clearTimeout(postTimer); }
+          var rr = await fetch(origin + '/api/job', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url: url }),
+            signal: postCtrl.signal,
+          });
           var dd = await rr.json().catch(function () { return null; });
-          if (rr.ok && dd && dd.jobId) { started = { origin: origins[i], jobId: dd.jobId }; break; }
-          if (rr.status === 429 || rr.status === 400) break;
-        } catch (e) { /* next origin */ }
-        if (reqId !== latestReq || upgradeDone) return;
-      }
-      if (!started) return;
-      upgradeJobOrigin = started.origin;
-      upgradeJobId = started.jobId;
-      var jobStart = Date.now();
-      var poll = async function () {
-        if (reqId !== latestReq) { upgradeStop(); return; }
-        if (upgradeDone) return;
-        if (Date.now() - jobStart > 180000) { upgradeStop(); return; }
-        var pr, pd;
-        var pCtrl = new AbortController();
-        var pTimer = setTimeout(function () { pCtrl.abort(); }, 10000);
-        try {
-          pr = await fetch(upgradeJobOrigin + '/api/job/' + upgradeJobId, { signal: pCtrl.signal });
-          pd = await pr.json().catch(function () { return null; });
-        } catch (e) { pd = null; }
-        finally { clearTimeout(pTimer); }
-        if (reqId !== latestReq) { upgradeStop(); return; }
-        if (upgradeDone) return;
-        if (pd && pd.status === 'ready' && pd.formats && pd.formats.length) {
-          upgradeSwap(pd);
-          // YT-LONG FIX (2026-11-26): the job's answer carries the
-          // preview relay (with sound) when the first list's preview
-          // was the silent choc stream. Update the PENDING preview URL
-          // so a later tap plays with sound. Only when the visitor
-          // has not tapped yet (pendingYouTubePreview non-empty) — a
-          // video already playing is never swapped mid-play.
-          if (pd.previewStream && pendingYouTubePreview) pendingYouTubePreview = pd.previewStream;
-          upgradeStop(); // job is done either way — nothing fuller left to show
-          return;
-        }
-        if (pd && (pd.status === 'failed' || pr.status === 404)) { upgradeStop(); return; }
-        upgradeJobTimer = setTimeout(poll, 3000);
+          if (rr.ok && dd && dd.jobId) return { origin: origin, jobId: dd.jobId };
+          if (rr.status === 429 || rr.status === 400) return 'stop';
+          return null;
+        } catch (e) { return null; }
+        finally { clearTimeout(postTimer); }
       };
-      poll();
+      for (var i = 0; i < Math.min(3, origins.length); i++) {
+        if (reqId !== latestReq || upgradeDone) return;
+        if (Date.now() - upgradeStart > 180000) return;
+        var origin = origins[i];
+        var started = await postJob(origin, 10000);
+        // Wake-retry: a backup origin that timed out is probably
+        // asleep (~50s cold start) — the first POST woke it, so retry
+        // once with a long timeout instead of giving up on it.
+        if (!started && started !== 'stop' && origin !== location.origin) {
+          started = await postJob(origin, 45000);
+        }
+        if (started === 'stop') return;
+        if (!started) continue;
+        upgradeJobOrigin = started.origin;
+        upgradeJobId = started.jobId;
+        var jobStart = Date.now();
+        var gotFuller = false;
+        var jobDone = false;
+        while (!jobDone) {
+          if (reqId !== latestReq) { upgradeStop(); return; }
+          if (upgradeDone) return;
+          if (Date.now() - upgradeStart > 180000) { upgradeStop(); return; }
+          if (Date.now() - jobStart > 75000) break; // this origin's job is too slow — try the next origin
+          var pr, pd;
+          var pCtrl = new AbortController();
+          var pTimer = setTimeout(function () { pCtrl.abort(); }, 10000);
+          try {
+            pr = await fetch(upgradeJobOrigin + '/api/job/' + upgradeJobId, { signal: pCtrl.signal });
+            pd = await pr.json().catch(function () { return null; });
+          } catch (e) { pd = null; }
+          finally { clearTimeout(pTimer); }
+          if (reqId !== latestReq) { upgradeStop(); return; }
+          if (upgradeDone) return;
+          if (pd && pd.status === 'ready' && pd.formats && pd.formats.length) {
+            gotFuller = upgradeSwap(pd);
+            // YT-LONG FIX (2026-11-26): the job's answer carries the
+            // preview relay (with sound) when the first list's preview
+            // was the silent choc stream. Update the PENDING preview URL
+            // so a later tap plays with sound. Only when the visitor
+            // has not tapped yet (pendingYouTubePreview non-empty) — a
+            // video already playing is never swapped mid-play. The
+            // relay URL is relative, so prefix it with the job's origin
+            // (whose raw cache holds the format URL).
+            if (pd.previewStream && pendingYouTubePreview) {
+              var _ps = pd.previewStream;
+              if (_ps.charAt(0) === '/' && upgradeJobOrigin) _ps = upgradeJobOrigin + _ps;
+              pendingYouTubePreview = _ps;
+            }
+            jobDone = true;
+          } else if (pd && (pd.status === 'failed' || (pr && pr.status === 404))) {
+            jobDone = true;
+          } else {
+            await new Promise(function (ok) { upgradeJobTimer = setTimeout(ok, 3000); });
+          }
+        }
+        if (gotFuller) { upgradeStop(); return; }
+        // Not fuller — try the next origin for a fuller list.
+      }
     }
     function maybeUpgradeQualities(data) {
       if (!data || !Array.isArray(data.formats)) return;
@@ -1935,7 +2017,15 @@
         // previewUrl (choc proxy / Piped) when no relay exists.
         resetPreviewPlayer();
         sizeFromThumb(data.thumbnail);
-        pendingYouTubePreview = data.previewStream || data.previewUrl;
+        // COLD-LINK FIX (2026-11-26): the relay URL (previewStream)
+        // is relative (/api/save?…) — it must go to the origin that
+        // served this info (currentInfoOrigin), whose raw cache holds
+        // the format URL. A relative fetch hits the page's origin
+        // instead, whose cache is empty, so the relay 502s and the
+        // tap does nothing.
+        var _pv = data.previewStream || data.previewUrl;
+        if (_pv && _pv.charAt(0) === '/' && currentInfoOrigin) _pv = currentInfoOrigin + _pv;
+        pendingYouTubePreview = _pv;
         videoEl.style.display = 'none';
         if (playerWrap) playerWrap.classList.add('no-video');
         if (data.thumbnail) { thumbImg.src = data.thumbnail; thumbImg.style.display = ''; }
