@@ -303,7 +303,13 @@ function safeTitle(t, fallback) {
 //   videos never share a filename when no real title exists.
 const GENERIC_TITLES = new Set(['video', 'twitch', 'tiktok', 'instagram', 'facebook', 'youtube', 'x', 'twitter', 'pinterest', 'sharechat', 'moj', 'douyin', 'kuaishou', 'zhihu', 'sohu', 'bluesky', 'reddit', 'tumblr', 'dailymotion', 'vimeo', 'rumble', 'kick', 'vk', 'okru', 'soundcloud', 'likee', 'kwai', 'streamable', 'threads', 'linkedin', 'snapchat', 'tencent', 'haokan', 'pear', 'download', 'watch']);
 function isGenericTitle(t) {
-  const s = String(t || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
+  // UNICODE-AWARE (2026-11-26): the old /[^a-z0-9]/ strip deleted
+  // every non-Latin letter, so a real Bengali/Arabic/Chinese title
+  // collapsed to '' and was rejected as generic — the file then saved
+  // as "video.mp4" / "video-<id>.mp4" instead of the video's own
+  // title. \p{L}\p{N} keeps letters and numbers in every script; a
+  // title of only emoji/punctuation still collapses to '' (generic).
+  const s = String(t || '').trim().toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
   return !s || GENERIC_TITLES.has(s);
 }
 function isAuthorNameTitle(t) {
@@ -378,7 +384,13 @@ function contentDisposition(title, ext) {
     if (code >= 32 && code <= 126 && ch !== '"' && ch !== "'") ascii += ch;
   }
   ascii = ascii.trim().slice(0, 100) || 'video';
-  const encoded = encodeURIComponent(raw).slice(0, 200);
+  // TRUNCATE THE RAW TITLE, NEVER THE ENCODED FORM (2026-11-26):
+  // slicing encodeURIComponent(raw) at 200 chars cut non-Latin
+  // titles mid-triplet (a lone "%A" at the end) and lost most of the
+  // title — the browser then fell back to "video.mp4". Slice the raw
+  // title by code points (never splits a surrogate pair) and encode
+  // the whole sliced title, so filename* is always complete and valid.
+  const encoded = encodeURIComponent([...raw].slice(0, 80).join(''));
   return 'attachment; filename="' + ascii + '.' + ext + '"; filename*=UTF-8' + "''" + encoded + '.' + ext;
 }
 
@@ -403,6 +415,21 @@ function setPreviewHeaders(res, contentType) {
   res.setHeader('Cache-Control', 'no-store');
 }
 
+// A Piped proxy video URL (proxy.piped.private.coffee/videoplayback).
+// The googlevideo signature in it is bound to the proxy's own IP, and
+// the proxy 403s every playback/download (measured 2026-11-26: 403
+// from this VM and from a real browser) — the file plays/downloads
+// for nobody. Never play it directly, never 302 to it, never relay
+// it as if it were a file.
+function isPipedProxyUrl(u) {
+  return hostOfUrl(u).includes('piped');
+}
+
+// Progressive YouTube itag -> height, for mapping a dead mirror
+// format (yt-<itag>) to the chain's YT-A file for the same quality
+// (yd-<height>) when the mirror URL is a dead Piped proxy URL.
+const YT_PROG_ITAG_HEIGHT = { 5: 240, 17: 144, 18: 360, 22: 720, 36: 240, 37: 1080, 38: 3072, 43: 360 };
+
 // Hostname of a URL, '' when it is not a URL at all.
 function hostOfUrl(u) {
   try { return new URL(String(u || '')).hostname.toLowerCase(); } catch { return ''; }
@@ -420,7 +447,10 @@ function hostOfUrl(u) {
 // CDN; Facebook/Instagram CDNs) need no relay.
 function isUnplayablePreviewHost(u) {
   const h = hostOfUrl(u);
-  return h === 'ytdownloader.tech' || h === 'googlevideo.com' || h.endsWith('.googlevideo.com');
+  // Piped proxy (2026-11-26): its videoplayback URL 403s globally
+  // (IP-bound googlevideo signature) — never play it directly; the
+  // same-origin relay is attached instead.
+  return h === 'ytdownloader.tech' || h === 'googlevideo.com' || h.endsWith('.googlevideo.com') || h.includes('piped');
 }
 
 // Same-origin relay URL for a format whose direct URL is unplayable
@@ -630,7 +660,9 @@ function mergeTikTokInfos(ssInfo, twInfo) {
     uploader: base.uploader || '',
     previewUrl: base.previewUrl || '',
     formats,
-    clientSide: true,
+    // NO clientSide flag (2026-11-26): same reason as ssstikInfoFresh
+    // — the flag routed saves around the server relay, losing the
+    // original-title filename to the CDN's name.
     note: '',
   };
 }
@@ -3857,12 +3889,47 @@ function pipedToInfo(j) {
   };
 }
 
+// PIPED PROXY LIVENESS (2026-11-26): the Piped API answers but its
+// video proxy (proxy.piped.private.coffee/videoplayback) 403s globally
+// — the googlevideo signature is bound to the proxy's own IP, so the
+// file plays/downloads for nobody (measured: 403 from this VM and
+// from a real browser; the proxy thumbnail still answers 200, so the
+// host is up and only videoplayback is dead). Probe the first video
+// URL (Range 0-0, 2s cap, Chrome UA): alive only on 200/206.
+async function pipedProxyAlive(info) {
+  const f = (info && info.formats || []).find((x) => x && x.url && isDirectFileUrl(x.url));
+  if (!f) return false;
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 2000);
+    const r = await fetch(f.url, {
+      signal: ctrl.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        Range: 'bytes=0-0',
+      },
+    });
+    clearTimeout(timer);
+    const alive = r.status === 200 || r.status === 206;
+    try { await r.arrayBuffer(); } catch {}
+    return alive;
+  } catch { return false; }
+}
+
 async function mirrorInfo(url) {
   const vid = youtubeId(url);
   if (!vid) return null;
   const [inv, pip] = await Promise.all([invidiousInfo(vid), pipedInfo(vid)]);
   if (inv) return invidiousToInfo(inv);
-  if (pip) return pipedToInfo(pip);
+  if (pip) {
+    const info = pipedToInfo(pip);
+    // Do not offer a dead format: if the Piped proxy refuses the
+    // file, treat Piped as dead so the lookup falls through to the
+    // chain (YT-A) or the honest error — never a dead play button
+    // and a 403 save page.
+    if (info && await pipedProxyAlive(info)) return info;
+    return null;
+  }
   return null;
 }
 
@@ -3962,6 +4029,11 @@ function isRedirectSafeUrl(u) {
   try {
     const h = new URL(u).hostname.toLowerCase();
     if (h === 'googlevideo.com' || h.endsWith('.googlevideo.com')) return false;
+    // Piped proxy (2026-11-26): its videoplayback URL 403s globally,
+    // so a 302 to it lands the visitor on an error page. Never
+    // redirect there — fall through to the format branch, which
+    // re-resolves and relays (or answers with a clear message).
+    if (h.includes('piped')) return false;
     return true;
   } catch { return false; }
 }
@@ -4798,7 +4870,10 @@ async function ssstikInfoFresh(url, timeoutMs = 15000) {
           uploader: authorM ? authorM[1].trim() : '',
           previewUrl: link[1],
           formats: [{ id: 'best', label: 'Best quality', ext: 'mp4', hasAudio: true, filesize: 0, note: '', url: link[1] }],
-          clientSide: true,
+          // NO clientSide flag (2026-11-26): the flag routed the save
+          // around the server relay (openTab to the tikcdn URL), so the
+          // browser saved the CDN's filename (ssstik.io_....mp4) instead
+          // of the original title. The relay names the file correctly.
           note: '',
         };
       }
@@ -7091,7 +7166,17 @@ app.get('/api/save', rateLimit('save', 10, 60000), async (req, res) => {
 
   // Mirror streams (Invidious / Piped): resolve the direct stream URL and stream it through.
   if (formatId.startsWith('yt-')) {
-    const streamUrl = await mirrorStreamUrl(url, formatId);
+    let streamUrl = await mirrorStreamUrl(url, formatId);
+    // PIPED PROXY DEAD (2026-11-26): a resolved Piped proxy URL 403s
+    // for everyone (IP-bound googlevideo signature). Do not fetch it
+    // and do not 302 to it — use the chain's YT-A file for the same
+    // quality instead (same itag, working file). When the chain has
+    // no such quality either, the clear 502 below stands.
+    if (streamUrl && isPipedProxyUrl(streamUrl)) {
+      const itag = formatId.slice(3);
+      const chainId = formatId.endsWith('-audio') ? 'yd-audio' : ('yd-' + (YT_PROG_ITAG_HEIGHT[itag] || 360));
+      try { streamUrl = await chainStreamUrl(url, chainId); } catch { streamUrl = null; }
+    }
     if (!streamUrl) return res.status(502).json({ error: 'This clip is not available right now. Please try again.' });
     const ext = formatId.endsWith('-audio') ? 'm4a' : 'mp4';
     try {
