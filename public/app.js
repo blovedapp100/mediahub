@@ -1202,7 +1202,13 @@
   // next source is used. "video" is the last resort only.
   var GENERIC_TITLES = { video: 1, twitch: 1, tiktok: 1, instagram: 1, facebook: 1, youtube: 1, x: 1, twitter: 1, pinterest: 1, sharechat: 1, moj: 1, douyin: 1, kuaishou: 1, zhihu: 1, sohu: 1, bluesky: 1, reddit: 1, tumblr: 1, dailymotion: 1, vimeo: 1, rumble: 1, kick: 1, vk: 1, okru: 1, soundcloud: 1, likee: 1, kwai: 1, streamable: 1, threads: 1, linkedin: 1, snapchat: 1, tencent: 1, haokan: 1, pear: 1, download: 1, watch: 1 };
   function isGenericTitle(t) {
-    var s = String(t || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
+    // UNICODE-AWARE (2026-11-26): the old /[^a-z0-9]/ strip deleted
+    // every non-Latin letter, so a real Bengali/Arabic/Chinese title
+    // collapsed to '' and was rejected as generic — the file then saved
+    // as "video.mp4" instead of the video's own title. \p{L}\p{N}
+    // keeps letters and numbers in every script; a title of only
+    // emoji/punctuation still collapses to '' (generic).
+    var s = String(t || '').trim().toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
     return !s || !!GENERIC_TITLES[s];
   }
   function isAuthorNameTitle(t) {
