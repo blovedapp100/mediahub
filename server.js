@@ -15,15 +15,38 @@ const PORT = process.env.PORT || 3000;
 const YTDLP = process.env.YTDLP_PATH || 'yt-dlp';
 
 app.use(express.json({ limit: '64kb' }));
-// ---- visit counter ---------------------------------------------------------
+// ---- visit counter (real views only) --------------------------------------
 // Lightweight, in-memory page-view counter for the 6-hourly views report.
-// Counts ONLY real browser visits to the homepage (GET /) and landing pages
-// (GET /<platform-slug>). Never counts API routes, /api/stats itself,
-// /sitemap.xml, /robots.txt, static assets, or bot/crawler/keep-alive
-// user-agents. No cookies, no IPs, no personal data, no I/O per request.
-// LIMIT: counts live only in memory - a Render restart resets them. The
-// 6-hourly views cron keeps the persistent total in its own log, so a
-// reset loses at most the views since the last cron read.
+// Counts ONLY real, authentic browser visits to the homepage (GET /) and
+// landing pages (GET /<platform-slug>). DROPPED (never counted):
+//  - bot/crawler/headless/keep-alive user-agents, API routes, /api/stats
+//    itself, /sitemap.xml, /robots.txt, static assets, non-GET requests;
+//  - REPEAT views: the same visitor (IP + browser) counts at most ONCE per
+//    30 minutes, so bar-bar refresh, an idle tab auto-reloading, or a
+//    reload loop can never inflate the number;
+//  - INACTIVITY reloads are covered by the same 30-minute window.
+// Privacy: the visitor is identified only by a SHA-256 hash of (IP + UA);
+// the raw IP is never stored or logged. No cookies, no personal data, no
+// I/O per request. LIMIT: counts live only in memory - a Render restart
+// resets them. The 6-hourly views cron keeps the persistent total in its
+// own log, so a reset loses at most the views since the last cron read.
+// Honest limit: a determined person can still fake a view (new IP / new
+// browser), but casual refresh spam and bots are dropped.
+const VISIT_DEDUP_MS = 30 * 60 * 1000; // 30 minutes per visitor
+const VISIT_SEEN = new Map(); // visitor hash -> last counted timestamp (ms)
+function clientIp(req) {
+  // Render sits behind a proxy and there is no `trust proxy` setting, so
+  // req.ip is the proxy's IP (same for everyone). Render sets
+  // x-forwarded-for with the real client IP first.
+  const xff = req.headers['x-forwarded-for'];
+  if (typeof xff === 'string' && xff.length) return xff.split(',')[0].trim();
+  return req.ip || 'unknown';
+}
+function visitorKey(req) {
+  return crypto.createHash('sha256')
+    .update(clientIp(req) + '|' + (req.headers['user-agent'] || ''))
+    .digest('hex').slice(0, 16);
+}
 function pktDate() {
   // Asia/Karachi is UTC+5 all year (Pakistan has no daylight saving).
   return new Date(Date.now() + 5 * 3600 * 1000).toISOString().slice(0, 10);
@@ -46,12 +69,24 @@ function isPagePath(p) {
 }
 app.use((req, res, next) => {
   if (req.method === 'GET' && isPagePath(req.path) && !isBotUA(req.headers['user-agent'] || '')) {
-    statsRollover();
-    VISIT_STATS.today += 1;
-    VISIT_STATS.total += 1;
+    const now = Date.now();
+    const key = visitorKey(req);
+    const last = VISIT_SEEN.get(key) || 0;
+    if (now - last >= VISIT_DEDUP_MS) {
+      VISIT_SEEN.set(key, now);
+      statsRollover();
+      VISIT_STATS.today += 1;
+      VISIT_STATS.total += 1;
+    }
   }
   next();
 });
+setInterval(() => {
+  const cutoff = Date.now() - VISIT_DEDUP_MS;
+  for (const [key, t] of VISIT_SEEN) {
+    if (t < cutoff) VISIT_SEEN.delete(key);
+  }
+}, 60000).unref();
 
 app.use(express.static(path.join(__dirname, 'public'), {
   maxAge: '1h', etag: true,
