@@ -95,6 +95,27 @@
     sizePreviewPlayerFromRatio(videoEl.videoWidth / videoEl.videoHeight, true);
   }
 
+  // SCROLL-RESIZE FIX (2026-11-26): the loadedmetadata listener must NOT
+  // live only inside setupPreviewPlayer() — that function early-returns
+  // when Plyr is undefined, and the landing page does not load Plyr (no
+  // vendor/plyr bundle is shipped in the build), so the listener was
+  // never attached there. The box was then sized from the thumbnail
+  // only, and the video's own ratio landed only on the next window
+  // resize — on a phone that resize is the address bar hiding/showing
+  // while scrolling, so every scroll jerked the player from the
+  // thumbnail ratio to the video ratio (at 390px wide: 336x448 -> 336x597,
+  // a ~150px height jump). Attach the listener once here, Plyr or not,
+  // so the box is right the moment the stream's metadata arrives and no
+  // scroll can ever change it. setupPreviewPlayer() calls this too
+  // (it is a no-op the second time).
+  var previewMetaListenerAttached = false;
+  function attachPreviewMetaListener() {
+    if (previewMetaListenerAttached || !videoEl) return;
+    videoEl.addEventListener('loadedmetadata', sizePreviewPlayer);
+    previewMetaListenerAttached = true;
+  }
+  attachPreviewMetaListener();
+
   // Size from the thumbnail: it loads in under a second and carries the
   // video's own ratio, so the box is correct from the preview onward and
   // never jumps when the stream's metadata arrives (the metadata re-size
@@ -158,7 +179,7 @@
       var _plyrEl = playerWrap ? playerWrap.querySelector('.plyr') : null;
       if (_plyrEl) _plyrEl.classList.add('plyr__poster-enabled');
     }
-    videoEl.addEventListener('loadedmetadata', sizePreviewPlayer);
+    attachPreviewMetaListener();
     if (videoEl.readyState >= 1) sizePreviewPlayer();
   }
 
@@ -327,10 +348,20 @@
     };
   }
 
-  // Re-size when the window changes (rotate the phone, resize desktop).
+  // SCROLL-RESIZE FIX (2026-11-26): re-size only when the WIDTH changes
+  // (rotate the phone, resize the desktop window). On a phone, scrolling
+  // hides/shows the browser's address bar, which changes
+  // window.innerHeight and fires a `resize` event — and
+  // sizePreviewPlayer() sizes the box from innerHeight (the maxH cap),
+  // so every scroll re-sized the player (small and big, jerking). A
+  // height-only resize must never re-size the player: track the last
+  // width and ignore the event when the width did not move.
+  var lastResizeWidth = window.innerWidth;
   window.addEventListener('resize', function () {
+    if (window.innerWidth === lastResizeWidth) return; // height-only (address bar): ignore
     if (previewResizeTimer) clearTimeout(previewResizeTimer);
     previewResizeTimer = setTimeout(function () {
+      lastResizeWidth = window.innerWidth;
       if (previewSized) sizePreviewPlayer();
     }, 150);
   });
@@ -480,7 +511,7 @@
   }
 
   function safeFileName(name, ext) {
-    var s = String(name || 'video').replace(/[\\/:*?"<>|\n\r\t]/g, '').replace(/\s+/g, ' ').trim().slice(0, 80) || 'video';
+    var s = dedupeTitle(String(name || 'video')).replace(/[\\/:*?"<>|\n\r\t]/g, '').replace(/\s+/g, ' ').trim().slice(0, 80) || 'video';
     return s + '.' + (ext || 'mp4');
   }
 
@@ -849,6 +880,8 @@
       var ctrls = list.map(function () { return new AbortController(); });
       var timers = ctrls.map(function (c) { return setTimeout(function () { c.abort(); }, timeoutMs); });
       var winner = null;
+      var thinFallback = null; // TikTok prefer-full: first thin answer held
+      var thinTimer = null; // TikTok prefer-full: 12s cap waiting for full
       var doneCount = 0;
       await new Promise(function (resolve) {
         list.forEach(function (origin, idx) {
@@ -856,6 +889,63 @@
             .then(function (r) { return r.json().catch(function () { return null; }).then(function (data) { return { r: r, data: data }; }); })
             .then(function (o) {
               doneCount++;
+              // TIKTOK PREFER-FULL (2026-11-26, all-qualities fix): a
+              // thin TikTok answer (<4 formats, Best only) is held as a
+              // fallback while the other origins are given up to 12s to
+              // return the full list (Best + HD + SD + Audio). Without
+              // this, main's thin 1-format answer at ~3s wins the race
+              // over SG's full 4-format answer at ~10s, and the user
+              // sees Best first and the rest later. A full answer wins
+              // at once; a thin answer only wins when every origin has
+              // answered thin, or the 12s cap fires. Non-TikTok and
+              // non-/api/info calls are unaffected.
+              var preferFullPlatform = (opts && opts.preferFull) || null; // 'tiktok' | 'facebook' | true
+              var isPreferFull = !!preferFullPlatform;
+              var isFullList = function (d) {
+                if (!d || !Array.isArray(d.formats)) return false;
+                if (preferFullPlatform === 'facebook') {
+                  // FACEBOOK PREFER-FULL (2026-11-26): the chain-only
+                  // first list is 2 formats (partial:true); the union
+                  // is 5-6 formats and not partial. Any non-partial
+                  // answer with more than the chain's 2 is the full
+                  // list. (The own-only job list is 5-6 too.)
+                  return d.formats.length > 2 && d.partial !== true;
+                }
+                return d.formats.length >= 4;
+              };
+              // FACEBOOK PREFER-FULL (2026-11-26): same hold-a-thin-answer
+              // logic as TikTok, but the cap is 18s not 12s — the
+              // server-side union waits for the own leg, which takes
+              // 5-15s on the backup origins (EU ~5s, SG ~15s), so a
+              // 12s cap would take main's thin answer before the
+              // union lands. Without this, main's thin 2-format
+              // answer wins the race over the backup origins' full
+              // union, and the user sees 2 first and the rest later.
+              var preferFullCap = preferFullPlatform === 'facebook' ? 18000 : 12000;
+              if (isPreferFull && o && o.data && o.r.ok) {
+                if (isFullList(o.data)) {
+                  winner = { data: o.data, origin: origin };
+                  ctrls.forEach(function (c, j) { if (j !== idx) c.abort(); });
+                  resolve();
+                  return;
+                }
+                if (!thinFallback) thinFallback = { data: o.data, origin: origin };
+                if (!thinTimer) {
+                  thinTimer = setTimeout(function () {
+                    if (!winner && thinFallback) {
+                      winner = thinFallback;
+                      ctrls.forEach(function (c) { c.abort(); });
+                      resolve();
+                    }
+                  }, preferFullCap);
+                }
+                if (doneCount === list.length) {
+                  winner = thinFallback;
+                  resolve();
+                  return;
+                }
+                return;
+              }
               if (o && o.data && o.r.ok && !winner) {
                 winner = { data: o.data, origin: origin };
                 ctrls.forEach(function (c, j) { if (j !== idx) c.abort(); });
@@ -883,7 +973,9 @@
         });
       });
       timers.forEach(function (t) { clearTimeout(t); });
+      if (thinTimer) clearTimeout(thinTimer);
       if (winner) return winner;
+      if (thinFallback) return thinFallback; // TikTok prefer-full: all thin
       if (answered && geoFails === answered && lastErr) lastErr.geoBlocked = true;
       throw lastErr || new Error('Something went wrong.');
     }
@@ -1047,20 +1139,69 @@
     return s;
   }
 
-  // FILENAME TITLE (2026-11-25, user rule): a downloaded file is named
-  // from the ORIGINAL title or our cleaned title — never a third-party
-  // lane's title. Order: an original /api/meta title first, then the
-  // display title when it came from an original lane, then the
-  // /api/meta title (the platform-derived replacement the rule names),
-  // else the generic name. A third-party /api/info title is never used
-  // directly as a filename.
+  // FILENAME TITLE (2026-11-25/26, user rules): a downloaded file is
+  // named from the video's ORIGINAL title — the platform's own title,
+  // cleaned of counts, appearing exactly once, and never the same
+  // generic name for two different videos. Order: an original
+  // /api/meta title first, then the display title when it came from an
+  // original lane, then the /api/meta title, then the display title
+  // even when it came through a third-party lane — that title is still
+  // the platform's own title relayed (TikTok's description, IG's
+  // caption, YT-long's title), not the lane's brand; /api/meta is 404
+  // for most links, so refusing it would name every such file "video".
+  // A title that is only a platform/site name ("Twitch" — every clip
+  // would share it) or only a display name + (@handle) (Bluesky's
+  // og:title is the author's name, not the video) is skipped, and the
+  // next source is used. "video" is the last resort only.
+  var GENERIC_TITLES = { video: 1, twitch: 1, tiktok: 1, instagram: 1, facebook: 1, youtube: 1, x: 1, twitter: 1, pinterest: 1, sharechat: 1, moj: 1, douyin: 1, kuaishou: 1, zhihu: 1, sohu: 1, bluesky: 1, reddit: 1, tumblr: 1, dailymotion: 1, vimeo: 1, rumble: 1, kick: 1, vk: 1, okru: 1, soundcloud: 1, likee: 1, kwai: 1, streamable: 1, threads: 1, linkedin: 1, snapchat: 1, tencent: 1, haokan: 1, pear: 1, download: 1, watch: 1 };
+  function isGenericTitle(t) {
+    var s = String(t || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
+    return !s || !!GENERIC_TITLES[s];
+  }
+  function isAuthorNameTitle(t) {
+    return /^\s*[^@\n]+?\(\s*@[^)\s]+\s*\)\s*$/.test(String(t || ''));
+  }
+  function dedupeTitle(t) {
+    var s = String(t || '').trim();
+    if (!s) return s;
+    s = s.replace(/\.(mp4|mp3|m4a|webm|mov|mkv)\s*$/i, '').trim();
+    var sep = '\\s*[·•|:;\\-–—]\\s*';
+    var m = s.match(new RegExp('^(.+?)' + sep + '\\1$', 'i'));
+    if (m) s = m[1].trim();
+    else {
+      var m2 = s.match(/^(.+?)\s+\1$/i);
+      if (m2 && m2[1].trim().length >= 3) s = m2[1].trim();
+    }
+    return s.replace(/\s+/g, ' ').trim();
+  }
+  function isUsableTitle(t) {
+    var s = dedupeTitle(String(t || '').trim());
+    return !!s && !isGenericTitle(s);
+  }
   function fileTitle() {
     var m = String(metaTitle || '').trim();
     var c = String(currentTitle || '').trim();
-    if (m && m !== 'video' && metaTitleOrigin === 'original') return m;
-    if (c && c !== 'video' && currentTitleOrigin === 'original') return c;
-    if (m && m !== 'video') return m;
+    if (isUsableTitle(m) && !isAuthorNameTitle(m) && metaTitleOrigin === 'original') return dedupeTitle(m);
+    if (isUsableTitle(c) && currentTitleOrigin === 'original') return dedupeTitle(c);
+    if (isUsableTitle(m) && !isAuthorNameTitle(m)) return dedupeTitle(m);
+    if (isUsableTitle(c)) return dedupeTitle(c);
     return 'video';
+  }
+
+  // Filenames already saved in this session: the same video saved in a
+  // second quality, or a second video with the same title, must not
+  // download under an identical name (it would overwrite the first).
+  // The browser appends (1) on a disk collision, but the site itself
+  // must not produce the duplicate — append " (2)", " (3)" here.
+  var savedFileNames = {};
+  function uniqueFileName(name, ext) {
+    var base = safeFileName(name, ext);
+    if (!savedFileNames[base]) { savedFileNames[base] = 1; return base; }
+    var n = ++savedFileNames[base];
+    var dot = base.lastIndexOf('.');
+    var uniq = base.slice(0, dot) + ' (' + n + ')' + base.slice(dot);
+    savedFileNames[uniq] = 1;
+    return uniq;
   }
 
   function renderPreview(data) {
@@ -1580,7 +1721,7 @@
         }, 45000);
       });
       var res = await Promise.race([
-        tryOrigins('/api/info', infoReqOptions, 27000, 3, { regionDiverse: true, parallel: true }),
+        tryOrigins('/api/info', infoReqOptions, 27000, 3, { regionDiverse: true, parallel: true, preferFull: platform === 'TikTok' ? 'tiktok' : (platform === 'Facebook' ? 'facebook' : false) }),
         infoBudget,
       ]);
       jobStop(); // Stage 2 won: stop any job polling and free its slot
@@ -1619,7 +1760,7 @@
             }, 15000);
           });
           var res2 = await Promise.race([
-            tryOrigins('/api/info', infoReqOptions, 15000, 3, { regionDiverse: true, parallel: true }),
+            tryOrigins('/api/info', infoReqOptions, 15000, 3, { regionDiverse: true, parallel: true, preferFull: platform === 'TikTok' ? 'tiktok' : (platform === 'Facebook' ? 'facebook' : false) }),
             retryBudget,
           ]);
           jobStop(); // retry won: stop any job polling and free its slot
@@ -1699,6 +1840,12 @@
         btn.disabled = true;
         btn.textContent = 'Saving…';
         var reset = function () { setTimeout(function () { btn.disabled = false; btn.textContent = 'Save'; }, 3000); };
+        // One filename for this click: the same name is handed to every
+        // client-side path (fast download, direct download, open-tab),
+        // so a retry inside one click never renames the file, while a
+        // second save of the same name in this session gets " (2)".
+        // (serverSave sends only the title as `t`; the server names it.)
+        var fname = uniqueFileName(fileTitle(), f.ext);
         var serverSave = function () {
           window.location.href = (currentInfoOrigin || '') + '/api/save?url=' + encodeURIComponent(currentUrl) +
             '&formatId=' + encodeURIComponent(f.id) +
@@ -1714,7 +1861,7 @@
           a.target = '_blank';
           a.rel = 'noopener';
           a.referrerPolicy = 'no-referrer';
-          a.download = safeFileName(fileTitle(), f.ext);
+          a.download = fname;
           document.body.appendChild(a);
           a.click();
           a.remove();
@@ -1727,7 +1874,7 @@
         // platforms, where there IS no server save: the browser then
         // opens the file itself in a new tab.
         var legacy = function () {
-          downloadDirect(f.url, safeFileName(fileTitle(), f.ext), function (done, total, bps) {
+          downloadDirect(f.url, fname, function (done, total, bps) {
             btn.textContent = progressText(done, total, bps);
           }).then(function (ok) {
             if (ok) { btn.textContent = 'Saved ✓'; reset(); }
@@ -1742,7 +1889,7 @@
           // a download that used to work. A file over the parallel cap
           // never goes through a whole-file fetch: it opens in a tab
           // (client-side-only) or takes the server stream instead.
-          tryFastDownload(f, data.formats, safeFileName(fileTitle(), f.ext), btn).then(function (res) {
+          tryFastDownload(f, data.formats, fname, btn).then(function (res) {
             if (res === 'saved') { btn.textContent = 'Saved ✓'; reset(); }
             else if (res === 'toobig') { if (currentClientSide) openTab(); else serverSave(); }
             else legacy();
