@@ -466,6 +466,11 @@
       for (var i = 0; i < PLATFORMS.length; i++) {
         if (host === PLATFORMS[i][0] || host.endsWith('.' + PLATFORMS[i][0])) return PLATFORMS[i][1];
       }
+      // PEERTUBE FEDERATION (2026-11-27): any instance's watch link
+      // (/w/<id> or /videos/watch/<uuid>) is a PeerTube link, whatever
+      // host carries it — the host list cannot name every instance.
+      var path = new URL(url).pathname;
+      if (/^\/w\/[A-Za-z0-9_-]{6,}$/.test(path) || /^\/videos\/watch\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.test(path)) return 'PeerTube';
     } catch (e) {}
     return null;
   }
@@ -1192,6 +1197,11 @@
         low === '404 not found' || low === 'access denied' ||
         low === 'forbidden' || low === 'unavailable') return 'video';
     if (/^error\s*[|\-–—]/.test(s)) return 'video';
+    // Cloudflare's bot-check page title ("Just a moment..." /
+    // "Attention Required") is not a video title — a Mixcloud file
+    // saved under it live on 2026-11-27 because the meta scrape hit
+    // the challenge page instead of the video page.
+    if (/^just a moment/i.test(s) || /^attention required/i.test(s)) return 'video';
     // Strip engagement counts, then re-check: stripping can expose a
     // junk title underneath ("79K views · Error" -> "Error").
     s = stripTitleCounts(s);
@@ -1202,6 +1212,7 @@
         low === '404 not found' || low === 'access denied' ||
         low === 'forbidden' || low === 'unavailable') return 'video';
     if (/^error\s*[|\-–—]/.test(s)) return 'video';
+    if (/^just a moment/i.test(s) || /^attention required/i.test(s)) return 'video';
     return s;
   }
 
@@ -1228,6 +1239,9 @@
     // keeps letters and numbers in every script; a title of only
     // emoji/punctuation still collapses to '' (generic).
     var s = String(t || '').trim().toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+    // Cloudflare's bot-check page title ("Just a moment...") is not a
+    // video title — a Mixcloud file saved under it live on 2026-11-27.
+    if (/^\s*just a moment/i.test(String(t || ''))) return true;
     return !s || !!GENERIC_TITLES[s];
   }
   function isAuthorNameTitle(t) {
@@ -1251,14 +1265,39 @@
     var s = dedupeTitle(String(t || '').trim());
     return !!s && !isGenericTitle(s);
   }
+  // Short id for the video, from its own URL (IG shortcode, TikTok
+  // /video/<id>, FB/X id, last path segment), else 8 hex of a small
+  // hash — so two different videos never share a filename when no
+  // real title exists. Mirrors the server's videoShortId.
+  function fileShortId(u) {
+    try {
+      var segs = String(u || '').split('?')[0].split('/').filter(Boolean);
+      var skip = { video: 1, videos: 1, reel: 1, reels: 1, watch: 1, shorts: 1, status: 1, statuses: 1, pin: 1, clip: 1, clips: 1, post: 1, posts: 1, p: 1, tv: 1, v: 1, embed: 1 };
+      for (var i = segs.length - 1; i >= 0; i--) {
+        var s = decodeURIComponent(segs[i]).replace(/\.[a-z0-9]+$/i, '');
+        if (/^[A-Za-z0-9_-]{5,32}$/.test(s) && !skip[s.toLowerCase()]) return s;
+      }
+    } catch (e) {}
+    var h = 2166136261, str = String(u || '');
+    for (var j = 0; j < str.length; j++) { h ^= str.charCodeAt(j); h = Math.imul(h, 16777619); }
+    return ('0000000' + (h >>> 0).toString(16)).slice(-8);
+  }
   function fileTitle() {
     var m = String(metaTitle || '').trim();
     var c = String(currentTitle || '').trim();
+    // AUTHOR-NAME TITLES (2026-11-27, live-verified): yt-dlp's
+    // caption-less Instagram title ("Video by <handle>") is an author
+    // label, not a video title — the server's saveTitle already rejects
+    // it, but the client-side direct download names the file from
+    // fileTitle(), and branches 2/4 returned it unchecked, so the
+    // file still saved as "Video_by_<handle>.mp4". Exclude author-name
+    // titles on every branch; last resort is video-<shortcode>, never
+    // a bare "video" (two caption-less reels would share it).
     if (isUsableTitle(m) && !isAuthorNameTitle(m) && metaTitleOrigin === 'original') return dedupeTitle(m);
-    if (isUsableTitle(c) && currentTitleOrigin === 'original') return dedupeTitle(c);
+    if (isUsableTitle(c) && !isAuthorNameTitle(c) && currentTitleOrigin === 'original') return dedupeTitle(c);
     if (isUsableTitle(m) && !isAuthorNameTitle(m)) return dedupeTitle(m);
-    if (isUsableTitle(c)) return dedupeTitle(c);
-    return 'video';
+    if (isUsableTitle(c) && !isAuthorNameTitle(c)) return dedupeTitle(c);
+    return 'video-' + fileShortId(currentUrl);
   }
 
   // Filenames already saved in this session: the same video saved in a
