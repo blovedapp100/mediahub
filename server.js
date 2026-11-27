@@ -2213,6 +2213,11 @@ async function mixcloudInfo(url, timeoutMs) {
       duration: (info && info.duration) || 0,
       uploader: (info && info.uploader) || (info && info.channel) || '',
       previewUrl: '',
+      // Playable preview: the audio-only mix has no video file, so the
+      // preview is the same-origin relay of the mc-audio HLS (the
+      // SoundCloud pattern) — without it the preview is cover art
+      // only, with no player at all (live-verified 2026-11-27).
+      previewStream: previewRelayUrl(url, 'mc-audio', (info && info.title) || 'Mixcloud mix'),
       note: 'Full-length mix — saving the audio can be slow.',
       formats: [fmt],
     };
@@ -2323,11 +2328,123 @@ async function bitchuteInfo(url, timeoutMs) {
 }
 
 async function peertubeInfo(url, timeoutMs) {
-  // Any instance host: clientSideKey matches PeerTube watch-URL shapes
-  // (/w/<id>, /videos/watch/<uuid>) on any host, and validateUserUrl
-  // lets shape-matched links past the allowlist (public-DNS check
-  // still applies). yt-dlp's PeerTube extractor is instance-agnostic,
-  // so no per-instance code is needed here.
+  // OWN FIRST (2026-11-27): the instance's own public API — no key,
+  // no yt-dlp. GET <origin>/api/v1/videos/<id> returns the title,
+  // thumbnail, duration, direct files[] and the HLS master playlist
+  // URL. yt-dlp is only the fallback. This matters because yt-dlp
+  // fails from Render's IP on some instances (live-verified: the
+  // echelon link resolved locally but /api/info failed live with
+  // "Could not read this link"), while the instance API is a plain
+  // JSON GET. The HLS variants are parsed from the master playlist
+  // (same shape as odyseeInfo) and saved via the direct ffmpeg m3u8
+  // remux (mode 'm3u8' in worldcSaveSpec) — no yt-dlp on the save
+  // path either.
+  const deadline = Date.now() + timeoutMs;
+  const left = () => deadline - Date.now();
+  const api = await peertubeApiInfo(url, Math.min(9000, Math.max(3000, left() - 2000)));
+  if (api) return api;
+  return peertubeYtdlpInfo(url, Math.max(5000, left()));
+}
+
+async function peertubeApiInfo(url, timeoutMs) {
+  // The instance API JSON carries everything: title, thumbnail,
+  // duration, direct progressive files[] and, per HLS playlist,
+  // files[] with resolution + size + the variant m3u8 URL. NO master
+  // playlist fetch: the storage CDN (MinIO) 403s node's direct fetch
+  // (curl through the egress proxy gets 200), and the JSON already
+  // has the resolutions. The save path hands yt-dlp the MASTER
+  // playlistUrl with -f <resolution>+bestaudio (see worldcSaveSpec):
+  // PeerTube HLS variants are video-ONLY (the audio is a separate
+  // variant in the same master), so remuxing a variant URL alone
+  // would save a SILENT video — the master + bestaudio is what
+  // keeps the sound.
+  let origin = '', vid = '';
+  try {
+    const parsed = new URL(url);
+    origin = parsed.origin;
+    const m = parsed.pathname.match(/^\/w\/([A-Za-z0-9_-]+)/)
+      || parsed.pathname.match(/^\/videos\/watch\/([0-9a-f-]{36})/i);
+    if (!m) return null;
+    vid = m[1];
+  } catch { return null; }
+  const j = await fetchJsonTimeout(origin + '/api/v1/videos/' + encodeURIComponent(vid), timeoutMs);
+  if (!j || !j.name) return null;
+  const duration = Number(j.duration) || 0;
+  const thumb = j.previewPath ? origin + j.previewPath
+    : (j.thumbnailPath ? origin + j.thumbnailPath : '');
+  const uploader = (j.channel && j.channel.displayName)
+    || (j.account && j.account.displayName) || '';
+  const byHeight = new Map();
+  const put = (h, cand) => {
+    if (!h) return;
+    const cur = byHeight.get(h);
+    const candDirect = !!cand.url, curDirect = !!(cur && cur.url);
+    if (!cur || (candDirect && !curDirect)
+      || (candDirect === curDirect && (cand.tbr || 0) > (cur.tbr || 0))) {
+      byHeight.set(h, cand);
+    }
+  };
+  // Direct progressive files (some instances serve them).
+  for (const f of (j.files || [])) {
+    if (!f || !f.fileUrl) continue;
+    const h = Number((f.resolution || {}).id) || 0;
+    if (!h) continue; // audio-only file (resolution id 0) is not a video format
+    put(h, { id: 'pt-' + h + 'p', label: h + 'p', ext: 'mp4', hasAudio: true,
+      filesize: Number(f.size) || 0, note: 'With sound', url: f.fileUrl });
+  }
+  // HLS playlists: one format per video variant, _m3u8 = the master
+  // playlistUrl, _ytid = the yt-dlp format selector (height filter +
+  // bestaudio). The audio variant (resolution id 0) is picked up by
+  // yt-dlp as bestaudio at save time.
+  for (const pl of (j.streamingPlaylists || [])) {
+    if (!pl || pl.type !== 1 || !pl.playlistUrl) continue;
+    for (const f of (pl.files || [])) {
+      if (!f || !f.hasVideo) continue;
+      const h = Number((f.resolution || {}).id) || 0;
+      if (!h) continue;
+      put(h, { id: 'pt-' + h + 'p', label: h + 'p', ext: 'mp4', hasAudio: true,
+        filesize: Number(f.size) || 0, note: 'With sound',
+        _m3u8: pl.playlistUrl,
+        // yt-dlp names raw-master variants by bitrate (1778), NOT by
+        // resolution — '1080p+bestaudio' is "format not available".
+        // The height filter selects the right variant (verified live
+        // by -F + a section download) and +bestaudio adds the separate
+        // audio variant (PeerTube HLS video variants are video-only).
+        _ytid: 'bestvideo[height<=' + h + ']+bestaudio' });
+    }
+  }
+  const formats = [...byHeight.values()]
+    .sort((a, b) => parseInt(b.id.slice(3), 10) - parseInt(a.id.slice(3), 10))
+    .filter((f, i, arr) => {
+      if (f.url) return true; // direct progressive: unaffected by the cap
+      const estBytes = f.filesize || 0;
+      return !estBytes || estBytes <= 12 * 60 * 350 * 1024 || i === arr.length - 1;
+    })
+    .map((f) => { delete f.tbr; return f; });
+  if (!formats.length) return null;
+  // Preview: the smallest direct file plays in the browser as-is;
+  // otherwise the same-origin relay of the smallest HLS variant (see
+  // worldcSaveSpec pt- + mode 'm3u8'). Without one, HLS-only
+  // instances show a static thumbnail with player chrome that never
+  // plays (live-verified 2026-11-27).
+  const directs = formats.filter((f) => f.url);
+  const previewUrl = directs.length ? directs[directs.length - 1].url : '';
+  const previewStream = !previewUrl
+    ? previewRelayUrl(url, formats[formats.length - 1].id, j.name) : '';
+  return {
+    title: j.name || 'PeerTube video',
+    thumbnail: thumb,
+    duration,
+    uploader,
+    previewUrl,
+    previewStream,
+    formats,
+  };
+}
+
+async function peertubeYtdlpInfo(url, timeoutMs) {
+  // Fallback (pre-2026-11-27 path, unchanged): yt-dlp, whose PeerTube
+  // extractor is instance-agnostic.
   try {
     const res = await withTimeout(
       ytdlpInfoWithFallbacks(url),
@@ -2440,7 +2557,12 @@ async function worldcSaveSpec(url, formatId) {
   if (formatId.startsWith('pt-')) {
     const info = await peertubeInfo(url, 20000);
     const f = (info && info.formats || []).find((x) => x && x.id === formatId);
-    if (!f || !f._ytid) return null;
+    if (!f) return null;
+    // API lane (HLS): direct ffmpeg remux of the variant playlist —
+    // no yt-dlp on the save path (see peertubeInfo). yt-dlp only for
+    // formats the fallback lane produced.
+    if (f._m3u8) return { mode: 'm3u8', m3u8Url: f._m3u8, ytdlpFormatId: f._ytid || null, ext: 'mp4', ctype: 'video/mp4' };
+    if (!f._ytid) return null;
     return { mode: 'ytdlp', ytdlpFormatId: f._ytid, ext: 'mp4', ctype: 'video/mp4' };
   }
   return null;
@@ -7905,7 +8027,7 @@ app.get('/api/save', rateLimit('save', 10, 60000), async (req, res) => {
     const spec = await worldcSaveSpec(url, formatId);
     if (!spec) return res.status(502).json({ error: 'This clip is not available right now. Please try again.' });
     const wargs = spec.mode === 'm3u8'
-      ? ['--no-playlist', '--no-warnings', '--socket-timeout', '15', ...saveProxyArgs, '-o', '-', spec.m3u8Url]
+      ? [...(spec.ytdlpFormatId ? ['-f', spec.ytdlpFormatId] : []), '--no-playlist', '--no-warnings', '--socket-timeout', '15', ...saveProxyArgs, '-o', '-', spec.m3u8Url]
       : ['-f', spec.ytdlpFormatId, '--no-playlist', '--no-warnings', '--socket-timeout', '15', ...(rawClientGet(url) || []), ...saveProxyArgs, '-o', '-', url];
     const child = spawn(YTDLP, wargs, { timeout: 900000 });
     let sent = false;
