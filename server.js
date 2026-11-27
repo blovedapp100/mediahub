@@ -251,7 +251,10 @@ async function validateUserUrl(u) {
   let parsed;
   try { parsed = new URL(u); } catch { return false; }
   if (parsed.username || parsed.password) return false;
-  if (!hostAllowed(u)) return false;
+  // PeerTube federation: a shape-matched PeerTube link on an unlisted
+  // instance host skips the host allowlist (see clientSideKey) — the
+  // public-DNS check below still gates it.
+  if (clientSideKey(u) !== 'peertube' && !hostAllowed(u)) return false;
   return hostResolvesPublic(parsed.hostname);
 }
 
@@ -330,6 +333,19 @@ function clientSideKey(url) {
     if (h === 'odysee.com' || h.endsWith('.odysee.com')) return 'odysee';
     if (h === 'bitchute.com' || h.endsWith('.bitchute.com')) return 'bitchute';
     if (h === 'framatube.org' || h.endsWith('.framatube.org')) return 'peertube';
+    // PEERTUBE FEDERATION (2026-11-27, live-verified): PeerTube is not
+    // one site — hundreds of instances share the same watch-URL shapes
+    // (/w/<short-id> and /videos/watch/<uuid>). The host allowlist
+    // cannot list them all, and the site promises any public instance,
+    // so a link whose PATH matches a PeerTube watch shape is PeerTube
+    // whatever host carries it. Known platform hosts above already
+    // returned, so this only fires for unlisted hosts; the public-DNS
+    // check in validateUserUrl still applies. The ?start= query some
+    // instances append is ignored — the pathname is what matters.
+    try {
+      const p = new URL(url).pathname;
+      if (/^\/w\/[A-Za-z0-9_-]{6,}$/.test(p) || /^\/videos\/watch\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.test(p)) return 'peertube';
+    } catch {}
   } catch {}
   return null;
 }
@@ -391,6 +407,10 @@ function isGenericTitle(t) {
   // yt-dlp's caption-less Instagram title ("Video by <handle>") is an
   // author label, not a video title — never use it as a filename.
   if (/^video\s+by\s+@?[\w.\-]+$/i.test(String(t || '').trim())) return true;
+  // Cloudflare's bot-check page title ("Just a moment...") is not a
+  // video title either — a Mixcloud file saved under it live on
+  // 2026-11-27 because the meta scrape hit the challenge page.
+  if (/^\s*just a moment/i.test(String(t || ''))) return true;
   return !s || GENERIC_TITLES.has(s);
 }
 function isAuthorNameTitle(t) {
@@ -2303,9 +2323,11 @@ async function bitchuteInfo(url, timeoutMs) {
 }
 
 async function peertubeInfo(url, timeoutMs) {
-  // Any instance host — the allowlist gates which instances reach
-  // this lane (framatube.org today; add an instance to ALLOWED_HOSTS
-  // + clientSideKey before its links can use it).
+  // Any instance host: clientSideKey matches PeerTube watch-URL shapes
+  // (/w/<id>, /videos/watch/<uuid>) on any host, and validateUserUrl
+  // lets shape-matched links past the allowlist (public-DNS check
+  // still applies). yt-dlp's PeerTube extractor is instance-agnostic,
+  // so no per-instance code is needed here.
   try {
     const res = await withTimeout(
       ytdlpInfoWithFallbacks(url),
@@ -3687,6 +3709,22 @@ function stripTitleCounts(t) {
   return s;
 }
 
+// Snapchat title cleanup (2026-11-27, live-verified): Snapchat's own
+// pages render a missing first name as the literal word "Undefined"
+// ("Undefined Malik (@handle)") and append the section name
+// ("Spotlight") — neither belongs in a display title or a filename.
+// The <title> segment order also varies (date first on some pages,
+// author first on others), so the author segment (the one carrying
+// (@handle)) is moved first, then the date.
+function cleanSnapchatTitle(t) {
+  let parts = String(t || '').split(/\s*\|\s*/).map((s) => s.trim()).filter(Boolean);
+  parts = parts.filter((p) => p.toLowerCase() !== 'spotlight');
+  parts = parts.map((p) => p.replace(/^undefined\s+/i, ''));
+  const ai = parts.findIndex((p) => /\(@[A-Za-z0-9_.]+\)/.test(p));
+  if (ai > 0) { const a = parts.splice(ai, 1)[0]; parts.unshift(a); }
+  return parts.join(' | ').trim();
+}
+
 // Response-door cleaner: every /api/info + /api/job body passes through
 // here, so a lane that returns its own title directly (fbChain, ytChain,
 // mirrors, ytdlpDirectFallback) is cleaned even though it never touches
@@ -3840,6 +3878,10 @@ async function fastMeta(url) {
     // Title cleaner: oEmbed/SSSTik titles can also carry engagement
     // counts — strip them before the meta is cached and returned.
     out.title = stripTitleCounts(out.title) || 'Video';
+    // Snapchat: the og:title also carries the platform's own
+    // "Undefined <name>" artifact and a "Spotlight" suffix — clean
+    // them the same way as the info title (see cleanSnapchatTitle).
+    if (clientSideKey(url) === 'snapchat') out.title = cleanSnapchatTitle(out.title) || out.title;
     // TITLE PROVENANCE: TikTok's meta comes from SSSTik (a third-party
     // resolver); every other meta comes from the platform's own page
     // (og scrape) or its own oEmbed — original.
@@ -4705,7 +4747,10 @@ async function scrapeDirectInfo(url) {
     const video = decodeHtmlEntities(ogTag(html, 'og:video'));
     if (!video || !video.includes('sc-cdn.net')) return null;
     const titleTag = (html.match(/<title>([^<]+)<\/title>/i) || [])[1] || '';
-    const cleanTitle = stripTitleCounts(decodeEntities(titleTag).split(' | ')[0].trim()) || 'Snapchat video';
+    // The <title> segment order varies (date first on some pages,
+    // author first on others), so clean the whole tag instead of
+    // taking the first segment — see cleanSnapchatTitle.
+    const cleanTitle = cleanSnapchatTitle(stripTitleCounts(decodeEntities(titleTag))) || 'Snapchat video';
     const handle = (title.match(/@([A-Za-z0-9_.]+)/) || [])[1] || '';
     return { title: cleanTitle, thumbnail: thumb, duration: 0, uploader: handle, previewUrl: video, formats: [directFormat(video)] };
   }
