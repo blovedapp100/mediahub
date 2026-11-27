@@ -2403,6 +2403,13 @@ async function peertubeApiInfo(url, timeoutMs) {
   // yt-dlp as bestaudio at save time.
   for (const pl of (j.streamingPlaylists || [])) {
     if (!pl || pl.type !== 1 || !pl.playlistUrl) continue;
+    // Some instances encode audio INTO the video variant (one
+    // combined format, e.g. Alex Hyett's 2121 avc+mp4a) — there is no
+    // separate audio variant and +bestaudio makes yt-dlp fail with
+    // "Requested format is not available" (live-verified save 502).
+    // Others (echelon) split A/V, so +bestaudio is required there.
+    const hasSeparateAudio = (pl.files || [])
+      .some((f) => f && f.hasAudio && !f.hasVideo);
     for (const f of (pl.files || [])) {
       if (!f || !f.hasVideo) continue;
       const h = Number((f.resolution || {}).id) || 0;
@@ -2412,10 +2419,14 @@ async function peertubeApiInfo(url, timeoutMs) {
         _m3u8: pl.playlistUrl,
         // yt-dlp names raw-master variants by bitrate (1778), NOT by
         // resolution — '1080p+bestaudio' is "format not available".
-        // The height filter selects the right variant (verified live
-        // by -F + a section download) and +bestaudio adds the separate
-        // audio variant (PeerTube HLS video variants are video-only).
-        _ytid: 'bestvideo[height<=' + h + ']+bestaudio' });
+        // The height filter selects the right variant (verified by -F
+        // + section downloads). NOTE the verb matters: bestvideo
+        // excludes COMBINED variants (they carry audio), so a
+        // combined-only master needs best[height<=H] — bestvideo
+        // there is "format not available" (live-verified).
+        _ytid: hasSeparateAudio
+          ? 'bestvideo[height<=' + h + ']+bestaudio'
+          : 'best[height<=' + h + ']' });
     }
   }
   const formats = [...byHeight.values()]
@@ -8050,7 +8061,12 @@ app.get('/api/save', rateLimit('save', 10, 60000), async (req, res) => {
     const previewM3u8 = isPreview
       ? (spec.mode === 'm3u8' ? spec.m3u8Url : (spec.previewM3u8 || null)) : null;
     if (previewM3u8) {
-      const fargs = ['-hide_banner', '-loglevel', 'error', '-i', previewM3u8,
+      let previewOrigin = '';
+      try { previewOrigin = new URL(url).origin; } catch {}
+      const fargs = ['-hide_banner', '-loglevel', 'error',
+        '-user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        ...(previewOrigin ? ['-referer', previewOrigin + '/'] : []),
+        '-i', previewM3u8,
         '-map', '0', '-c', 'copy', '-bsf:a', 'aac_adtstoasc',
         '-f', 'mp4', '-movflags', 'frag_keyframe+empty_moov+default_base_moof', '-'];
       const ff = spawn(KICK_FFMPEG, fargs, { timeout: 900000 });
