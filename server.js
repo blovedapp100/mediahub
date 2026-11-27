@@ -2203,6 +2203,11 @@ async function mixcloudInfo(url, timeoutMs) {
       filesize: (direct && (direct.filesize || direct.filesize_approx)) || 0,
       note: 'Sound only',
       _ytid: String(base.format_id),
+      // The HLS master URL, for the progressive ffmpeg preview relay
+      // (see the /api/save preview branch). stripWorldcInternal
+      // removes it before the info reaches the visitor; the save path
+      // re-runs this lane, so it still sees it.
+      _m3u8: hls64 ? hls64.url : null,
     };
     // Direct progressive file when yt-dlp reports one — the browser
     // tries it first; the server save is the fallback.
@@ -2546,6 +2551,7 @@ async function worldcSaveSpec(url, formatId) {
     if (!f || !f._ytid) return null;
     const ext = (f.ext || 'm4a').toLowerCase();
     return { mode: 'ytdlp', ytdlpFormatId: f._ytid, ext,
+      previewM3u8: f._m3u8 || null,
       ctype: ext === 'mp3' ? 'audio/mpeg' : 'audio/mp4' };
   }
   if (formatId.startsWith('od-')) {
@@ -8026,6 +8032,50 @@ app.get('/api/save', rateLimit('save', 10, 60000), async (req, res) => {
   if (formatId.startsWith('sc-') || formatId.startsWith('mc-') || formatId.startsWith('od-') || formatId.startsWith('pt-')) {
     const spec = await worldcSaveSpec(url, formatId);
     if (!spec) return res.status(502).json({ error: 'This clip is not available right now. Please try again.' });
+    // PREVIEW ONLY — progressive ffmpeg relay (2026-11-27). yt-dlp
+    // downloads the WHOLE HLS stream before emitting any bytes
+    // (download-then-merge), so a preview <video> starves at 00:00
+    // and the player unmounts — live-verified on PeerTube x2 and
+    // Mixcloud. ffmpeg remuxes progressively and writes fragmented
+    // MP4 (ftyp+moov first), so playback can start in seconds
+    // (verified locally: 1.5 MB / 190 s of audio in a 20 s run,
+    // ffprobe-clean AAC). Saves keep the yt-dlp path below.
+    // -bsf:a aac_adtstoasc is REQUIRED: HLS AAC is ADTS-framed and
+    // the MP4 muxer rejects it without the filter (ffmpeg code 8).
+    // -map 0 takes every stream from the master (best variant +
+    // audio group for PeerTube; audio-only for Mixcloud/Odysee
+    // variants carry their own audio). The visitor closing the
+    // preview kills the remux — otherwise ffmpeg would run to the
+    // end of a 60-min mix on the server.
+    const previewM3u8 = isPreview
+      ? (spec.mode === 'm3u8' ? spec.m3u8Url : (spec.previewM3u8 || null)) : null;
+    if (previewM3u8) {
+      const fargs = ['-hide_banner', '-loglevel', 'error', '-i', previewM3u8,
+        '-map', '0', '-c', 'copy', '-bsf:a', 'aac_adtstoasc',
+        '-f', 'mp4', '-movflags', 'frag_keyframe+empty_moov+default_base_moof', '-'];
+      const ff = spawn(KICK_FFMPEG, fargs, { timeout: 900000 });
+      let sent = false;
+      let ffErr = '';
+      ff.stderr.on('data', (d) => { if (ffErr.length < 2000) ffErr += d.toString(); });
+      ff.on('error', () => { if (!res.headersSent) res.status(502).json({ error: 'This clip is not available right now. Please try again.' }); });
+      ff.stdout.on('data', (chunk) => {
+        if (!sent) { sendHeaders(spec.ext, spec.ctype); sent = true; }
+        if (!res.write(chunk)) ff.stdout.pause();
+      });
+      res.on('drain', () => ff.stdout.resume());
+      res.on('close', () => { try { ff.kill('SIGKILL'); } catch {} });
+      ff.on('close', (code) => {
+        if (code === 0) {
+          if (sent) { try { res.end(); } catch {} }
+          else if (!res.headersSent) res.status(502).json({ error: 'This clip is not available right now. Please try again.' });
+          return;
+        }
+        console.error('preview ffmpeg failed:', code, scrub(ffErr.slice(-500)));
+        if (!sent && !res.headersSent) res.status(502).json({ error: 'This clip is not available right now. Please try again.' });
+        else if (sent) { try { res.end(); } catch {} }
+      });
+      return;
+    }
     const wargs = spec.mode === 'm3u8'
       ? [...(spec.ytdlpFormatId ? ['-f', spec.ytdlpFormatId] : []), '--no-playlist', '--no-warnings', '--socket-timeout', '15', ...saveProxyArgs, '-o', '-', spec.m3u8Url]
       : ['-f', spec.ytdlpFormatId, '--no-playlist', '--no-warnings', '--socket-timeout', '15', ...(rawClientGet(url) || []), ...saveProxyArgs, '-o', '-', url];
