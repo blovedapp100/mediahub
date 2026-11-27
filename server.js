@@ -94,6 +94,11 @@ app.use(express.static(path.join(__dirname, 'public'), {
     // HTML/JS/CSS must never stay cached after a deploy — a stale app.js
     // kept the old (pre-timer, pre-/api/meta) frontend live for an hour.
     if (/\.(html|js|css)$/.test(filePath)) res.setHeader('Cache-Control', 'no-cache');
+    // Preview fix (2026-11-27): <video> ignores referrerpolicy, so the
+    // page must not send a Referer at all — video.twimg.com and
+    // Douyin's zjcdn 403 a foreign Referer (measured). fetch() calls
+    // set their own policy explicitly and are unaffected.
+    if (/\.html$/.test(filePath)) res.setHeader('Referrer-Policy', 'no-referrer');
   },
 }));
 
@@ -383,6 +388,9 @@ function isGenericTitle(t) {
   // title. \p{L}\p{N} keeps letters and numbers in every script; a
   // title of only emoji/punctuation still collapses to '' (generic).
   const s = String(t || '').trim().toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+  // yt-dlp's caption-less Instagram title ("Video by <handle>") is an
+  // author label, not a video title — never use it as a filename.
+  if (/^video\s+by\s+@?[\w.\-]+$/i.test(String(t || '').trim())) return true;
   return !s || GENERIC_TITLES.has(s);
 }
 function isAuthorNameTitle(t) {
@@ -1274,7 +1282,9 @@ async function chainStreamUrl(url, formatId) {
   // Kwai own lane (step 13): re-resolve the slide-0 mp4 fresh.
   else if (formatId.startsWith('kw-')) info = await kwaiInfo(url, 15000);
   // BitChute own lane (step 14): re-resolve the direct mp4 fresh.
-  else if (formatId.startsWith('bc-')) info = await bitchuteInfo(url, 15000);
+  // One retry: the media API intermittently fails from Render and a
+  // single miss is the exact 502 the visitor's tab lands on.
+  else if (formatId.startsWith('bc-')) info = (await bitchuteInfo(url, 15000)) || (await bitchuteInfo(url, 15000));
   // SoundCloud fallback MP3 (step 14): re-run the lane; the sc-mp3
   // format only exists when own yt-dlp failed at info time, so a
   // save-time own success means this id is gone -> null -> 502.
@@ -1686,6 +1696,10 @@ async function blueskyInfo(url, timeoutMs) {
   const title = (post.record && post.record.text ? String(post.record.text) : '').slice(0, 200);
   return {
     title: title || 'Bluesky video',
+    thumbnail: embed.thumbnail || '',
+    duration: 0,
+    uploader: (post.author && post.author.handle) || handle,
+    previewUrl: 'https://bsky.social/xrpc/com.atproto.sync.getBlob?did=' + did + '&cid=' + cid,
     formats: [{
       id: 'bs-original', label: 'Original', ext: 'mp4',
       url: 'https://bsky.social/xrpc/com.atproto.sync.getBlob?did=' + did + '&cid=' + cid,
@@ -1785,6 +1799,10 @@ async function videofishInfo(url, slug, timeoutMs) {
   if (!j || !j.ok || !Array.isArray(j.media)) return null;
   const media = j.media.find((x) => x && x.type === 'video' && x.url);
   if (!media) return null;
+  // Videofish sometimes answers with its own HLS proxy (/api/hls?url=…)
+  // instead of a direct mp4 — that is a playlist, not a file, and must
+  // never be listed as an mp4 quality.
+  if (/\/api\/hls/i.test(media.url) || !/\.mp4/i.test(media.url)) return null;
   const title = (j.title && j.title !== 'Media') ? String(j.title) : 'Video';
   return {
     title,
@@ -1946,7 +1964,9 @@ async function streamableInfo(url, timeoutMs) {
     seen.add(id);
     formats.push({ id, label: id === 'st-360' ? '360p' : '720p', ext: 'mp4', url: u });
   }
-  return { title, formats };
+  const thumb = decodeHtmlEntities(ogTag(html, 'og:image') || '');
+  const best = formats.find((f) => f.id === 'st-720') || formats[0];
+  return { title, thumbnail: thumb, previewUrl: best.url, formats };
 }
 
 async function kwaiInfo(url, timeoutMs) {
@@ -1955,11 +1975,25 @@ async function kwaiInfo(url, timeoutMs) {
     || url.match(/kwai\.com\/video\/(\d+)/);
   if (!m) return null;
   // fetch follows the k.kwai.com short-link 302 to the full video page.
-  const html = await fetchTextTimeout(url, timeoutMs);
+  // Browser Accept headers: without them Kwai serves a variant whose
+  // video URLs are \u002F-escaped (and the literal mp4 is absent).
+  const html = await fetchTextTimeout(url, timeoutMs, {
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+  });
   if (!html) return null;
-  // Target video is ALWAYS slide 0 — never take any other mp4 on the page.
-  const src = (html.match(/<a-video-player[^>]*id="video-0"[^>]*src="([^"]+\.mp4[^"]*)"/)
-    || html.match(/id="video-0"[^>]*src="([^"]+\.mp4[^"]*)"/) || [])[1];
+  // Unescape JSON-escaped slashes so \u002F forms scan the same way.
+  const scan = html.replace(/\\u002F/g, '/');
+  // 2026-11-27: Kwai dropped the <a-video-player id="video-0"> markup —
+  // the page no longer contains "video-0" at all. The video file now
+  // sits in the page's embedded JSON (aws-br-cdn.kwai.net … .mp4).
+  // Prefer a URL under an explicit "url" key; else the first mp4 URL.
+  // This page shape carries exactly one distinct mp4 URL (the target
+  // video); re-check that before shipping — a page with comment videos
+  // would need the URL anchored to the video id instead.
+  const src = (scan.match(/"url"\s*:\s*"(https:[^"]+\.mp4[^"]*)"/)
+    || scan.match(/(https:\/\/[A-Za-z0-9._-]+\.kwai\.net\/[^"' ]+\.mp4[^"' ]*)/)
+    || scan.match(/(https:\/\/[^"' ]+\.mp4[^"' ]*)/) || [])[1];
   if (!src) return null;
   const title = ((html.match(/<title>([^<|]+)/) || [])[1] || '').trim();
   return { title, formats: [{ id: 'kw-video', label: 'Video', ext: 'mp4', url: src }] };
@@ -2087,6 +2121,7 @@ async function soundcloudInfo(url, timeoutMs) {
         duration: (info && info.duration) || 0,
         uploader: (info && info.uploader) || (info && info.channel) || '',
         previewUrl: '',
+        previewStream: previewRelayUrl(url, audio[0].id, (info && info.title) || 'SoundCloud track'),
         formats: audio,
       };
     }
@@ -2107,7 +2142,7 @@ async function soundcloudInfo(url, timeoutMs) {
     thumbnail: mi.thumbnail || '',
     duration: Number(mi.duration) || 0,
     uploader: mi.author || '',
-    previewUrl: '',
+    previewUrl: mi.audioUrl,
     formats: [{
       id: 'sc-mp3', label: 'Audio MP3', ext: 'mp3', hasAudio: true,
       filesize: 0, note: 'Sound only', url: mi.audioUrl,
@@ -2250,13 +2285,19 @@ async function bitchuteInfo(url, timeoutMs) {
   }
   return {
     title: title || 'BitChute video',
-    thumbnail: '',
+    thumbnail: html ? (ogTag(html, 'og:image') || '') : '',
     duration: 0,
     uploader: '',
     previewUrl: d.media_url,
     formats: [{
       id: 'bc-video', label: 'Video', ext: 'mp4', hasAudio: true,
       filesize: 0, note: 'With sound', url: d.media_url,
+      // serverOnly: seed*.bitchute.com allowlists CORS to bitchute.com
+      // only, so the visitor's browser can never fetch it — the client
+      // must skip its (doomed) direct attempts and go straight to
+      // /api/save. The url STAYS: the server relay (chainStreamUrl)
+      // reads it from the fresh re-resolve to stream the file.
+      serverOnly: true,
     }],
   };
 }
@@ -2303,6 +2344,24 @@ async function peertubeInfo(url, timeoutMs) {
     }
     const formats = [...byHeight.values()]
       .sort((a, b) => parseInt(b.id.slice(3), 10) - parseInt(a.id.slice(3), 10))
+      // HLS-only instances save through /api/save: yt-dlp stdout with
+      // no resume and a 15-min spawn cap — measured live ~385 KB/s on
+      // the 2160p save, and the HLS segment fetches stall. A variant
+      // whose estimated size (filesize, else tbr x duration) cannot
+      // finish inside ~12 min at 350 KB/s (measured rate with margin)
+      // can only ever truncate ("download interrupted"), so do not
+      // offer it. Direct progressive variants (other instances) are
+      // unaffected.
+      .filter((f, i, arr) => {
+        if (f._direct) return true;
+        // Prefer the known file size (direct formats carry it); fall
+        // back to tbr x duration for HLS-only variants. A variant with
+        // NEITHER is kept only if it is the smallest (the `i ===` guard
+        // below) — an unknown size must not silently keep a 2160p row.
+        const estBytes = (f.filesize && f.filesize > 0) ? f.filesize
+          : (((f._tbr || 0) * 1000 / 8) * ((info && info.duration) || 0));
+        return !estBytes || estBytes <= 12 * 60 * 350 * 1024 || i === arr.length - 1;
+      })
       .map((f) => { delete f._direct; delete f._tbr; return f; });
     if (!formats.length) return null;
     if (res.clientArgs) rawClientSet(url, res.clientArgs);
@@ -2590,24 +2649,43 @@ const KICK_FFMPEG = process.env.FFMPEG || 'ffmpeg';
 // The _ytid is internal-only: the save branch re-resolves via
 // kickVariantUrl, so it is NOT included here (nothing to strip).
 async function kickInfo(url, timeoutMs) {
-  const m = url.match(/kick\.com\/[^/]+\/videos\/[0-9a-f-]+/i);
+  // Clips too: /<channel>/clips/<id> — previously fell through to
+  // generic yt-dlp, whose clip output has no video-codec formats and
+  // produced "No playable versions were found".
+  const m = url.match(/kick\.com\/[^/]+\/(?:videos\/[0-9a-f-]+|clips\/[A-Za-z0-9_]+)/i);
   if (!m) return null;
+  // Retry like kickVariantUrl: Kick's API closes the connection without
+  // a response on roughly half the -J calls from a datacenter IP, so a
+  // single attempt fails clips (and VODs) that a retry would read.
   let info = null;
-  try {
-    info = await withTimeout(ytdlpJson(url, timeoutMs, [], false), timeoutMs, 'kick timed out');
-  } catch { return null; }
+  for (let attempt = 0; attempt < 3 && !info; attempt++) {
+    try {
+      info = await withTimeout(ytdlpJson(url, timeoutMs, [], false), timeoutMs, 'kick timed out');
+    } catch { info = null; }
+    if (!info && attempt < 2) await new Promise((ok) => setTimeout(ok, 3000));
+  }
+  if (!info) return null;
   const fmts = (info && Array.isArray(info.formats)) ? info.formats : [];
   const formats = [];
   for (const f of fmts) {
     if (!f || !f.url || String(f.protocol || '') !== 'm3u8_native') continue;
-    const isAudio = !f.vcodec || f.vcodec === 'none';
+    // Clips: yt-dlp returns ONE format — the master playlist.m3u8 with
+    // no height and no codecs at all (variants live inside the
+    // playlist, which yt-dlp cannot expand when the m3u8 fetch flakes).
+    // That row is the VIDEO, not audio: ffmpeg reads the playlist and
+    // picks the best variant at save time (kc- branch). An audio-only
+    // variant has acodec set and no vcodec; a height-bearing variant
+    // is video even when yt-dlp reports no vcodec.
     const h = parseInt(String(f.height || ''), 10) || 0;
+    const hasVideoCodec = f.vcodec && f.vcodec !== 'none';
+    const hasAudioCodec = f.acodec && f.acodec !== 'none';
     let id, label, ext;
-    if (isAudio) { id = 'kc-audio'; label = 'Audio only'; ext = 'm4a'; }
-    else if (h) { id = 'kc-' + h + 'p'; label = h + 'p'; ext = 'mp4'; }
+    if (h) { id = 'kc-' + h + 'p'; label = h + 'p'; ext = 'mp4'; }
+    else if (!hasVideoCodec && hasAudioCodec) { id = 'kc-audio'; label = 'Audio only'; ext = 'm4a'; }
+    else if (!hasVideoCodec && !hasAudioCodec) { id = 'kc-video'; label = 'Video'; ext = 'mp4'; }
     else continue;
     if (formats.some((x) => x.id === id)) continue;
-    formats.push({ id, label, ext, hasAudio: true, filesize: 0, note: isAudio ? 'Sound only' : 'With sound' });
+    formats.push({ id, label, ext, hasAudio: true, filesize: 0, note: id === 'kc-audio' ? 'Sound only' : 'With sound' });
   }
   if (!formats.length) return null;
   return {
@@ -2633,7 +2711,7 @@ async function kickInfo(url, timeoutMs) {
 // at ~50% each still fail ~1 time in 8 — the lane is honest about
 // that in REPORT.md §13; a fourth attempt would only add latency.
 async function kickVariantUrl(url, formatId) {
-  const quality = formatId.slice(3); // '160p' | '360p' | '480p' | '720p' | 'audio'
+  const quality = formatId.slice(3); // '160p' | '360p' | '480p' | '720p' | 'audio' | 'video' (clip master playlist)
   let info = null;
   for (let attempt = 0; attempt < 3 && !info; attempt++) {
     try {
@@ -2644,7 +2722,8 @@ async function kickVariantUrl(url, formatId) {
   if (!info || !Array.isArray(info.formats)) return null;
   const f = info.formats.find((x) => {
     if (!x || !x.url || String(x.protocol || '') !== 'm3u8_native') return false;
-    if (quality === 'audio') return !x.vcodec || x.vcodec === 'none';
+    if (quality === 'audio') return (!x.vcodec || x.vcodec === 'none') && x.acodec && x.acodec !== 'none';
+    if (quality === 'video') return !x.height && !x.vcodec && !x.acodec; // master playlist (clips)
     return (parseInt(String(x.height || ''), 10) || 0) === parseInt(quality, 10);
   });
   if (!f) return null;
@@ -3578,6 +3657,13 @@ function stripTitleCounts(t) {
   var num = '\\d[\\d,]*?(?:\\.\\d+)?\\s*[KMB]?';
   var unit = '(?:views?|reactions?|likes?|comments?|shares?)';
   var sep = '[·•|:\\-–—]';
+  // Comma/"and" count list at the start: "6.6K likes, 1.2K comments,
+  // and 46 shares | …" (Snapchat og:title). The lead regex below only
+  // knows · | : - separators, so a comma-joined list survived verbatim.
+  // Requires TWO OR MORE counts and a separator/end after the last one,
+  // so a sentence like "10 likes, 20 shares of my trip" is untouched.
+  var listLead = new RegExp('^\\s*' + num + '\\s*' + unit + '(?:\\s*,?\\s*(?:and\\s+)?' + num + '\\s*' + unit + ')+(?=\\s*(?:' + sep + '|$))\\s*(?:' + sep + '\\s*)?', 'i');
+  s = s.replace(listLead, '');
   // Middle: a count segment sandwiched between separators.
   var mid = new RegExp('\\s*' + sep + '\\s*' + num + '\\s*' + unit + '(?=\\s*' + sep + ')', 'gi');
   s = s.replace(mid, '');
@@ -6809,7 +6895,11 @@ try {
     // yt-dlp — its lbry extractor works on live claims.
     if (!result && clientSideKey(url) === 'odysee') {
       result = await odyseeInfo(url, Math.min(20000, budgetLeft()));
-      if (result) { stripWorldcInternal(result); return { status: 200, body: result }; }
+      if (result) {
+        stripWorldcInternal(result);
+        if (result.formats && result.formats[0]) result.previewStream = previewRelayUrl(url, result.formats[0].id, result.title);
+        return { status: 200, body: result };
+      }
     }
     // BitChute own lane (public media API -> direct mp4; full 1196s
     // file 124,478,566 B verified). Direct fetch, NOT yt-dlp
@@ -6860,6 +6950,14 @@ try {
     if (!result && clientSideKey(url) === 'kick') {
       result = await kickInfo(url, Math.min(20000, budgetLeft()));
       if (result) return { status: 200, body: result };
+    }
+    // Tencent chain, EARLY (2026-11-27): Videofish must run BEFORE the
+    // generic yt-dlp block below — yt-dlp burns ~20s of the 25s cap on
+    // Tencent links, leaving Videofish ~4s and it aborts. The later
+    // dispatch stays as a fallback for the same link.
+    if (!result && clientSideKey(url) === 'tencent') {
+      const txEarly = await videofishInfo(url, 'tencent-video', Math.min(12000, budgetLeft()));
+      if (txEarly) { txEarly.clientSide = true; txEarly.titleOrigin = 'third-party'; return { status: 200, body: txEarly }; }
     }
     let info = null;
     // FB/IG chain already ran to completion (and found nothing) in the
@@ -7700,6 +7798,11 @@ app.get('/api/save', rateLimit('save', 10, 60000), async (req, res) => {
     try {
       const r = await fetch(streamUrl, { headers: { 'User-Agent': saveUa } });
       if (!r.ok || !r.body) return res.status(502).json({ error: 'This clip is not available right now. Please try again.' });
+      // Pass the upstream length through when known: the browser can
+      // then show real progress and, crucially, flag a short body as
+      // an interrupted download instead of keeping a partial file.
+      const cl = r.headers.get('content-length');
+      if (cl) res.setHeader('Content-Length', cl);
       sendHeaders(ext, ext === 'mp3' ? 'audio/mpeg' : ext === 'm4a' ? 'audio/mp4' : 'video/mp4');
       const reader = r.body.getReader();
       try {

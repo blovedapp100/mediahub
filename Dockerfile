@@ -4,7 +4,7 @@ FROM node:20-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip ffmpeg curl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && pip3 install --break-system-packages --no-cache-dir yt-dlp
+    && pip3 install --break-system-packages --no-cache-dir yt-dlp==2026.10.26
 
 # Cloudflare WARP (free, no account) — Render's IPs are blocked by
 # YouTube/TikTok, so yt-dlp routes those calls through a userspace
