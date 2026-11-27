@@ -316,7 +316,14 @@
     if (posterFrameHandler && videoEl) videoEl.removeEventListener('loadeddata', posterFrameHandler);
     posterFrameHandler = function () {
       clearPosterStallTimer();
-      if (firstFrameLooksBlack() === true) return; // keep the still: first frame is black
+      if (firstFrameLooksBlack() === true) {
+        // A black early frame is normal while the stream starts:
+        // re-check once instead of leaving the still up forever.
+        setTimeout(function () {
+          if (firstFrameLooksBlack() !== true) { clearPreviewPoster(); if (thumbImg) thumbImg.style.display = 'none'; }
+        }, 800);
+        return;
+      }
       clearPreviewPoster();
       if (thumbImg) thumbImg.style.display = 'none';
     };
@@ -542,6 +549,7 @@
 
   function safeFileName(name, ext) {
     var s = dedupeTitle(String(name || 'video')).replace(/[\\/:*?"<>|\n\r\t]/g, '').replace(/\s+/g, ' ').trim().slice(0, 80) || 'video';
+    if (!/[\p{L}\p{N}]/u.test(s)) s = 'video'; // a name of only punctuation/underscores is not a title
     return s + '.' + (ext || 'mp4');
   }
 
@@ -778,6 +786,11 @@
   // old flow unchanged). Never throws, never shows an error itself.
   async function tryFastDownload(format, formats, filename, btn) {
     try {
+      // Mixcloud (mc-audio): one signed URL. Six parallel Range GETs
+      // stall on slow/mobile egress; one failed chunk discards ALL
+      // progress and the single fetch restarts from byte 0 (the
+      // "19% then resets"). One connection is the reliable path here.
+      if (format && format.id === 'mc-audio') return null;
       var urls = [];
       if (format.url) urls.push(format.url);
       if (Array.isArray(format.urls)) format.urls.forEach(function (u) { if (u && urls.indexOf(u) === -1) urls.push(u); });
@@ -1132,6 +1145,12 @@
     var num = '\\d[\\d,]*?(?:\\.\\d+)?\\s*[KMB]?';
     var unit = '(?:views?|reactions?|likes?|comments?|shares?)';
     var sep = '[·•|:\\-–—]';
+    // Comma/"and" count list at the start: "6.6K likes, 1.2K comments,
+    // and 46 shares | …" (Snapchat og:title). Requires TWO OR MORE counts
+    // and a separator/end after the last one, so a sentence like
+    // "10 likes, 20 shares of my trip" is untouched.
+    var listLead = new RegExp('^\\s*' + num + '\\s*' + unit + '(?:\\s*,?\\s*(?:and\\s+)?' + num + '\\s*' + unit + ')+(?=\\s*(?:' + sep + '|$))\\s*(?:' + sep + '\\s*)?', 'i');
+    s = s.replace(listLead, '');
     var mid = new RegExp('\\s*' + sep + '\\s*' + num + '\\s*' + unit + '(?=\\s*' + sep + ')', 'gi');
     s = s.replace(mid, '');
     var lead = new RegExp('^\\s*(?:' + num + '\\s*' + unit + '\\s*,\\s*)*' + num + '\\s*' + unit + '(?=\\s*(?:' + sep + '|\\d|$))\\s*(?:' + sep + '\\s*)?', 'i');
@@ -1212,6 +1231,7 @@
     return !s || !!GENERIC_TITLES[s];
   }
   function isAuthorNameTitle(t) {
+    if (/^\s*video\s+by\s+@?[\w.\-]+\s*$/i.test(String(t || ''))) return true;
     return /^\s*[^@\n]+?\(\s*@[^)\s]+\s*\)\s*$/.test(String(t || ''));
   }
   function dedupeTitle(t) {
@@ -1296,6 +1316,7 @@
     // video's filename (fileTitle reads these).
     currentTitle = '';
     currentTitleOrigin = 'original';
+    currentThumb = ''; // this request's meta thumb only; never the last search's
     metaTitle = '';
     metaTitleOrigin = 'original';
     var reqId = ++latestReq;
@@ -1970,7 +1991,7 @@
             else serverSave();
           });
         };
-        if (f.url) {
+        if (f.url && !f.serverOnly) {
           // Fast path first: parallel chunked download with live speed
           // (only when the CDN allows it). Any fast-path failure falls
           // through to the old flow below — nothing about it can break
@@ -1993,7 +2014,7 @@
   function renderResult(data) {
     currentTitle = cleanTitle(data.title);
     currentTitleOrigin = data.titleOrigin || 'original';
-    currentThumb = data.thumbnail || '';
+    currentThumb = data.thumbnail || currentThumb || '';
     currentClientSide = !!data.clientSide;
     titleEl.textContent = currentTitle;
     uploaderEl.textContent = data.uploader ? 'By ' + data.uploader : '';
@@ -2005,7 +2026,7 @@
 
     // Proper preview player: play the source stream when possible,
     // fall back to the still image if the stream cannot play.
-    var hasVideo = !!(data.previewUrl && videoEl);
+    var hasVideo = !!((data.previewUrl || data.previewStream) && videoEl);
     var isYouTubeResult = detectPlatform(currentUrl) === 'YouTube';
     if (videoEl) {
       if (hasVideo && isYouTubeResult) {
@@ -2055,13 +2076,15 @@
         // box to the old clip's ratio. currentSrc matches only on the
         // double-render of the SAME link (v3's case), where the metadata
         // really is this video's.
+        var _src = data.previewStream || data.previewUrl;
+        if (_src && _src.charAt(0) === '/' && currentInfoOrigin) _src = currentInfoOrigin + _src;
         var hadVideoMeta = !!(videoEl.videoWidth && videoEl.videoHeight) &&
-          videoEl.currentSrc === data.previewUrl;
+          videoEl.currentSrc === _src;
         resetPreviewPlayer();
         if (hadVideoMeta) sizePreviewPlayer();
         else sizeFromThumb(data.thumbnail); // size from THIS link's thumbnail
         videoEl.referrerPolicy = 'no-referrer';
-        videoEl.src = data.previewUrl;
+        videoEl.src = _src;
         showPreviewPoster(data.thumbnail);
         videoEl.style.display = '';
         // Poster survival (2026-11-25): do NOT hide #thumb here — it

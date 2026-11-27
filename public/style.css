@@ -207,6 +207,8 @@ button.secondary:hover:not(:disabled) { box-shadow: none; background: var(--bord
   position: absolute; inset: 0;
   width: 100%; height: 100%; object-fit: contain; border-radius: 12px;
   background: #0b0f13; display: block;
+  pointer-events: none; /* the still is a poster, never a click target:
+    Plyr's clickToPlay + controls sit underneath it */
 }
 .player.no-video .plyr { display: none; }
 /* Plyr theme: match the site accent (teal), light + dark. */
