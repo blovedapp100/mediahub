@@ -288,8 +288,7 @@ button.secondary:hover:not(:disabled) { box-shadow: none; background: var(--bord
 
 /* Ad slots */
 .ad-slot {
-  background: var(--surface-2); border: 1px dashed var(--border); border-radius: 10px;
-  min-height: 56px; display: flex; align-items: center; justify-content: center; margin: 18px 0;
+  display: none; /* hidden until real AdSense code exists (2026-11-27) */
 }
 .ad-slot span { color: var(--faint); font-size: 11px; letter-spacing: 1.5px; text-transform: uppercase; }
 
