@@ -562,11 +562,22 @@
   // a proper name. Returns false when the direct fetch fails, so the
   // caller can fall back to the server save.
   async function downloadDirect(url, filename, onProgress) {
+    // Stall watchdog (2026-11-28): a direct fetch that stops delivering
+    // bytes must fail fast instead of hanging forever — without it the
+    // Save button sits on "Saving…" and the fallback to /api/save never
+    // runs (live: YouTube + Facebook Save produced no file). 20s with no
+    // bytes is a stall; a slow-but-moving download is never aborted
+    // (the timer resets on every chunk).
+    var ctrl = new AbortController();
+    var lastByteAt = Date.now();
+    var watchdog = setInterval(function () {
+      if (Date.now() - lastByteAt > 20000) { try { ctrl.abort(); } catch (e) {} }
+    }, 5000);
     try {
       // No Referer: some file hosts refuse a request that carries
       // another site's Referer, even though the file itself is public.
       // Sending no Referer makes the same URL answer.
-      var r = await fetch(url, { referrerPolicy: 'no-referrer' });
+      var r = await fetch(url, { referrerPolicy: 'no-referrer', signal: ctrl.signal });
       if (!r.ok || !r.body) return false;
       // Stream it (instead of one r.blob()) so the button can show real
       // MB/s + % while it downloads. Content-Length is a CORS-safelisted
@@ -584,6 +595,7 @@
         var read = await reader.read();
         if (read.done) break;
         if (read.value) {
+          lastByteAt = Date.now();
           parts.push(read.value);
           got += read.value.byteLength;
           var now = Date.now();
@@ -606,6 +618,8 @@
       return true;
     } catch (e) {
       return false;
+    } finally {
+      clearInterval(watchdog);
     }
   }
 
