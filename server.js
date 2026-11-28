@@ -1444,6 +1444,13 @@ async function ytdownloaderTech(url, timeoutMs) {
   // Highest first (2160p down), audio last — the order the list shows.
   const hOf = (f) => { const m = String(f.label || '').match(/(\d{3,4})p/); return m ? parseInt(m[1], 10) : 0; };
   formats.sort((a, b) => ((b.label === 'Audio only') - (a.label === 'Audio only')) || (hOf(b) - hOf(a)));
+  // SAVE-ONLY (2026-11-28): ytdownloader.tech answers same-origin only
+  // (CORP, no ACAO, ignores Range) — the visitor's browser can never
+  // fetch these URLs directly. Mark them serverOnly so Save goes
+  // straight to /api/save (chainStreamUrl) instead of stalling on a
+  // doomed direct download. The url STAYS for the relay.
+  for (const f of formats) if (f && f.url && isUnplayablePreviewHost(f.url)) f.serverOnly = true;
+
   return { title: j.title || vid, formats };
 }
 
@@ -4698,6 +4705,17 @@ function buildFormats(info, opts) {
       }
     }
   }
+  // SAVE-ONLY HOSTS (2026-11-28): a direct URL on an unplayable host
+  // (googlevideo / ytdownloader.tech / piped — no CORS, IP-signed) can
+  // never be fetched by the visitor's browser, so the client's direct
+  // attempts are doomed and can stall forever (downloadDirect has no
+  // timeout). Mark such formats serverOnly: the client skips straight
+  // to /api/save, whose relay streams the file. The url STAYS: the
+  // relay reads it from the fresh re-resolve. Same pattern as
+  // BitChute's serverOnly (seed*.bitchute.com). Playable CDN hosts
+  // (fbcdn, TikTok CDN, choc proxy) are unaffected.
+  for (const o of out) if (o && o.url && isUnplayablePreviewHost(o.url)) o.serverOnly = true;
+
   return out;
 }
 
